@@ -2,7 +2,7 @@ use crate::get_engine;
 use wgpu::util::DeviceExt;
 
 #[repr(C)]
-#[derive(Copy, Clone, Debug,bytemuck::Pod, bytemuck::Pod,bytemuck::Zeroable)]
+#[derive(Copy, Clone, Debug,bytemuck::Pod,bytemuck::Zeroable)]
 pub struct ElemDims {
     pub length : u32,
     pub rank : u32,
@@ -14,7 +14,7 @@ pub struct ElemDims {
     pub strides_b : [u32;8],
     pub strides_c : [u32;8],
 }
-pub const ELEM_SHADER : &str = r#" ... "#;
+pub const ELEM_SHADER : &str = r#";
 struct Dims{
     length : u32,
     rank : u32,
@@ -27,39 +27,15 @@ struct Dims{
 }
 @group(0) @binding(0) var<storage,read> arrayA : array<f32>;
 @group(0) @binding(1) var<storage,read> arrayB : array<f32>;
-@group(0) @binding(2) var<sotrage,read_write> arrayC : array<f32>;
+@group(0) @binding(2) var<storage,read_write> arrayC : array<f32>;
 @group(0) @binding(3) var<uniform> dims : Dims;
-
-@compute @workgroup_size(256)
-fn add_main(@builtin(global_invocation_id) gid:vec3<u32>){
-    let i = gid.x;
-    if i<dims.length { arrayC[i] = arrayA[i]+arrayB[i];}
-}
-
-@compute @workgroup_size(256)
-fn sub_main(@builtin(global_invocation_id) gid:vec3<u32>){
-    let i = gid.x;
-    if i<dims.length { arrayC[i] = arrayA[i]-arrayB[i];}
-}
-
-@compute @workgroup_size(256)
-fn mul_main(@builtin(global_invocation_id) gid:vec3<u32>){
-    let i = gid.x;
-    if i < dims.length { arrayC[i] = arrayA[i]*arrayB[i];}
-}
-
-@compute @workgroup_size(256)
-fn div_main(@builtin(global_invocation_id)gid:vec3<u32>){
-    let i = gid.x;
-    if i < dims.length { arrayC[i] = arrayA[i]/arrayB[i];}
-}
 
 fn get_indices(logical_idx : u32) -> vec3<u32> { 
     var remaining = logical_idx;
     var offset_a = 0u;
     var offset_b = 0u;
     var offset_c = 0u;
-    for(var d_idc = 0u ; d_idx < dims.rank; d_idx = d_idx + 1u){
+    for(var d_idx = 0u ; d_idx < dims.rank; d_idx = d_idx + 1u){
         let d = dims.rank - 1u - d_idx;
         let dim_size = dims.shape[d];
 
@@ -78,7 +54,7 @@ fn get_indices(logical_idx : u32) -> vec3<u32> {
 @compute @workgroup_size(256)
 fn add_main(@builtin(global_invocation_id) gid : vec3<u32>){
     if(dims.is_contigous == 1u){
-        let base = gid.x * ru;
+        let base = gid.x * 4u;
         if(base + 3u < dims.length){
             let val_a = vec4<f32>(arrayA[base],arrayA[base+1],arrayA[base+2],arrayA[base+3]);
             let val_b = vec4<f32>(arrayB[base],arrayB[base+1],arrayB[base+2],arrayB[base+3]);
@@ -89,7 +65,7 @@ fn add_main(@builtin(global_invocation_id) gid : vec3<u32>){
             arrayC[base+3] = res.w;
         }
         else {
-         for(var i = base ; i <dims.lengt ;i=i + 1u){
+         for(var i = base ; i <dims.length ;i=i + 1u){
                 arrayC[i] = arrayA[i] + arrayB[i];
          }
     }
@@ -101,6 +77,85 @@ fn add_main(@builtin(global_invocation_id) gid : vec3<u32>){
         }
     }
 }
+@compute @workgroup_size(256)
+fn sub_main(global_invocation_id gid : vec3<u32>){
+       if(dims.is_contigous == 1u){
+       let base = gid.x * 4u;
+       if(base + 3u < dims.length){
+         let val_a = vec4<f32>(arrayA[base],arrayA[base+1],arrayA[base+2],arrayA[base+3]);
+         let val_b = vec4<f32>(arrayB[base],arrayB[base+1],arrayB[base+2],arrayB[base+3]);
+         let res = val_a - val_b;
+         arrayC[base] = res.x;
+         arrayC[base+1] = res.y;
+         arrayC[base+2]=res.z;
+         arrayC[base+3] = res.w;
+       }
+         else{
+           for(var i = base ; i<dims.length ;i = i + 1u){
+           arrayC[i] = arrayA[i]-arrayB[i]; // tailing loop
+           }
+         }
+        else{
+        let i = gid.x;
+        if(i < dims.length){
+          let idxs = get_indices(i);
+          arrayC[idxs.z] = arrayA[idxs.x] - arrayB[idsx.y];
+          }
+       }
+    }
+@compute @workgroup_size(256)
+fn mul_main(@builtin(gloabal_invocation_id) gid: vec3<u32>){
+if(dims.is_contigous == 1u){
+   let base = gid.x * 4u;
+   if(base + 3u < dims.length){
+   let val_a = vec4<f32>(arrayA[base],arrayA[base+1],arrayA[base+2],arrayA[base+3]);
+   let val_b = vec4<f32>(arrayB[base],arrayB[base+1],arrayB[base+2],arrayB[base+3]);
+   let res = val_a * val_b;
+   arrayC[base] = res.x;
+   arrayC[base+1] = res.y;
+   arrayC[base+2] = res.z;
+   arrayC[base+3] = res.w;
+   }
+   else{
+       for(var i = base ; i< dims.length ;i = i +1u){
+        arrayC[i] = arrayA[i] * arrayB[i];
+       }
+   }
+   else{
+   let i = gid.x;
+   if(i < dims.length){
+   let idxs = get_indices(i);
+   arrayC[idxs.z] = arrayA[idxs.x]*arrayB[idxs.y];
+}
+}
+}
+@compute @workgroup_size(256)
+fn div_main(@builtin(gloabal_invocation_id) gid: vec3<u32>){
+if(dims.is_contigous == 1u){
+   let base = gid.x * 4u;
+   if(base + 3u < dims.length){
+   let val_a = vec4<f32>(arrayA[base],arrayA[base+1],arrayA[base+2],arrayA[base+3]);
+   let val_b = vec4<f32>(arrayB[base],arrayB[base+1],arrayB[base+2],arrayB[base+3]);
+   let res = val_a / val_b;
+   arrayC[base] = res.x;
+   arrayC[base+1] = res.y;
+   arrayC[base+2] = res.z;
+   arrayC[base+3] = res.w;
+   }
+   else{
+       for(var i = base ; i< dims.length ;i = i +1u){
+        arrayC[i] = arrayA[i] / arrayB[i];
+       }
+   }
+   else{
+   let i = gid.x;
+   if(i < dims.length){
+   let idxs = get_indices(i);
+   arrayC[idxs.z] = arrayA[idxs.x]/arrayB[idxs.y];
+}
+}
+}
+"#;
 
 
 
