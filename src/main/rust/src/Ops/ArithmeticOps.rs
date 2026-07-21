@@ -67,7 +67,8 @@ fn add_main(@builtin(global_invocation_id) gid : vec3<u32>){
         else {
          for(var i = base ; i <dims.length ;i=i + 1u){
                 arrayC[i] = arrayA[i] + arrayB[i];
-         }
+            }
+        }
     }
     else { 
         let i = gid.x;
@@ -93,8 +94,9 @@ fn sub_main(global_invocation_id gid : vec3<u32>){
          else{
            for(var i = base ; i<dims.length ;i = i + 1u){
            arrayC[i] = arrayA[i]-arrayB[i]; // tailing loop
-           }
-         }
+          }
+        }
+       }
         else{
         let i = gid.x;
         if(i < dims.length){
@@ -120,14 +122,15 @@ if(dims.is_contigous == 1u){
        for(var i = base ; i< dims.length ;i = i +1u){
         arrayC[i] = arrayA[i] * arrayB[i];
        }
-   }
+    }
+}
    else{
    let i = gid.x;
    if(i < dims.length){
    let idxs = get_indices(i);
    arrayC[idxs.z] = arrayA[idxs.x]*arrayB[idxs.y];
-}
-}
+    }
+  }
 }
 @compute @workgroup_size(256)
 fn div_main(@builtin(gloabal_invocation_id) gid: vec3<u32>){
@@ -152,8 +155,8 @@ if(dims.is_contigous == 1u){
    if(i < dims.length){
    let idxs = get_indices(i);
    arrayC[idxs.z] = arrayA[idxs.x]/arrayB[idxs.y];
-}
-}
+    }
+  }
 }
 "#;
 
