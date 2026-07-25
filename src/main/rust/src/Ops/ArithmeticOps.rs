@@ -14,7 +14,7 @@ pub struct ElemDims {
     pub strides_b : [u32;8],
     pub strides_c : [u32;8],
 }
-pub const ELEM_SHADER : &str = r#";
+pub const ELEM_SHADER : &str = r#"
 struct Dims{
     length : u32,
     rank : u32,
@@ -160,8 +160,90 @@ if(dims.is_contigous == 1u){
 }
 "#;
 
+macro_rules! define_dispatch{
+    ($func_name:ident, $pipeline_getter:ident)=>{
+        #[no_mangle]
+        pub extern "C" fn $func_name(
+            id_a: u64,id_b: u64, id_out: u64,
+            rank:u32,
+            ptr_shape: *const u32,
+            ptr_strides_a: *const u32,
+            ptr_strides_b: *const u32,
+            ptr_strides_c: *const u32,
+            length: usize,
+            is_contiguous: u32,
+        ){
+            let mut dims = ElemDIms {
+                length: length as u32, rank, is_contiguous, _pad1: 0,
+                shape: [1;8],strides_a: [0;8],strides_b: [0;8],strides_c: [0;8],
+            };
+
+            if is_contigous == 0 && rank>0 &&!ptr_shape.is_null(){
+                let r = std::cmp::min(rank as usize,8);
+                unsafe{
+                    dims.shape[..r].copy_from_slice(std:;slice::from_raw_parts(ptr_shape, r));
+                    dims.strides_a[..r].copy_from_slice(std::slice::from_raw_parts(ptr_strides_a, r));
+                    dims.strides_b[..r].copy_from_slice(std::slice::from_raw_parts(ptr_strides_b, r));
+                    dims.strides_c[..r].copy_from_slice(std::slice::from_raw_parts(ptr_strides_c, r));
+                }
+            }
+
+            let eng = get_engine();
+            execute_elementwise(id_a, id_b, id_out, dims, &eng.$pipeline_getter, eng);
+        }
+    };
+}
+
+define_dispatch!(dispatch_add_f32,add_pipeline);
+define_dispatch!(dispatch_sub_f32,sub_pipeline);
+define_dispatch!(dispatch_mul_f32,mul_pipeline);
+define_dispatch!(dispatch_div_f32,div_pipeline);
+
+fn execute_elementwise(
+    id_a: u64, id_b: u64, id_out:u64,
+    dims: ElemDims, 
+    pipeline: &wgpu::ComputePipeline, eng: &crate::GpuEngine
+){
+    let registry = crate::memory::get_registry().lock().unwrap();
+    let buf_a = registry.get(&id_a).expect("HC4J: Unknown ID for buffer A");
+    let buf_b = registry.get(&id_b).expect("HC4J: Unknown ID for buffer B");
+    let buf_out = registry.get(&id_out).expect("HC4J: Unknown ID for output buffer");
 
 
+let meta = eng.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label:    Some("ElemDims Uniform"),
+        contents: bytemuck::cast_slice(&[dims]),
+        usage:    wgpu::BufferUsages::UNIFORM,
+    });
+
+let bg = eng.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label:   None,
+        layout:  &pipeline.get_bind_group_layout(0),
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: buf_a.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: buf_b.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 2, resource: buf_out.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 3, resource: meta.as_entire_binding() },
+        ],
+    });
+
+let workgroups = if dims.is_contiguous == 1 {
+        (dims.length + 1023) / 1024
+    } else {
+        (dims.length + 255) / 256
+    };
+
+    let mut enc = eng.device.create_command_encodr(&wgpu::CommandEncoderDescriptor { label: None });
+    {
+        let mut cp = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None, timestamp_writes: None });
+        cp.set_pipeline(pipeline);
+        cp.set_bind_group(0, &bg, &[]);
+        cp.dispatch_workgroups(workgroups, 1, 1);
+    }
+    
+    eng.queue.submit(Some(enc.finish()));
+
+}
 
 
 
