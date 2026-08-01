@@ -66,7 +66,7 @@ struct Dims {
 @group(0) @binding(0) var<storage, read> arrayA: array<__SCALAR__>;
 @group(0) @binding(1) var<storage, read> arrayB: array<__SCALAR__>;
 @group(0) @binding(2) var<storage, read_write> arrayC: array<__SCALAR__>;
-@group(0) @binding(3) var<uniform> dims: Dims;
+@group(0) @binding(3) var<storage, read> dims: Dims;
 
 fn get_indices(logical_idx: u32) -> vec3<u32> { 
     var remaining = logical_idx;
@@ -381,12 +381,12 @@ fn execute_elementwise(
         (a, b, out)
     };
 
-    let meta = eng
+     let meta = eng
         .device
         .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("ElemDims Uniform"),
+            label: Some("ElemDims Meta"),
             contents: bytemuck::cast_slice(&[dims]),
-            usage: wgpu::BufferUsages::UNIFORM,
+            usage: wgpu::BufferUsages::STORAGE, // <-- Changed to STORAGE
         });
 
     let bg = eng.device.create_bind_group(&wgpu::BindGroupDescriptor {

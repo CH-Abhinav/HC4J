@@ -3,6 +3,7 @@ pub mod ops{
 }
 pub mod memory;
 
+
 use std::borrow::Cow;
 use std::sync::{Mutex,OnceLock};
 use wgpu;
@@ -73,5 +74,4 @@ impl GpuEngine{
 pub extern "C" fn hc4j_init_gpu(){
     let _ = get_engine();
 }
-
 
