@@ -251,7 +251,7 @@ fn dispatch_elem_op(
     execute_elementwise(id_a, id_b, id_out, dims, &pipeline, eng)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn dispatch_add(
     id_a: u64, id_b: u64, id_out: u64, rank: u32,
     ptr_shape: *const u32, ptr_strides_a: *const u32, ptr_strides_b: *const u32, ptr_strides_c: *const u32,
@@ -264,7 +264,7 @@ pub extern "C" fn dispatch_add(
     )
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn dispatch_sub(
     id_a: u64, id_b: u64, id_out: u64, rank: u32,
     ptr_shape: *const u32, ptr_strides_a: *const u32, ptr_strides_b: *const u32, ptr_strides_c: *const u32,
@@ -277,7 +277,7 @@ pub extern "C" fn dispatch_sub(
     )
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn dispatch_mul(
     id_a: u64, id_b: u64, id_out: u64, rank: u32,
     ptr_shape: *const u32, ptr_strides_a: *const u32, ptr_strides_b: *const u32, ptr_strides_c: *const u32,
@@ -290,7 +290,7 @@ pub extern "C" fn dispatch_mul(
     )
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn dispatch_div(
     id_a: u64, id_b: u64, id_out: u64, rank: u32,
     ptr_shape: *const u32, ptr_strides_a: *const u32, ptr_strides_b: *const u32, ptr_strides_c: *const u32,
@@ -303,7 +303,7 @@ pub extern "C" fn dispatch_div(
     )
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn dispatch_add_f32(
     id_a: u64, id_b: u64, id_out: u64, rank: u32,
     ptr_shape: *const u32, ptr_strides_a: *const u32, ptr_strides_b: *const u32, ptr_strides_c: *const u32,
@@ -315,7 +315,7 @@ pub extern "C" fn dispatch_add_f32(
     )
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn dispatch_sub_f32(
     id_a: u64, id_b: u64, id_out: u64, rank: u32,
     ptr_shape: *const u32, ptr_strides_a: *const u32, ptr_strides_b: *const u32, ptr_strides_c: *const u32,
@@ -327,7 +327,7 @@ pub extern "C" fn dispatch_sub_f32(
     )
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn dispatch_mul_f32(
     id_a: u64, id_b: u64, id_out: u64, rank: u32,
     ptr_shape: *const u32, ptr_strides_a: *const u32, ptr_strides_b: *const u32, ptr_strides_c: *const u32,
@@ -339,7 +339,7 @@ pub extern "C" fn dispatch_mul_f32(
     )
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn dispatch_div_f32(
     id_a: u64, id_b: u64, id_out: u64, rank: u32,
     ptr_shape: *const u32, ptr_strides_a: *const u32, ptr_strides_b: *const u32, ptr_strides_c: *const u32,

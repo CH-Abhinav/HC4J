@@ -19,15 +19,13 @@ static ENGINE: OnceLock<GpuEngine> = OnceLock::new();
 pub fn get_engine() -> &'static GpuEngine {
     ENGINE.get_or_init(|| {
         pollster::block_on(async {
-            let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-                backends: wgpu::Backends::all(),
-                ..Default::default()
-            });
+            let instance = wgpu::Instance::default();
             let adapter = instance.request_adapter(&wgpu::RequestAdapterOptions::default())
                 .await
                 .expect("HC4J Fatal Error:Failed to find a sutiable GPU adapter.");
 
-            let (device,queue) = adapter.request_device(&wgpu::DeviceDescriptor::default(), None)
+            let (device,queue) = adapter
+                .request_device(&wgpu::DeviceDescriptor::default())
                 .await
                 .expect("HC4J Fatal Error: Failed to connect to logical GPU device.");
 
@@ -71,7 +69,7 @@ impl GpuEngine{
 }
 
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn hc4j_init_gpu(){
     let _ = get_engine();
 }

@@ -1,9 +1,7 @@
 use std::collections::HashMap;
-use std::sync::TryLockError::Poisoned;
 use std::sync::{Mutex, OnceLock};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::get_engine;
 
 type Registry = Mutex<HashMap<u64,wgpu::Buffer>>;
 
@@ -19,7 +17,7 @@ pub const HC4J_ERR_NOT_FOUND:i32 =-1;
 pub const HC4J_ERR_INVALID_PARAM:i32 =-2;
 pub const HC4J_ERR_GPU_READBACK:i32 =-3;
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn hc4j_gpu_alloc(length:usize) -> u64{
     if length==0 {return 0;}
 
@@ -48,7 +46,7 @@ pub extern "C" fn hc4j_gpu_alloc(length:usize) -> u64{
     id
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn hc4j_gpu_write(id: u64, ptr_in: *const f32, length:usize)-> i32{
     if ptr_in.is_null() || length == 0 { return HC4J_ERR_INVALID_PARAM; }
 
@@ -71,7 +69,7 @@ pub extern "C" fn hc4j_gpu_write(id: u64, ptr_in: *const f32, length:usize)-> i3
     HC4J_SUCCESS
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn hc4j_gpu_free(id: u64) -> i32{
     let buffer_opt ={
         let mut guard = match get_registry().lock(){
@@ -89,7 +87,7 @@ pub extern "C" fn hc4j_gpu_free(id: u64) -> i32{
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn hc4j_gpu_download(id: u64, ptr_out: *mut f32, length:usize)-> i32{
     if ptr_out.is_null() || length == 0 { return HC4J_ERR_INVALID_PARAM; }
 
@@ -118,7 +116,7 @@ pub extern "C" fn hc4j_gpu_download(id: u64, ptr_out: *mut f32, length:usize)-> 
         mapped_at_creation: false,
     });
 
-    let mut encoder = eng.device.create_command_encodder(&wgpu::CommandEncoderDescriptor { label: None});
+    let mut encoder = eng.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None});
         encoder.copy_buffer_to_buffer(&source_buffer, 0, &staging_buffer, 0, size_bytes);
         eng.queue.submit(Some(encoder.finish()));
 
