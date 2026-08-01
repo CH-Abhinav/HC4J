@@ -15,7 +15,44 @@ pub struct ElemDims {
     pub strides_c: [u32; 8],
 }
 
-pub const ELEM_SHADER: &str = r#"
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum DataType {
+    I32,
+    F32,
+}
+
+impl DataType {
+    pub fn from_u32(val: u32) -> Self {
+        match val {
+            0 => DataType::I32,
+            1 => DataType::F32,
+            _ => DataType::F32,
+        }
+    }
+
+    pub fn wgsl_scalar(&self) -> &'static str {
+        match self {
+            DataType::I32 => "i32",
+            DataType::F32 => "f32",
+        }
+    }
+
+    pub fn wgsl_vec4(&self) -> &'static str {
+        match self {
+            DataType::I32 => "vec4<i32>",
+            DataType::F32 => "vec4<f32>",
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            DataType::I32 => "i32",
+            DataType::F32 => "f32",
+        }
+    }
+}
+
+pub const ELEM_SHADER_TEMPLATE: &str = r#"
 struct Dims {
     length: u32,
     rank: u32,
@@ -27,9 +64,9 @@ struct Dims {
     strides_c: array<u32, 8>,
 }
 
-@group(0) @binding(0) var<storage, read> arrayA: array<f32>;
-@group(0) @binding(1) var<storage, read> arrayB: array<f32>;
-@group(0) @binding(2) var<storage, read_write> arrayC: array<f32>;
+@group(0) @binding(0) var<storage, read> arrayA: array<__SCALAR__>;
+@group(0) @binding(1) var<storage, read> arrayB: array<__SCALAR__>;
+@group(0) @binding(2) var<storage, read_write> arrayC: array<__SCALAR__>;
 @group(0) @binding(3) var<uniform> dims: Dims;
 
 fn get_indices(logical_idx: u32) -> vec3<u32> { 
@@ -58,8 +95,8 @@ fn add_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (dims.is_contiguous == 1u) {
         let base = gid.x * 4u;
         if (base + 3u < dims.length) {
-            let val_a = vec4<f32>(arrayA[base], arrayA[base+1], arrayA[base+2], arrayA[base+3]);
-            let val_b = vec4<f32>(arrayB[base], arrayB[base+1], arrayB[base+2], arrayB[base+3]);
+            let val_a = __VEC4__(arrayA[base], arrayA[base+1], arrayA[base+2], arrayA[base+3]);
+            let val_b = __VEC4__(arrayB[base], arrayB[base+1], arrayB[base+2], arrayB[base+3]);
             let res = val_a + val_b;
             arrayC[base] = res.x;
             arrayC[base+1] = res.y;
@@ -84,8 +121,8 @@ fn sub_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (dims.is_contiguous == 1u) {
         let base = gid.x * 4u;
         if (base + 3u < dims.length) {
-            let val_a = vec4<f32>(arrayA[base], arrayA[base+1], arrayA[base+2], arrayA[base+3]);
-            let val_b = vec4<f32>(arrayB[base], arrayB[base+1], arrayB[base+2], arrayB[base+3]);
+            let val_a = __VEC4__(arrayA[base], arrayA[base+1], arrayA[base+2], arrayA[base+3]);
+            let val_b = __VEC4__(arrayB[base], arrayB[base+1], arrayB[base+2], arrayB[base+3]);
             let res = val_a - val_b;
             arrayC[base] = res.x;
             arrayC[base+1] = res.y;
@@ -110,8 +147,8 @@ fn mul_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (dims.is_contiguous == 1u) {
         let base = gid.x * 4u;
         if (base + 3u < dims.length) {
-            let val_a = vec4<f32>(arrayA[base], arrayA[base+1], arrayA[base+2], arrayA[base+3]);
-            let val_b = vec4<f32>(arrayB[base], arrayB[base+1], arrayB[base+2], arrayB[base+3]);
+            let val_a = __VEC4__(arrayA[base], arrayA[base+1], arrayA[base+2], arrayA[base+3]);
+            let val_b = __VEC4__(arrayB[base], arrayB[base+1], arrayB[base+2], arrayB[base+3]);
             let res = val_a * val_b;
             arrayC[base] = res.x;
             arrayC[base+1] = res.y;
@@ -136,8 +173,8 @@ fn div_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (dims.is_contiguous == 1u) {
         let base = gid.x * 4u;
         if (base + 3u < dims.length) {
-            let val_a = vec4<f32>(arrayA[base], arrayA[base+1], arrayA[base+2], arrayA[base+3]);
-            let val_b = vec4<f32>(arrayB[base], arrayB[base+1], arrayB[base+2], arrayB[base+3]);
+            let val_a = __VEC4__(arrayA[base], arrayA[base+1], arrayA[base+2], arrayA[base+3]);
+            let val_b = __VEC4__(arrayB[base], arrayB[base+1], arrayB[base+2], arrayB[base+3]);
             let res = val_a / val_b;
             arrayC[base] = res.x;
             arrayC[base+1] = res.y;
@@ -158,44 +195,155 @@ fn div_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 "#;
 
-macro_rules! define_dispatch {
-    ($func_name:ident, $pipeline_getter:ident) => {
-        #[no_mangle]
-        pub extern "C" fn $func_name(
-            id_a: u64, id_b: u64, id_out: u64,
-            rank: u32,
-            ptr_shape: *const u32,
-            ptr_strides_a: *const u32,
-            ptr_strides_b: *const u32,
-            ptr_strides_c: *const u32,
-            length: usize,
-            is_contiguous: u32,
-        ) {
-            let mut dims = ElemDims {
-                length: length as u32, rank, is_contiguous, _pad1: 0,
-                shape: [1; 8], strides_a: [0; 8], strides_b: [0; 8], strides_c: [0; 8],
-            };
-
-            if is_contiguous == 0 && rank > 0 && !ptr_shape.is_null() {
-                let r = std::cmp::min(rank as usize, 8);
-                unsafe {
-                    dims.shape[..r].copy_from_slice(std::slice::from_raw_parts(ptr_shape, r));
-                    dims.strides_a[..r].copy_from_slice(std::slice::from_raw_parts(ptr_strides_a, r));
-                    dims.strides_b[..r].copy_from_slice(std::slice::from_raw_parts(ptr_strides_b, r));
-                    dims.strides_c[..r].copy_from_slice(std::slice::from_raw_parts(ptr_strides_c, r));
-                }
-            }
-
-            let eng = get_engine();
-            execute_elementwise(id_a, id_b, id_out, dims, &eng.$pipeline_getter, eng);
-        }
-    };
+pub fn generate_elem_shader(dtype: DataType) -> String {
+    ELEM_SHADER_TEMPLATE
+        .replace("__SCALAR__", dtype.wgsl_scalar())
+        .replace("__VEC4__", dtype.wgsl_vec4())
+        .replace("add_main", &format!("add_main_{}", dtype.as_str()))
+        .replace("sub_main", &format!("sub_main_{}", dtype.as_str()))
+        .replace("mul_main", &format!("mul_main_{}", dtype.as_str()))
+        .replace("div_main", &format!("div_main_{}", dtype.as_str()))
 }
 
-define_dispatch!(dispatch_add_f32, add_pipeline);
-define_dispatch!(dispatch_sub_f32, sub_pipeline);
-define_dispatch!(dispatch_mul_f32, mul_pipeline);
-define_dispatch!(dispatch_div_f32, div_pipeline);
+fn dispatch_elem_op(
+    op_name: &str, base_entry: &str,
+    id_a: u64, id_b: u64, id_out: u64, rank: u32,
+    ptr_shape: *const u32, ptr_strides_a: *const u32, ptr_strides_b: *const u32, ptr_strides_c: *const u32,
+    length: usize, is_contiguous: u32, dtype_code: u32,
+) {
+    let dtype = DataType::from_u32(dtype_code);
+
+    let mut dims = ElemDims {
+        length: length as u32, rank, is_contiguous, _pad1: 0,
+        shape: [1; 8], strides_a: [0; 8], strides_b: [0; 8], strides_c: [0; 8],
+    };
+
+    if is_contiguous == 0 && rank > 0 && !ptr_shape.is_null() {
+        let r = std::cmp::min(rank as usize, 8);
+        unsafe {
+            dims.shape[..r].copy_from_slice(std::slice::from_raw_parts(ptr_shape, r));
+            dims.strides_a[..r].copy_from_slice(std::slice::from_raw_parts(ptr_strides_a, r));
+            dims.strides_b[..r].copy_from_slice(std::slice::from_raw_parts(ptr_strides_b, r));
+            dims.strides_c[..r].copy_from_slice(std::slice::from_raw_parts(ptr_strides_c, r));
+        }
+    }
+
+    let eng = get_engine();
+    let shader_name = format!("elem_{}_{}", op_name, dtype.as_str());
+    let entry_point = format!("{}_{}", base_entry, dtype.as_str());
+    let wgsl_code = generate_elem_shader(dtype);
+
+    let pipeline = eng.get_or_compile(&shader_name, &entry_point, &wgsl_code);
+    execute_elementwise(id_a, id_b, id_out, dims, &pipeline, eng);
+}
+
+#[no_mangle]
+pub extern "C" fn dispatch_add(
+    id_a: u64, id_b: u64, id_out: u64, rank: u32,
+    ptr_shape: *const u32, ptr_strides_a: *const u32, ptr_strides_b: *const u32, ptr_strides_c: *const u32,
+    length: usize, is_contiguous: u32, dtype_code: u32,
+) {
+    dispatch_elem_op(
+        "add", "add_main",
+        id_a, id_b, id_out, rank,
+        ptr_shape, ptr_strides_a, ptr_strides_b, ptr_strides_c,
+        length, is_contiguous, dtype_code,
+    );
+}
+
+#[no_mangle]
+pub extern "C" fn dispatch_sub(
+    id_a: u64, id_b: u64, id_out: u64, rank: u32,
+    ptr_shape: *const u32, ptr_strides_a: *const u32, ptr_strides_b: *const u32, ptr_strides_c: *const u32,
+    length: usize, is_contiguous: u32, dtype_code: u32,
+) {
+    dispatch_elem_op(
+        "sub", "sub_main",
+        id_a, id_b, id_out, rank,
+        ptr_shape, ptr_strides_a, ptr_strides_b, ptr_strides_c,
+        length, is_contiguous, dtype_code,
+    );
+}
+
+#[no_mangle]
+pub extern "C" fn dispatch_mul(
+    id_a: u64, id_b: u64, id_out: u64, rank: u32,
+    ptr_shape: *const u32, ptr_strides_a: *const u32, ptr_strides_b: *const u32, ptr_strides_c: *const u32,
+    length: usize, is_contiguous: u32, dtype_code: u32,
+) {
+    dispatch_elem_op(
+        "mul", "mul_main",
+        id_a, id_b, id_out, rank,
+        ptr_shape, ptr_strides_a, ptr_strides_b, ptr_strides_c,
+        length, is_contiguous, dtype_code,
+    );
+}
+
+#[no_mangle]
+pub extern "C" fn dispatch_div(
+    id_a: u64, id_b: u64, id_out: u64, rank: u32,
+    ptr_shape: *const u32, ptr_strides_a: *const u32, ptr_strides_b: *const u32, ptr_strides_c: *const u32,
+    length: usize, is_contiguous: u32, dtype_code: u32,
+) {
+    dispatch_elem_op(
+        "div", "div_main",
+        id_a, id_b, id_out, rank,
+        ptr_shape, ptr_strides_a, ptr_strides_b, ptr_strides_c,
+        length, is_contiguous, dtype_code,
+    );
+}
+
+#[no_mangle]
+pub extern "C" fn dispatch_add_f32(
+    id_a: u64, id_b: u64, id_out: u64, rank: u32,
+    ptr_shape: *const u32, ptr_strides_a: *const u32, ptr_strides_b: *const u32, ptr_strides_c: *const u32,
+    length: usize, is_contiguous: u32,
+) {
+    dispatch_add(
+        id_a, id_b, id_out, rank,
+        ptr_shape, ptr_strides_a, ptr_strides_b, ptr_strides_c,
+        length, is_contiguous, 1,
+    );
+}
+
+#[no_mangle]
+pub extern "C" fn dispatch_sub_f32(
+    id_a: u64, id_b: u64, id_out: u64, rank: u32,
+    ptr_shape: *const u32, ptr_strides_a: *const u32, ptr_strides_b: *const u32, ptr_strides_c: *const u32,
+    length: usize, is_contiguous: u32,
+) {
+    dispatch_sub(
+        id_a, id_b, id_out, rank,
+        ptr_shape, ptr_strides_a, ptr_strides_b, ptr_strides_c,
+        length, is_contiguous, 1,
+    );
+}
+
+#[no_mangle]
+pub extern "C" fn dispatch_mul_f32(
+    id_a: u64, id_b: u64, id_out: u64, rank: u32,
+    ptr_shape: *const u32, ptr_strides_a: *const u32, ptr_strides_b: *const u32, ptr_strides_c: *const u32,
+    length: usize, is_contiguous: u32,
+) {
+    dispatch_mul(
+        id_a, id_b, id_out, rank,
+        ptr_shape, ptr_strides_a, ptr_strides_b, ptr_strides_c,
+        length, is_contiguous, 1,
+    );
+}
+
+#[no_mangle]
+pub extern "C" fn dispatch_div_f32(
+    id_a: u64, id_b: u64, id_out: u64, rank: u32,
+    ptr_shape: *const u32, ptr_strides_a: *const u32, ptr_strides_b: *const u32, ptr_strides_c: *const u32,
+    length: usize, is_contiguous: u32,
+) {
+    dispatch_div(
+        id_a, id_b, id_out, rank,
+        ptr_shape, ptr_strides_a, ptr_strides_b, ptr_strides_c,
+        length, is_contiguous, 1,
+    );
+}
 
 fn execute_elementwise(
     id_a: u64, id_b: u64, id_out: u64,

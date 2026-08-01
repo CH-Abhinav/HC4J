@@ -1,31 +1,33 @@
-pub mod arithematic;
+pub mod ops{
+    pub mod arithmetic;
+}
 pub mod memory;
 
 use std::borrow::Cow;
-std::sync::{Mutex,OnceLock};
+use std::sync::{Mutex,OnceLock};
 use wgpu;
+use std::collections::HashMap;
 
 pub struct GpuEngine { 
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
-    pub pipelines : Mutex<HashMap<String,wgpu,wgpu::ComputePipelines>>,
+    pub pipelines : Mutex<HashMap<String,wgpu::ComputePipeline>>,
 }
 
-static ENGINE: OnceLocl<GpuEngine> = OnceLock::new();
+static ENGINE: OnceLock<GpuEngine> = OnceLock::new();
 
 pub fn get_engine() -> &'static GpuEngine {
-    ENGINE.get_or_int(|| {
+    ENGINE.get_or_init(|| {
         pollster::block_on(async {
             let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
                 backends: wgpu::Backends::all(),
                 ..Default::default()
             });
-            let adapter = instance.request_adapter(&wgpu::RequeustAdapterOptions::default())
+            let adapter = instance.request_adapter(&wgpu::RequestAdapterOptions::default())
                 .await
                 .expect("HC4J Fatal Error:Failed to find a sutiable GPU adapter.");
 
-            let (device,queue) = adapter
-                .request_Adapter(&wgpu::RequestAdapterOptions::default())
+            let (device,queue) = adapter.request_device(&wgpu::DeviceDescriptor::default(), None)
                 .await
                 .expect("HC4J Fatal Error: Failed to connect to logical GPU device.");
 
@@ -38,18 +40,18 @@ pub fn get_engine() -> &'static GpuEngine {
     })
 }
 impl GpuEngine{
-    pub fn get_or_copile(&self,shader_name: &str, entry_point: &str, wgsl_code : &str) -> wgpu::ComputePipeline {
+    pub fn get_or_compile(&self,shader_name: &str, entry_point: &str, wgsl_code : &str) -> wgpu::ComputePipeline {
         {
             let cache = self.pipelines.lock().unwrap();
-            if let Some(pipeline) = cache.get(entry_pint){
+            if let Some(pipeline) = cache.get(entry_point){
                 return pipeline.clone();
             }
         }
         let module = self.device.create_shader_module(wgpu::ShaderModuleDescriptor{
-            leabe : Some(shader_name),
+            label : Some(shader_name),
             source: wgpu:: ShaderSource::Wgsl(Cow::Borrowed(wgsl_code)),
         });
-        let pipeline = self.device.create_compute_pipeline(wgpu::ShaderModuleDescripor{
+        let pipeline = self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor{
             label: Some(entry_point),
             layout: None,
             module: &module,
@@ -57,7 +59,7 @@ impl GpuEngine{
             compilation_options: Default::default(),
             cache: None,
         });
-        let mut cach = self.pipeline.lock().unwrap();
+        let mut cache = self.pipelines.lock().unwrap();
 
         if let Some(existing) = cache.get(entry_point){
             return existing.clone();
