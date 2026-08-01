@@ -8,7 +8,6 @@ pub struct ElemDims {
     pub rank: u32,
     pub is_contiguous: u32,
     pub _pad1: u32,
-
     pub shape: [u32; 8],
     pub strides_a: [u32; 8],
     pub strides_b: [u32; 8],
@@ -206,16 +205,31 @@ pub fn generate_elem_shader(dtype: DataType) -> String {
 }
 
 fn dispatch_elem_op(
-    op_name: &str, base_entry: &str,
-    id_a: u64, id_b: u64, id_out: u64, rank: u32,
-    ptr_shape: *const u32, ptr_strides_a: *const u32, ptr_strides_b: *const u32, ptr_strides_c: *const u32,
-    length: usize, is_contiguous: u32, dtype_code: u32,
-) {
+    op_name: &str,
+    base_entry: &str,
+    id_a: u64,
+    id_b: u64,
+    id_out: u64,
+    rank: u32,
+    ptr_shape: *const u32,
+    ptr_strides_a: *const u32,
+    ptr_strides_b: *const u32,
+    ptr_strides_c: *const u32,
+    length: usize,
+    is_contiguous: u32,
+    dtype_code: u32,
+) -> i32 {
     let dtype = DataType::from_u32(dtype_code);
 
     let mut dims = ElemDims {
-        length: length as u32, rank, is_contiguous, _pad1: 0,
-        shape: [1; 8], strides_a: [0; 8], strides_b: [0; 8], strides_c: [0; 8],
+        length: length as u32,
+        rank,
+        is_contiguous,
+        _pad1: 0,
+        shape: [1; 8],
+        strides_a: [0; 8],
+        strides_b: [0; 8],
+        strides_c: [0; 8],
     };
 
     if is_contiguous == 0 && rank > 0 && !ptr_shape.is_null() {
@@ -232,9 +246,9 @@ fn dispatch_elem_op(
     let shader_name = format!("elem_{}_{}", op_name, dtype.as_str());
     let entry_point = format!("{}_{}", base_entry, dtype.as_str());
     let wgsl_code = generate_elem_shader(dtype);
-
     let pipeline = eng.get_or_compile(&shader_name, &entry_point, &wgsl_code);
-    execute_elementwise(id_a, id_b, id_out, dims, &pipeline, eng);
+    
+    execute_elementwise(id_a, id_b, id_out, dims, &pipeline, eng)
 }
 
 #[no_mangle]
@@ -242,13 +256,12 @@ pub extern "C" fn dispatch_add(
     id_a: u64, id_b: u64, id_out: u64, rank: u32,
     ptr_shape: *const u32, ptr_strides_a: *const u32, ptr_strides_b: *const u32, ptr_strides_c: *const u32,
     length: usize, is_contiguous: u32, dtype_code: u32,
-) {
+) -> i32 {
     dispatch_elem_op(
-        "add", "add_main",
-        id_a, id_b, id_out, rank,
+        "add", "add_main", id_a, id_b, id_out, rank,
         ptr_shape, ptr_strides_a, ptr_strides_b, ptr_strides_c,
         length, is_contiguous, dtype_code,
-    );
+    )
 }
 
 #[no_mangle]
@@ -256,13 +269,12 @@ pub extern "C" fn dispatch_sub(
     id_a: u64, id_b: u64, id_out: u64, rank: u32,
     ptr_shape: *const u32, ptr_strides_a: *const u32, ptr_strides_b: *const u32, ptr_strides_c: *const u32,
     length: usize, is_contiguous: u32, dtype_code: u32,
-) {
+) -> i32 {
     dispatch_elem_op(
-        "sub", "sub_main",
-        id_a, id_b, id_out, rank,
+        "sub", "sub_main", id_a, id_b, id_out, rank,
         ptr_shape, ptr_strides_a, ptr_strides_b, ptr_strides_c,
         length, is_contiguous, dtype_code,
-    );
+    )
 }
 
 #[no_mangle]
@@ -270,13 +282,12 @@ pub extern "C" fn dispatch_mul(
     id_a: u64, id_b: u64, id_out: u64, rank: u32,
     ptr_shape: *const u32, ptr_strides_a: *const u32, ptr_strides_b: *const u32, ptr_strides_c: *const u32,
     length: usize, is_contiguous: u32, dtype_code: u32,
-) {
+) -> i32 {
     dispatch_elem_op(
-        "mul", "mul_main",
-        id_a, id_b, id_out, rank,
+        "mul", "mul_main", id_a, id_b, id_out, rank,
         ptr_shape, ptr_strides_a, ptr_strides_b, ptr_strides_c,
         length, is_contiguous, dtype_code,
-    );
+    )
 }
 
 #[no_mangle]
@@ -284,13 +295,12 @@ pub extern "C" fn dispatch_div(
     id_a: u64, id_b: u64, id_out: u64, rank: u32,
     ptr_shape: *const u32, ptr_strides_a: *const u32, ptr_strides_b: *const u32, ptr_strides_c: *const u32,
     length: usize, is_contiguous: u32, dtype_code: u32,
-) {
+) -> i32 {
     dispatch_elem_op(
-        "div", "div_main",
-        id_a, id_b, id_out, rank,
+        "div", "div_main", id_a, id_b, id_out, rank,
         ptr_shape, ptr_strides_a, ptr_strides_b, ptr_strides_c,
         length, is_contiguous, dtype_code,
-    );
+    )
 }
 
 #[no_mangle]
@@ -298,12 +308,11 @@ pub extern "C" fn dispatch_add_f32(
     id_a: u64, id_b: u64, id_out: u64, rank: u32,
     ptr_shape: *const u32, ptr_strides_a: *const u32, ptr_strides_b: *const u32, ptr_strides_c: *const u32,
     length: usize, is_contiguous: u32,
-) {
+) -> i32 {
     dispatch_add(
-        id_a, id_b, id_out, rank,
-        ptr_shape, ptr_strides_a, ptr_strides_b, ptr_strides_c,
+        id_a, id_b, id_out, rank, ptr_shape, ptr_strides_a, ptr_strides_b, ptr_strides_c,
         length, is_contiguous, 1,
-    );
+    )
 }
 
 #[no_mangle]
@@ -311,12 +320,11 @@ pub extern "C" fn dispatch_sub_f32(
     id_a: u64, id_b: u64, id_out: u64, rank: u32,
     ptr_shape: *const u32, ptr_strides_a: *const u32, ptr_strides_b: *const u32, ptr_strides_c: *const u32,
     length: usize, is_contiguous: u32,
-) {
+) -> i32 {
     dispatch_sub(
-        id_a, id_b, id_out, rank,
-        ptr_shape, ptr_strides_a, ptr_strides_b, ptr_strides_c,
+        id_a, id_b, id_out, rank, ptr_shape, ptr_strides_a, ptr_strides_b, ptr_strides_c,
         length, is_contiguous, 1,
-    );
+    )
 }
 
 #[no_mangle]
@@ -324,12 +332,11 @@ pub extern "C" fn dispatch_mul_f32(
     id_a: u64, id_b: u64, id_out: u64, rank: u32,
     ptr_shape: *const u32, ptr_strides_a: *const u32, ptr_strides_b: *const u32, ptr_strides_c: *const u32,
     length: usize, is_contiguous: u32,
-) {
+) -> i32 {
     dispatch_mul(
-        id_a, id_b, id_out, rank,
-        ptr_shape, ptr_strides_a, ptr_strides_b, ptr_strides_c,
+        id_a, id_b, id_out, rank, ptr_shape, ptr_strides_a, ptr_strides_b, ptr_strides_c,
         length, is_contiguous, 1,
-    );
+    )
 }
 
 #[no_mangle]
@@ -337,38 +344,71 @@ pub extern "C" fn dispatch_div_f32(
     id_a: u64, id_b: u64, id_out: u64, rank: u32,
     ptr_shape: *const u32, ptr_strides_a: *const u32, ptr_strides_b: *const u32, ptr_strides_c: *const u32,
     length: usize, is_contiguous: u32,
-) {
+) -> i32 {
     dispatch_div(
-        id_a, id_b, id_out, rank,
-        ptr_shape, ptr_strides_a, ptr_strides_b, ptr_strides_c,
+        id_a, id_b, id_out, rank, ptr_shape, ptr_strides_a, ptr_strides_b, ptr_strides_c,
         length, is_contiguous, 1,
-    );
+    )
 }
 
 fn execute_elementwise(
-    id_a: u64, id_b: u64, id_out: u64,
-    dims: ElemDims, 
-    pipeline: &wgpu::ComputePipeline, eng: &crate::GpuEngine
-) {
-    let registry = crate::memory::get_registry().lock().unwrap();
-    let buf_a   = registry.get(&id_a).expect("HC4J: Unknown ID for buffer A");
-    let buf_b   = registry.get(&id_b).expect("HC4J: Unknown ID for buffer B");
-    let buf_out = registry.get(&id_out).expect("HC4J: Unknown ID for output buffer");
+    id_a: u64,
+    id_b: u64,
+    id_out: u64,
+    dims: ElemDims,
+    pipeline: &wgpu::ComputePipeline,
+    eng: &crate::GpuEngine,
+) -> i32 {
+    let (buf_a, buf_b, buf_out) = {
+        let guard = match crate::memory::get_registry().lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        
+        let a = match guard.get(&id_a) {
+            Some(b) => b.clone(),
+            None => return crate::memory::HC4J_ERR_NOT_FOUND,
+        };
+        let b = match guard.get(&id_b) {
+            Some(b) => b.clone(),
+            None => return crate::memory::HC4J_ERR_NOT_FOUND,
+        };
+        let out = match guard.get(&id_out) {
+            Some(b) => b.clone(),
+            None => return crate::memory::HC4J_ERR_NOT_FOUND,
+        };
+        
+        (a, b, out)
+    };
 
-    let meta = eng.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label:    Some("ElemDims Uniform"),
-        contents: bytemuck::cast_slice(&[dims]),
-        usage:    wgpu::BufferUsages::UNIFORM,
-    });
+    let meta = eng
+        .device
+        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("ElemDims Uniform"),
+            contents: bytemuck::cast_slice(&[dims]),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
 
     let bg = eng.device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label:   None,
-        layout:  &pipeline.get_bind_group_layout(0),
+        label: None,
+        layout: &pipeline.get_bind_group_layout(0),
         entries: &[
-            wgpu::BindGroupEntry { binding: 0, resource: buf_a.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 1, resource: buf_b.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 2, resource: buf_out.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 3, resource: meta.as_entire_binding() },
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: buf_a.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: buf_b.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: buf_out.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: meta.as_entire_binding(),
+            },
         ],
     });
 
@@ -378,13 +418,20 @@ fn execute_elementwise(
         (dims.length + 255) / 256
     };
 
-    let mut enc = eng.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+    let mut enc = eng
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
     {
-        let mut cp = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None, timestamp_writes: None });
+        let mut cp = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: None,
+            timestamp_writes: None,
+        });
         cp.set_pipeline(pipeline);
         cp.set_bind_group(0, &bg, &[]);
         cp.dispatch_workgroups(workgroups, 1, 1);
     }
 
     eng.queue.submit(Some(enc.finish()));
+    
+    crate::memory::HC4J_SUCCESS
 }

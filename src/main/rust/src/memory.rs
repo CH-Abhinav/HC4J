@@ -34,7 +34,7 @@ pub extern "C" fn hc4j_gpu_alloc(length:usize) -> u64{
         size: size_bytes,
         usage: wgpu::BufferUsages::STORAGE
         | wgpu::BufferUsages::COPY_SRC
-        | wgpu::BufferDescriptor::COPY_DST,
+        | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
 
@@ -78,7 +78,7 @@ pub extern "C" fn hc4j_gpu_free(id: u64) -> i32{
             Ok(g)=>g,
             Err(poisoned)=> poisoned.into_inner(),
         };
-        guard.remobe(&id)
+        guard.remove(&id)
     };
 
     if let Some(buffer)= buffer_opt{
@@ -95,7 +95,7 @@ pub extern "C" fn hc4j_gpu_download(id: u64, ptr_out: *mut f32, length:usize)-> 
 
     let eng = crate::get_engine();
 
-    let size_bytes = match (length as u64).checked_mul(std::mem::size_of::<f32> as u64){
+    let size_bytes = match (length as u64).checked_mul(std::mem::size_of::<f32>() as u64){
         Some(bytes)=> bytes,
         None => return HC4J_ERR_INVALID_PARAM,
     };
@@ -118,7 +118,7 @@ pub extern "C" fn hc4j_gpu_download(id: u64, ptr_out: *mut f32, length:usize)-> 
         mapped_at_creation: false,
     });
 
-    let mut encoder = eng.device.create_commad_encodder(&wgpu::CommandEncoderDescriptor { label: None});
+    let mut encoder = eng.device.create_command_encodder(&wgpu::CommandEncoderDescriptor { label: None});
         encoder.copy_buffer_to_buffer(&source_buffer, 0, &staging_buffer, 0, size_bytes);
         eng.queue.submit(Some(encoder.finish()));
 
