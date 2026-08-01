@@ -1,4 +1,4 @@
-pub mod arithmetic;
+pub mod arithematic;
 pub mod memory;
 
 use std::borrow::Cow;
