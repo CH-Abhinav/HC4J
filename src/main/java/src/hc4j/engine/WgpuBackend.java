@@ -2,6 +2,7 @@ package hc4j.engine;
 
 import java.lang.foreign.*;
 import java.lang.invoke.MethodHandle;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 
@@ -23,7 +24,8 @@ public class WgpuBackend {
         String extension = os.contains("win") ? ".dll" : (os.contains("mac") ? ".dylib" : ".so");
         String libName = "hc4j" + extension;
         
-        Path libPath = Paths.get("src", "rust", "target", "release", libName).toAbsolutePath();
+        Path libPath = findNativeLibrary(libName);
+        System.out.println("[HC4J] Native Engine loaded from: " + libPath);
         System.load(libPath.toString());
         
         Linker linker = Linker.nativeLinker();
@@ -46,6 +48,20 @@ public class WgpuBackend {
     }
 
     private WgpuBackend() {}
+
+    private static Path findNativeLibrary(String libName) {
+        Path current = Paths.get("").toAbsolutePath();
+        
+        while (current != null) {
+            Path checkPath = current.resolve(Paths.get("src", "main", "rust", "target", "release", libName));
+            if (Files.exists(checkPath)) {
+                return checkPath;
+            }
+            current = current.getParent();
+        }
+        
+        throw new UnsatisfiedLinkError("Could not find " + libName + " anywhere in the project tree. Did you run 'cargo build --release' in the rust folder?");
+    }
 
     public static void checkStatus(int statusCode, String context) {
         if (statusCode == HC4J_SUCCESS) return;
