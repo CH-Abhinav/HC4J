@@ -27,7 +27,6 @@ public class Main {
         runBenchmark("1D - 100K", true, 100_000);
         runBenchmark("1D - 1M", true, 1_000_000);
         runBenchmark("1D - 10M", true, 10_000_000);
-        runBenchmark("1D- 100M",true, 100_000_000);
 
         System.out.println("----------------------------------------------------------------------------------------------------");
 
@@ -37,7 +36,6 @@ public class Main {
         runBenchmark("2D - 100K", true, 500, 200);         // 100,000 elements
         runBenchmark("2D - 1M", true, 1000, 1000);        // 1,000,000 elements
         runBenchmark("2D - 10M", true, 5000, 2000);       // 10,000,000 elements
-        runBenchmark("2D - 100M", true, 10000, 10000);
         System.out.println("====================================================================================================\n");
     }
 
