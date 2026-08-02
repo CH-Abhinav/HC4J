@@ -1,5 +1,7 @@
 package hc4j.ops;
 
+import hc4j.DType;
+import hc4j.Tensor;
 import java.lang.foreign.Arena;
 import java.lang.foreign.FunctionDescriptor;
 import java.lang.foreign.Linker;
@@ -10,7 +12,7 @@ import java.lang.invoke.MethodHandle;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 
-public class Ops {
+public class ArithmeticOps {
     public static final int HC4J_SUCCESS = 0;
     public static final int HC4J_ERR_NOT_FOUND = -1;
     public static final int HC4J_ERR_INVALID_PARAM = -2;
@@ -67,7 +69,7 @@ public class Ops {
         dispatchDiv = linker.downcallHandle(lookup.find("dispatch_div").orElseThrow(), computeDesc);
     }
 
-    private Ops() {
+    private ArithmeticOps() {
         throw new AssertionError("Utility class");
     }
 

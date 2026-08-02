@@ -3,6 +3,8 @@ package hc4j;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 
+import hc4j.ops.ArithmeticOps;
+
 public class Tensor {
     private final MemorySegment data;
     private final int[] shape;
@@ -56,7 +58,7 @@ public class Tensor {
         System.out.println("-> Initializing WebGPU through Rust FFI Bridge...");
         try {
             // This triggers Ops static block, loads the DLL, and boots WebGPU
-            Ops.initGpu();
+            ArithmeticOps.initGpu();
             System.out.println("-> SUCCESS: WebGPU Engine connected successfully!");
 
             // Test allocation and math
