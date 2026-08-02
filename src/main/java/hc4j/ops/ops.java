@@ -1,4 +1,4 @@
-package hc4j;
+package hc4j.ops;
 
 import java.lang.foreign.Arena;
 import java.lang.foreign.FunctionDescriptor;
