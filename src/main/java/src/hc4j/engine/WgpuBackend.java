@@ -22,7 +22,9 @@ public class WgpuBackend {
     static {
         String os = System.getProperty("os.name").toLowerCase();
         String extension = os.contains("win") ? ".dll" : (os.contains("mac") ? ".dylib" : ".so");
-        String libName = "hc4j" + extension;
+        String libName = os.contains("mac") || os.contains("linux")
+        ? "libhc4j" + extension
+        : "hc4j" + extension;
         
         Path libPath = findNativeLibrary(libName);
         System.out.println("[HC4J] Native Engine loaded from: " + libPath);
