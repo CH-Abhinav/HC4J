@@ -3,11 +3,32 @@ name = "rust"
 version = "0.1.0"
 edition = "2024"
 
-[dependencies]
-wgpu="30.0.0"
-pollster="1.0.0"
-bytemuck = "1.25.2"
-
 [lib]
 name = "hc4j"
 crate-type = ["cdylib"]
+
+[dependencies]
+pollster="1.0.0"
+bytemuck = "1.25.2"
+rayon = "1.10.0"
+
+# common wgpu config
+[dependencies.wgpu]
+version = "30.0.0"
+default-features = false
+features = ["wgsl"]
+
+# windows specific config
+[target.'cfg(target_os = "windows")'.dependencies.wgpu]
+version = "30.0.0"
+features = ["dx12", "vulkan", "wgsl"]
+
+# linux specific config
+[target.'cfg(target_os = "linux")'.dependencies.wgpu]
+version = "30.0.0"
+features = ["vulkan", "wgsl"]
+
+# macos specific config
+[target.'cfg(target_os = "macos")'.dependencies.wgpu]
+version = "30.0.0"
+features = ["metal", "wgsl"]
