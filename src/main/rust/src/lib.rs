@@ -20,7 +20,10 @@ static ENGINE: OnceLock<GpuEngine> = OnceLock::new();
 pub fn get_engine() -> &'static GpuEngine {
     ENGINE.get_or_init(|| {
         pollster::block_on(async {
-            let instance = wgpu::Instance::default();
+            let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+                backends: if cfg!(windows) { wgpu::Backends::DX12 } else { wgpu::Backends::all() },
+                ..wgpu::InstanceDescriptor::new_without_display_handle()
+            });
             let adapter = instance.request_adapter(&wgpu::RequestAdapterOptions::default())
                 .await
                 .expect("HC4J Fatal Error:Failed to find a sutiable GPU adapter.");
