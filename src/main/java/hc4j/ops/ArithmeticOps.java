@@ -48,7 +48,7 @@ public class ArithmeticOps {
         return switch(type) {
             case i32 -> 0;
             case f32 -> 1;
-            case f64 -> throw new UnsupportedOperationException("F64 not supported yet.");
+          
         };
     }
 

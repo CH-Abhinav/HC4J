@@ -1,0 +1,69 @@
+plugins {
+    id 'java'
+    id 'application'
+    id 'me.champeau.jmh' version '0.7.3' 
+}
+
+group = 'hc4j'
+version = '0.0.2'
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(25)
+    }
+}
+
+
+application {
+    mainClass = 'hc4j.test.Main' 
+}
+
+repositories {
+    mavenCentral()
+}
+
+
+task buildRust(type: Exec) {
+    description = 'Compiles the HC4J Rust WebGPU backend via Cargo.'
+    group = 'build'
+    workingDir = rootDir
+
+    
+    if (System.getProperty("os.name").toLowerCase().contains("windows")) {
+        commandLine 'cmd', '/c', 'cargo build --manifest-path src/main/rust/Cargo.toml --release'
+    } else {
+        commandLine 'sh', '-c', 'cargo build --manifest-path src/main/rust/Cargo.toml --release'
+    }
+}
+
+processResources.dependsOn buildRust
+classes.dependsOn buildRust
+
+
+tasks.withType(JavaExec).configureEach {
+    
+    jvmArgs += ['--enable-native-access=ALL-UNNAMED']
+}
+
+tasks.withType(Test).configureEach {
+    useJUnitPlatform()
+    jvmArgs += ['--enable-native-access=ALL-UNNAMED']
+} 
+jmh {
+    
+    jvmArgsAppend = ['--enable-native-access=ALL-UNNAMED']
+    
+    
+    warmupIterations = 2
+    iterations = 5
+    fork = 1
+    threads = 1
+    
+    
+    resultFormat = 'JSON'
+    resultsFile = project.file("$buildDir/reports/jmh/results.json")
+}
+
+tasks.named('jmh').configure {
+    dependsOn buildRust
+}

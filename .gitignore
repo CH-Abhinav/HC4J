@@ -9,15 +9,6 @@
 .env.local
 .env.*.local
 
-# --- Python Virtual Environments ---
-venv/
-.venv/
-env/
-ENV/
-*.venv/
-virtualenv/
-
-
 # --- Rust / Cargo ---
 /target/
 **/*.rs.bk
@@ -56,3 +47,5 @@ hs_err_pid*
 .Trashes
 ehthumbs.db
 Thumbs.db
+
+
