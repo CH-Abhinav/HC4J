@@ -1,16 +1,13 @@
 use crate::get_engine;
 use wgpu::util::DeviceExt;
 
-// -------------------------------------------------------------------------
-// ULTIMATE OPTIMIZATION: Zero-Branch Mathematical Identity Layout
-// -------------------------------------------------------------------------
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct UnaryElemDims {
-    pub meta: [u32; 4],      // [length, is_contiguous, padding, padding]
-    pub shape: [u32; 8],     // Maps to array<vec4<u32>, 2> in WGSL
-    pub strides_a: [u32; 8], // Maps to array<vec4<u32>, 2> in WGSL
-    pub strides_c: [u32; 8], // Maps to array<vec4<u32>, 2> in WGSL
+    pub meta: [u32; 4],      
+    pub shape: [u32; 8],     
+    pub strides_a: [u32; 8], 
+    pub strides_c: [u32; 8], 
 }
 
 pub const UNARY_F32_SHADER_TEMPLATE: &str = r#"
