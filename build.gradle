@@ -45,6 +45,24 @@ tasks.withType(JavaExec).configureEach {
     jvmArgs += ['--enable-native-access=ALL-UNNAMED']
 }
 
+tasks.register('trignoSmokeTest', JavaExec) {
+    description = 'End-to-end check of the trig FFM bindings and the tiered VRAM manager on the real GPU.'
+    group = 'verification'
+    classpath = sourceSets.main.runtimeClasspath
+    mainClass = 'hc4j.test.TrignoSmokeTest'
+    javaLauncher = javaToolchains.launcherFor(java.toolchain)
+}
+
+tasks.register('engineSmokeTest', JavaExec) {
+    description = 'End-to-end check of matmul, fusion, slabs, batching and >67M-element grid folding on the real GPU.'
+    group = 'verification'
+    classpath = sourceSets.main.runtimeClasspath
+    mainClass = 'hc4j.test.EngineSmokeTest'
+    javaLauncher = javaToolchains.launcherFor(java.toolchain)
+    // The >67M-element checks hold two 269 MB float[] copies at once.
+    maxHeapSize = '2g'
+}
+
 tasks.withType(Test).configureEach {
     useJUnitPlatform()
     jvmArgs += ['--enable-native-access=ALL-UNNAMED']

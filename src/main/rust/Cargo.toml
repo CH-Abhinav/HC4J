@@ -32,3 +32,7 @@ features = ["vulkan", "wgsl"]
 [target.'cfg(target_os = "macos")'.dependencies.wgpu]
 version = "30.0.0"
 features = ["metal", "wgsl"]
+
+# Shader validation in unit tests (naga is already in the dependency tree via wgpu).
+[dev-dependencies]
+naga = { version = "30.0.0", features = ["wgsl-in"] }
