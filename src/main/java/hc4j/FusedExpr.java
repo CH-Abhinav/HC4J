@@ -114,6 +114,15 @@ public final class FusedExpr {
     public FusedExpr min(Tensor t) { return binary(MIN, of(t)); }
 
     public FusedExpr add(float c) { return scalar(ADD, c); }
+
+    /** {@code c - this}, the reverse of {@link #sub(float)}. */
+    public FusedExpr rsub(float c) { return reverseScalar(SUB, c); }
+
+    /** {@code c / this}. */
+    public FusedExpr rdiv(float c) { return reverseScalar(DIV, c); }
+
+    /** {@code c ^ this}. */
+    public FusedExpr rpow(float c) { return reverseScalar(POW, c); }
     public FusedExpr sub(float c) { return scalar(SUB, c); }
     public FusedExpr mul(float c) { return scalar(MUL, c); }
     public FusedExpr div(float c) { return scalar(DIV, c); }
@@ -131,10 +140,14 @@ public final class FusedExpr {
         return new FusedExpr(new Binary(op, root, other.root), shape, words + other.words + 1);
     }
 
+    /// Scalar on the left: the tree holds (const op this).
+    private FusedExpr reverseScalar(int op, float c) {
+        requireFinite(c);
+        return new FusedExpr(new Binary(op, new Const(c), root), shape, words + 3);
+    }
+
     private FusedExpr scalar(int op, float c) {
-        if (!Float.isFinite(c)) {
-            throw new IllegalArgumentException("Fused constants must be finite: " + c);
-        }
+        requireFinite(c);
         return new FusedExpr(new Binary(op, root, new Const(c)), shape, words + 3);
     }
 
@@ -208,6 +221,12 @@ public final class FusedExpr {
             }
             WgpuBackend.checkStatus(status, "FusedExpr.eval");
             return res;
+        }
+    }
+
+    private static void requireFinite(float c) {
+        if (!Float.isFinite(c)) {
+            throw new IllegalArgumentException("Fused constants must be finite: " + c);
         }
     }
 

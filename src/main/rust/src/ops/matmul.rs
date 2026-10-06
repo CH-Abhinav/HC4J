@@ -29,14 +29,41 @@
 //! the same command buffer, so the GEMM streams B along K with coalesced
 //! reads.
 //!
+//! **Working sets larger than VRAM.** If the operands cannot be made
+//! co-resident, `run_matmul` falls back to [`run_matmul_streaming`], which
+//! computes C in row blocks (`C[i..i+rb] = A[i..i+rb] * B`) with B held
+//! resident. K is never split, so the kernels and their accumulators are
+//! unchanged. B itself must fit in VRAM, and a stored-transposed A must be
+//! transposed into its own tensor first.
+//!
+//! **Working sets larger than VRAM.** When the operands cannot be made
+//! co-resident, matmul degrades in two steps:
+//!
+//! * [`run_matmul_streaming`] computes C in row blocks
+//!   (`C[i..i+rb] = A[i..i+rb] · B`) with B held resident. Row blocks of a
+//!   row-major matrix are contiguous, so each is one copy in and one copy out,
+//!   and K is never split.
+//! * [`run_matmul_blocked`], when even B does not fit, additionally blocks
+//!   over K and accumulates partial products in a resident C block (`beta = 1`
+//!   after the first K block). N stays whole, so one row of B plus one row of
+//!   C must fit in VRAM; B is re-read once per row block.
+//!
+//! A stored-transposed operand that has to be streamed must be transposed into
+//! its own tensor first ([`run_transpose`]), since transposing in place would
+//! need the whole matrix resident.
+//!
 //! Storage bindings are `read_write` (slab regions share buffers). Output
 //! aliasing an input is rejected, since tiles of C would race with reads of A/B.
 
+use std::collections::VecDeque;
 use std::sync::OnceLock;
 
 use crate::error::{Hc4jError, Hc4jResult, ffi_guard};
-use crate::memory::{DeviceBlock, DeviceSpan, TensorId, manager};
-use crate::ops::elementwise::grid_2d;
+use crate::memory::manager::try_with_capacity;
+use crate::memory::spill;
+use crate::memory::transfer::ReadbackRing;
+use crate::memory::{DeviceBlock, DeviceSpan, Snapshot, TensorId, TieredMemoryManager, manager};
+use crate::ops::elementwise::{OutputSink, grid_2d, open_output_sink};
 use crate::stream::Recorder;
 use crate::{ErrorTrap, GpuEngine};
 
@@ -269,7 +296,7 @@ pub fn register_kernel_wgsl(cfg: TileConfig, vec4: bool) -> String {
         "fn main(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wid: vec3<u32>, \
          @builtin(num_workgroups) nwg: vec3<u32>) {{"
     );
-    let _ = writeln!(s, "    let M = dims.p.x; let N = dims.p.y; let K = dims.p.z;");
+    let _ = writeln!(s, "    let M = dims.p.x; let N = dims.p.y; let K = dims.p.z; let beta = dims.p.w;");
     let _ = writeln!(s, "    let row0 = (wid.y + wid.z * nwg.y) * {bm}u;");
     let _ = writeln!(s, "    let col0 = wid.x * {bn}u;");
     let _ = writeln!(s, "    let tx = lid.x; let ty = lid.y;");
@@ -352,12 +379,21 @@ pub fn register_kernel_wgsl(cfg: TileConfig, vec4: bool) -> String {
             let _ = writeln!(s, "        let r = row0 + ty * {tm}u + {i}u;");
             let _ = writeln!(s, "        let c = col0 + {}u + tx * 4u;", j * group_span);
             if vec4 {
-                let _ = writeln!(s, "        if (r < M && c < N) {{ C[(r * N + c) / 4u] = acc[{slot}]; }}");
+                let _ = writeln!(s, "        if (r < M && c < N) {{");
+                let _ = writeln!(s, "            let idx = (r * N + c) / 4u;");
+                // beta == 1 accumulates, for K-blocked out-of-core matmul.
+                let _ = writeln!(s, "            if (beta == 1u) {{ C[idx] = C[idx] + acc[{slot}]; }} else {{ C[idx] = acc[{slot}]; }}");
+                let _ = writeln!(s, "        }}");
             } else {
                 let _ = writeln!(s, "        if (r < M) {{");
                 let _ = writeln!(s, "            let base = r * N + c; let v = acc[{slot}];");
                 for (q, comp) in ["x", "y", "z", "w"].iter().enumerate() {
-                    let _ = writeln!(s, "            if (c + {q}u < N) {{ C[base + {q}u] = v.{comp}; }}");
+                    let _ = writeln!(s, "            if (c + {q}u < N) {{");
+                    let _ = writeln!(
+                        s,
+                        "                if (beta == 1u) {{ C[base + {q}u] = C[base + {q}u] + v.{comp}; }} else {{ C[base + {q}u] = v.{comp}; }}"
+                    );
+                    let _ = writeln!(s, "            }}");
                 }
                 let _ = writeln!(s, "        }}");
             }
@@ -411,7 +447,9 @@ fn main(
         workgroupBarrier();
     }
     if (row < M && col < N) {
-        C[row * N + col] = acc;
+        let idx = row * N + col;
+        // beta == 1 accumulates, for K-blocked out-of-core matmul.
+        if (dims.p.w == 1u) { C[idx] = C[idx] + acc; } else { C[idx] = acc; }
     }
 }
 "#;
@@ -474,7 +512,7 @@ fn main(
         let count = atomicLoad(&slots);
         var acc = 0.0;
         for (var i = 0u; i < count; i = i + 1u) {{ acc = acc + partial[i]; }}
-        Y[row] = acc;
+        if (dims.p.z == 1u) {{ Y[row] = Y[row] + acc; }} else {{ Y[row] = acc; }}
     }}
 }}
 "
@@ -503,7 +541,9 @@ fn main(
         if (lane < s) {{ partial[li] = partial[li] + partial[li + s]; }}
         workgroupBarrier();
     }}
-    if (lane == 0u && row < R) {{ Y[row] = partial[li]; }}
+    if (lane == 0u && row < R) {{
+        if (dims.p.z == 1u) {{ Y[row] = Y[row] + partial[li]; }} else {{ Y[row] = partial[li]; }}
+    }}
 }}
 "
         )
@@ -547,7 +587,9 @@ fn main(
         if (ly < s) {{ partial[li] = partial[li] + partial[li + s * COLS]; }}
         workgroupBarrier();
     }}
-    if (ly == 0u && col < Cn) {{ Y[col] = partial[li]; }}
+    if (ly == 0u && col < Cn) {{
+        if (dims.p.z == 1u) {{ Y[col] = Y[col] + partial[li]; }} else {{ Y[col] = partial[li]; }}
+    }}
 }}
 "
     )
@@ -594,6 +636,23 @@ fn main(
 }
 "#;
 
+/// Kernels worth compiling before first use: on D3D12 the register-tiled GEMM
+/// and the transpose kernel cost 0.5-5 s in FXC, which would otherwise land
+/// on the first matmul a caller issues.
+pub fn warmup_kernels(engine: &GpuEngine) -> Vec<(String, String)> {
+    let caps = Caps::of(engine);
+    let cfg = match caps.forced_tile {
+        Some(cfg) if caps.fits(cfg) => cfg,
+        _ if caps.discrete && caps.fits(TILE_128) => TILE_128,
+        _ => TILE_64,
+    };
+    vec![
+        kernel_source(Kernel::Register { cfg, vec4: true }),
+        kernel_source(Kernel::Tiled16),
+        ("transpose_f32".to_string(), TRANSPOSE_WGSL.to_string()),
+    ]
+}
+
 fn kernel_source(kernel: Kernel) -> (String, String) {
     match kernel {
         Kernel::Register { cfg, vec4 } => (
@@ -629,6 +688,27 @@ fn tiled_grid(engine: &GpuEngine, col_tiles: u32, row_tiles: u32) -> Hc4jResult<
         return Err(Hc4jError::Unsupported("matrix too tall for one dispatch"));
     }
     Ok((col_tiles.max(1), y, z))
+}
+
+/// Dispatch grid for a kernel producing an `rb x n` output block.
+///
+/// With no transpose flags the planner only picks the row-mapped GEMV when
+/// `n == 1`, so its output length is `rb`; the column mapping always produces
+/// `n` outputs.
+fn block_grid(engine: &GpuEngine, kernel: Kernel, rb: u32, n: u32) -> Hc4jResult<(u32, u32, u32)> {
+    let max = engine.limits.max_compute_workgroups_per_dimension;
+    Ok(match kernel {
+        Kernel::GemvRows { lanes, .. } => {
+            let (x, y) = grid_2d(rb.div_ceil(256 / lanes), max);
+            (x, y, 1)
+        }
+        Kernel::GemvCols { cols } => {
+            let (x, y) = grid_2d(n.div_ceil(cols), max);
+            (x, y, 1)
+        }
+        Kernel::Register { cfg, .. } => tiled_grid(engine, n.div_ceil(cfg.bn), rb.div_ceil(cfg.bm))?,
+        Kernel::Tiled16 => tiled_grid(engine, n.div_ceil(16), rb.div_ceil(16))?,
+    })
 }
 
 fn bind_group(
@@ -689,8 +769,15 @@ pub fn run_matmul(id_a: TensorId, id_b: TensorId, id_out: TensorId, m: u32, n: u
         return Err(Hc4jError::InvalidParam("matmul output must not alias an input"));
     }
 
-    // No streaming fallback: GEMM tiles need random access to whole operands.
-    let resident = mgr.acquire_resident(&[id_a, id_b, id_out])?;
+    let resident = match mgr.acquire_resident(&[id_a, id_b, id_out]) {
+        Ok(resident) => resident,
+        // The working set does not fit in VRAM: stream A and C in row blocks.
+        Err(Hc4jError::OutOfMemory) => {
+            crate::hc4j_trace!("matmul {m}x{n}x{k} exceeds VRAM; streaming row blocks");
+            return run_matmul_streaming(mgr, id_a, id_b, id_out, m, n, k, flags);
+        }
+        Err(err) => return Err(err),
+    };
     let (a, b, c) = (&resident.spans[0], &resident.spans[1], &resident.spans[2]);
     if c.overlaps(a) || c.overlaps(b) {
         return Err(Hc4jError::InvalidParam("matmul output must not alias an input"));
@@ -720,7 +807,7 @@ pub fn run_matmul(id_a: TensorId, id_b: TensorId, id_out: TensorId, m: u32, n: u
             };
             let bytes = matrix.size + vector.size + c.size;
             let trap = ErrorTrap::push(&engine.device);
-            let recorded = engine.stream.record(1, |rec| {
+            let recorded = engine.stream.record(1, "matmul (gemv)", |rec| {
                 let uniform = rec.uniform(&dims_bytes([out_len, k, 0, 0]))?;
                 let bg = bind_group(engine, &pipeline, vec![matrix.binding(), vector.binding(), c.binding(), uniform]);
                 rec.dispatch(&pipeline, &bg, grid, bytes);
@@ -747,7 +834,7 @@ pub fn run_matmul(id_a: TensorId, id_b: TensorId, id_out: TensorId, m: u32, n: u
             // Transposes and the GEMM go into one recorded unit: one command
             // buffer, one submission (or none extra inside a batch).
             let trap = ErrorTrap::push(&engine.device);
-            let recorded = engine.stream.record(slots, |rec| {
+            let recorded = engine.stream.record(slots, "matmul (gemm)", |rec| {
                 let a_eff = match (&scratch_a, &transpose) {
                     (Some(scratch), Some(tp)) => {
                         // A stored K×M -> M×K.
@@ -776,6 +863,477 @@ pub fn run_matmul(id_a: TensorId, id_b: TensorId, id_out: TensorId, m: u32, n: u
     }
 }
 
+/// Target scratch size per streamed operand block.
+const STREAM_BLOCK_BYTES: u64 = 8 << 20;
+
+/// Out-of-core matmul for working sets larger than VRAM.
+///
+/// `C` is computed in row blocks: `C[i..i+rb] = A[i..i+rb] · B`. A row block of
+/// a row-major matrix is contiguous, so each block is one copy in and one copy
+/// out, and K is never split — which keeps the kernels (and their accumulators)
+/// exactly as they are in the resident path.
+///
+/// B stays VRAM-resident for the whole operation, since every block needs all
+/// of it. If B alone cannot be made resident this returns `OutOfMemory`, and a
+/// stored-transposed A returns `Unsupported` (transposing it would need the
+/// whole matrix resident; transpose it explicitly first).
+// Mirrors the FFI argument list rather than bundling (m, n, k, flags).
+#[allow(clippy::too_many_arguments)]
+fn run_matmul_streaming(
+    mgr: &TieredMemoryManager,
+    id_a: TensorId,
+    id_b: TensorId,
+    id_out: TensorId,
+    m: u32,
+    n: u32,
+    k: u32,
+    flags: u32,
+) -> Hc4jResult<()> {
+    let engine = mgr.engine();
+    if flags & FLAG_TRANS_A != 0 {
+        return Err(Hc4jError::Unsupported(
+            "a stored-transposed A cannot be streamed; transpose it into its own tensor first",
+        ));
+    }
+    let max_binding = engine.limits.max_storage_buffer_binding_size;
+
+    // B must be resident: every row block multiplies by all of it. If even B
+    // does not fit, fall back to blocking over K as well.
+    let b_resident = match mgr.acquire_resident(&[id_b]) {
+        Ok(resident) => resident,
+        Err(Hc4jError::OutOfMemory) => {
+            crate::hc4j_trace!("matmul {m}x{n}x{k}: B does not fit either; blocking over K");
+            return run_matmul_blocked(mgr, id_a, id_b, id_out, m, n, k, flags);
+        }
+        Err(err) => return Err(err),
+    };
+    let b_span = &b_resident.spans[0];
+    if b_span.size > max_binding {
+        return Err(Hc4jError::Unsupported("matmul B exceeds the storage-binding limit"));
+    }
+    // Pre-transpose B once, outside the block loop.
+    let b_scratch = if flags & FLAG_TRANS_B != 0 { Some(mgr.allocate_device(b_span.size, false)?) } else { None };
+    if let Some(scratch) = &b_scratch {
+        let pipeline = transpose_pipeline(engine)?;
+        let trap = ErrorTrap::push(&engine.device);
+        let recorded = engine
+            .stream
+            .record(1, "transpose (matmul B)", |rec| encode_transpose(rec, engine, &pipeline, b_span, scratch.span(), n, k));
+        let trapped = trap.finish();
+        recorded.and(trapped)?;
+    }
+    let b_eff = b_scratch.as_ref().map_or(b_span, |s| s.span());
+
+    let (a_source, _, _a_pin) = mgr.pin_snapshot(id_a)?;
+    let (out_snapshot, out_size, _out_pin) = mgr.pin_snapshot(id_out)?;
+    let mut sink = match out_snapshot {
+        Snapshot::Device(span) => OutputSink::Existing(span),
+        _ => open_output_sink(mgr, out_size)?,
+    };
+
+    // Block rows so both scratch buffers stay near the target size.
+    let a_row = (k as u64) * 4;
+    let c_row = (n as u64) * 4;
+    let mut rows = (STREAM_BLOCK_BYTES / a_row.max(c_row)).clamp(1, m as u64) as u32;
+    let (scratch_a, scratch_c) = loop {
+        let attempt = (|| -> Hc4jResult<(DeviceBlock, DeviceBlock)> {
+            let a_blk = mgr.allocate_device(rows as u64 * a_row, false)?;
+            let c_blk = mgr.allocate_device(rows as u64 * c_row, false)?;
+            Ok((a_blk, c_blk))
+        })();
+        match attempt {
+            Ok(pair) => break pair,
+            Err(Hc4jError::OutOfMemory) if rows > 1 => rows /= 2,
+            Err(err) => return Err(err),
+        }
+    };
+    if scratch_a.span().size > max_binding || scratch_c.span().size > max_binding {
+        return Err(Hc4jError::Unsupported("matmul row block exceeds the storage-binding limit"));
+    }
+
+    let mut host_block = Vec::new();
+    if matches!(a_source, Snapshot::Disk(_)) {
+        host_block = try_with_capacity(rows as u64 * a_row).ok_or(Hc4jError::OutOfMemory)?;
+        host_block.resize((rows as u64 * a_row) as usize, 0);
+    }
+
+    let blocks = m.div_ceil(rows);
+    let need_ring = sink.device_span().is_none();
+    let mut stream_block = |ring: Option<&mut ReadbackRing>| -> Hc4jResult<()> {
+        let mut ring = ring;
+        let slots = ring.as_ref().map_or(1, |r| r.slot_count());
+        let mut inflight: VecDeque<wgpu::SubmissionIndex> = VecDeque::new();
+        for block in 0..blocks {
+            let row0 = block * rows;
+            let rb = rows.min(m - row0);
+            let a_bytes = rb as u64 * a_row;
+            let c_bytes = rb as u64 * c_row;
+            let slot = (block as usize) % slots;
+
+            // Retire the block that previously used this staging slot.
+            if let Some(ring) = ring.as_mut() {
+                ring.drain(engine, slot, &mut |chunk: &[u8]| sink.append(chunk))?;
+            }
+
+            // Stage this row block of A (contiguous) into scratch.
+            let dst = scratch_a.span();
+            match &a_source {
+                Snapshot::Host(data) => {
+                    let start = (row0 as u64 * a_row) as usize;
+                    let slice = data
+                        .get(start..start + a_bytes as usize)
+                        .ok_or(Hc4jError::Readback("A shorter than its recorded size".to_string()))?;
+                    engine.stream.write_buffer(&dst.buffer, dst.offset, slice);
+                }
+                Snapshot::Disk(file) => {
+                    let buf = &mut host_block[..a_bytes as usize];
+                    spill::read_exact_at(file, buf, row0 as u64 * a_row)?;
+                    engine.stream.write_buffer(&dst.buffer, dst.offset, buf);
+                }
+                Snapshot::Device(_) => {} // copied on the GPU inside the recording below
+            }
+
+            let block_plan = plan(&Caps::of(engine), rb, n, k, 0)?;
+            let (name, source) = kernel_source(block_plan.kernel);
+            let pipeline = engine.get_or_compile(&name, "main", &source)?;
+            let grid = block_grid(engine, block_plan.kernel, rb, n)?;
+
+            let trap = ErrorTrap::push(&engine.device);
+            let out_span = sink.device_span().cloned();
+            let (_, submission) = engine.stream.submit_now(1, |rec| {
+                if let Snapshot::Device(a_span) = &a_source {
+                    let src = a_span;
+                    rec.encoder()
+                        .copy_buffer_to_buffer(&src.buffer, src.offset + row0 as u64 * a_row, &dst.buffer, dst.offset, a_bytes);
+                }
+                // GEMV kernels read [rows, K]; GEMM kernels read [M, N, K].
+                let dims = match block_plan.operands {
+                    Operands::Gemv { out_len, k: reduce, .. } => dims_bytes([out_len, reduce, 0, 0]),
+                    Operands::Gemm { .. } => dims_bytes([rb, n, k, 0]),
+                };
+                let uniform = rec.uniform(&dims)?;
+                let a_bind = scratch_a.span().sub_binding(0, a_bytes);
+                let c_bind = scratch_c.span().sub_binding(0, c_bytes);
+                // A GEMV block whose matrix is B (the m == 1 mapping) binds the
+                // matrix first and the streamed block as the vector.
+                let (first, second) = match block_plan.operands {
+                    Operands::Gemv { matrix_is_a: false, .. } => (b_eff.binding(), a_bind),
+                    _ => (a_bind, b_eff.binding()),
+                };
+                let bg = bind_group(engine, &pipeline, vec![first, second, c_bind, uniform]);
+                rec.dispatch(&pipeline, &bg, grid, a_bytes + b_eff.size + c_bytes);
+                match (&out_span, ring.as_ref()) {
+                    // Output already in VRAM: copy the block straight back.
+                    (Some(out), _) => {
+                        let src = scratch_c.span();
+                        rec.encoder().copy_buffer_to_buffer(
+                            &src.buffer,
+                            src.offset,
+                            &out.buffer,
+                            out.offset + row0 as u64 * c_row,
+                            c_bytes,
+                        );
+                    }
+                    (None, Some(ring)) => {
+                        let src = scratch_c.span();
+                        rec.encoder()
+                            .copy_buffer_to_buffer(&src.buffer, src.offset, ring.buffer(slot), 0, c_bytes);
+                    }
+                    (None, None) => return Err(Hc4jError::Device("streamed matmul without an output sink".to_string())),
+                }
+                Ok(())
+            })?;
+            trap.finish()?;
+
+            if let Some(ring) = ring.as_mut() {
+                ring.arm(slot, c_bytes, submission);
+            } else {
+                inflight.push_back(submission);
+                if inflight.len() > 2
+                    && let Some(oldest) = inflight.pop_front()
+                {
+                    engine.wait_for(oldest)?;
+                }
+            }
+        }
+        if let Some(ring) = ring.as_mut() {
+            for block in blocks.saturating_sub(slots as u32)..blocks {
+                ring.drain(engine, block as usize % slots, &mut |chunk: &[u8]| sink.append(chunk))?;
+            }
+        }
+        Ok(())
+    };
+
+    if need_ring {
+        mgr.with_ring(|ring| stream_block(Some(ring)))?;
+    } else {
+        stream_block(None)?;
+    }
+
+    if let Some(residency) = sink.into_residency() {
+        mgr.replace_residency(id_out, residency)?;
+    }
+    mgr.record_streamed_op();
+    Ok(())
+}
+
+/// Copies `len` bytes of a non-resident operand into `host` at `at`.
+fn gather_host(source: &Snapshot, src_offset: u64, len: u64, host: &mut [u8], at: usize) -> Hc4jResult<()> {
+    let dst = host
+        .get_mut(at..at + len as usize)
+        .ok_or_else(|| Hc4jError::Device("staging buffer too small".to_string()))?;
+    match source {
+        Snapshot::Host(data) => {
+            let src = data
+                .get(src_offset as usize..(src_offset + len) as usize)
+                .ok_or_else(|| Hc4jError::Readback("operand shorter than its recorded size".to_string()))?;
+            dst.copy_from_slice(src);
+            Ok(())
+        }
+        Snapshot::Disk(file) => Ok(spill::read_exact_at(file, dst, src_offset)?),
+        Snapshot::Device(_) => Err(Hc4jError::Device("device operands are copied on the GPU".to_string())),
+    }
+}
+
+/// Out-of-core matmul for working sets where even B cannot be made resident.
+///
+/// Blocks over rows of A/C **and** over K: `C[i] = Σ_j A[i, j] · B[j]`, with
+/// the C block held in VRAM and accumulated across K blocks (`beta = 1` after
+/// the first). A blocks are gathered row by row, since a block of columns is
+/// strided in a row-major A; B blocks are contiguous row chunks.
+///
+/// N is kept whole, so one row of B plus one row of C must fit in VRAM. B is
+/// re-read once per row block, which is the price of not having room for it;
+/// the row block is made as large as the budget allows to amortise that.
+#[allow(clippy::too_many_arguments)]
+fn run_matmul_blocked(
+    mgr: &TieredMemoryManager,
+    id_a: TensorId,
+    id_b: TensorId,
+    id_out: TensorId,
+    m: u32,
+    n: u32,
+    k: u32,
+    flags: u32,
+) -> Hc4jResult<()> {
+    let engine = mgr.engine();
+    if flags & FLAG_TRANS_A != 0 {
+        return Err(Hc4jError::Unsupported(
+            "a stored-transposed A cannot be streamed; transpose it into its own tensor first",
+        ));
+    }
+    if flags & FLAG_TRANS_B != 0 {
+        return Err(Hc4jError::Unsupported(
+            "a stored-transposed B larger than VRAM cannot be transposed in place; transpose it into its own tensor first",
+        ));
+    }
+
+    let (a_source, _, _a_pin) = mgr.pin_snapshot(id_a)?;
+    let (b_source, _, _b_pin) = mgr.pin_snapshot(id_b)?;
+    let (out_snapshot, out_size, _out_pin) = mgr.pin_snapshot(id_out)?;
+    let mut sink = match out_snapshot {
+        Snapshot::Device(span) => OutputSink::Existing(span),
+        _ => open_output_sink(mgr, out_size)?,
+    };
+
+    // Block sizes: aim for ~STREAM_BLOCK_BYTES per operand block, then shrink
+    // the larger dimension until all three blocks fit in VRAM.
+    let row_c = (n as u64) * 4;
+    let mut rows = (STREAM_BLOCK_BYTES / row_c).clamp(1, m as u64) as u32;
+    let mut depth = (STREAM_BLOCK_BYTES / row_c).clamp(1, k as u64) as u32;
+    let (a_block, b_block, c_block) = loop {
+        let attempt = (|| -> Hc4jResult<(DeviceBlock, DeviceBlock, DeviceBlock)> {
+            let a = mgr.allocate_device(rows as u64 * depth as u64 * 4, false)?;
+            let b = mgr.allocate_device(depth as u64 * row_c, false)?;
+            let c = mgr.allocate_device(rows as u64 * row_c, false)?;
+            Ok((a, b, c))
+        })();
+        match attempt {
+            Ok(blocks) => break blocks,
+            Err(Hc4jError::OutOfMemory) if rows > 1 || depth > 1 => {
+                if rows >= depth && rows > 1 {
+                    rows /= 2;
+                } else {
+                    depth /= 2;
+                }
+            }
+            Err(err) => return Err(err),
+        }
+    };
+    let max_binding = engine.limits.max_storage_buffer_binding_size;
+    if [a_block.span(), b_block.span(), c_block.span()].iter().any(|s| s.size > max_binding) {
+        return Err(Hc4jError::Unsupported("matmul block exceeds the storage-binding limit"));
+    }
+    crate::hc4j_trace!("blocked matmul {m}x{n}x{k}: {rows} rows x {depth} deep");
+
+    // Host staging for operands that are not device-resident.
+    let mut a_stage = Vec::new();
+    if !matches!(a_source, Snapshot::Device(_)) {
+        a_stage = try_with_capacity(rows as u64 * depth as u64 * 4).ok_or(Hc4jError::OutOfMemory)?;
+        a_stage.resize(rows as usize * depth as usize * 4, 0);
+    }
+    let mut b_stage = Vec::new();
+    if matches!(b_source, Snapshot::Disk(_)) {
+        b_stage = try_with_capacity(depth as u64 * row_c).ok_or(Hc4jError::OutOfMemory)?;
+        b_stage.resize((depth as u64 * row_c) as usize, 0);
+    }
+
+    let row_blocks = m.div_ceil(rows);
+    let k_blocks = k.div_ceil(depth);
+    let need_ring = sink.device_span().is_none();
+
+    let mut run = |ring: Option<&mut ReadbackRing>| -> Hc4jResult<()> {
+        let mut ring = ring;
+        let slots = ring.as_ref().map_or(1, |r| r.slot_count());
+        let mut inflight: VecDeque<wgpu::SubmissionIndex> = VecDeque::new();
+        for row_block in 0..row_blocks {
+            let row0 = row_block * rows;
+            let rb = rows.min(m - row0);
+            let c_bytes = rb as u64 * row_c;
+            let slot = (row_block as usize) % slots;
+            if let Some(ring) = ring.as_mut() {
+                // Retire the row block that previously used this slot.
+                ring.drain(engine, slot, &mut |chunk: &[u8]| sink.append(chunk))?;
+            }
+
+            for k_block in 0..k_blocks {
+                let k0 = k_block * depth;
+                let kb = depth.min(k - k0);
+                let a_bytes = rb as u64 * kb as u64 * 4;
+                let b_bytes = kb as u64 * row_c;
+
+                // Stage this A block (strided: one gather per row) and B block
+                // (contiguous) unless they are already in VRAM.
+                if !matches!(a_source, Snapshot::Device(_)) {
+                    for r in 0..rb as u64 {
+                        let src = ((row0 as u64 + r) * k as u64 + k0 as u64) * 4;
+                        gather_host(&a_source, src, kb as u64 * 4, &mut a_stage, (r * kb as u64 * 4) as usize)?;
+                    }
+                    let dst = a_block.span();
+                    engine.stream.write_buffer(&dst.buffer, dst.offset, &a_stage[..a_bytes as usize]);
+                }
+                match &b_source {
+                    Snapshot::Host(data) => {
+                        let start = (k0 as u64 * row_c) as usize;
+                        let src = data
+                            .get(start..start + b_bytes as usize)
+                            .ok_or_else(|| Hc4jError::Readback("B shorter than its recorded size".to_string()))?;
+                        let dst = b_block.span();
+                        engine.stream.write_buffer(&dst.buffer, dst.offset, src);
+                    }
+                    Snapshot::Disk(_) => {
+                        gather_host(&b_source, k0 as u64 * row_c, b_bytes, &mut b_stage, 0)?;
+                        let dst = b_block.span();
+                        engine.stream.write_buffer(&dst.buffer, dst.offset, &b_stage[..b_bytes as usize]);
+                    }
+                    Snapshot::Device(_) => {}
+                }
+
+                let block_plan = plan(&Caps::of(engine), rb, n, kb, 0)?;
+                let (name, source) = kernel_source(block_plan.kernel);
+                let pipeline = engine.get_or_compile(&name, "main", &source)?;
+                let grid = block_grid(engine, block_plan.kernel, rb, n)?;
+                let beta = u32::from(k_block > 0);
+
+                let trap = ErrorTrap::push(&engine.device);
+                let (_, submission) = engine.stream.submit_now(1, |rec| {
+                    if let Snapshot::Device(a_span) = &a_source {
+                        let dst = a_block.span();
+                        for r in 0..rb as u64 {
+                            let src = a_span.offset + ((row0 as u64 + r) * k as u64 + k0 as u64) * 4;
+                            rec.encoder().copy_buffer_to_buffer(
+                                &a_span.buffer,
+                                src,
+                                &dst.buffer,
+                                dst.offset + r * kb as u64 * 4,
+                                kb as u64 * 4,
+                            );
+                        }
+                    }
+                    if let Snapshot::Device(b_span) = &b_source {
+                        let dst = b_block.span();
+                        rec.encoder().copy_buffer_to_buffer(
+                            &b_span.buffer,
+                            b_span.offset + k0 as u64 * row_c,
+                            &dst.buffer,
+                            dst.offset,
+                            b_bytes,
+                        );
+                    }
+                    let dims = match block_plan.operands {
+                        Operands::Gemv { out_len, k: reduce, .. } => dims_bytes([out_len, reduce, beta, 0]),
+                        Operands::Gemm { .. } => dims_bytes([rb, n, kb, beta]),
+                    };
+                    let uniform = rec.uniform(&dims)?;
+                    let a_bind = a_block.span().sub_binding(0, a_bytes);
+                    let b_bind = b_block.span().sub_binding(0, b_bytes);
+                    let c_bind = c_block.span().sub_binding(0, c_bytes);
+                    let (first, second) = match block_plan.operands {
+                        Operands::Gemv { matrix_is_a: false, .. } => (b_bind, a_bind),
+                        _ => (a_bind, b_bind),
+                    };
+                    let bg = bind_group(engine, &pipeline, vec![first, second, c_bind, uniform]);
+                    rec.dispatch(&pipeline, &bg, grid, a_bytes + b_bytes + c_bytes);
+                    Ok(())
+                })?;
+                trap.finish()?;
+                inflight.push_back(submission);
+                if inflight.len() > 2
+                    && let Some(oldest) = inflight.pop_front()
+                {
+                    engine.wait_for(oldest)?;
+                }
+            }
+
+            // The row block is complete: hand it to the output.
+            let out_span = sink.device_span().cloned();
+            let trap = ErrorTrap::push(&engine.device);
+            let staging = ring.as_ref().map(|r| r.buffer(slot).clone());
+            let (_, submission) = engine.stream.submit_now(0, |rec| {
+                let src = c_block.span();
+                match (&out_span, &staging) {
+                    (Some(out), _) => rec.encoder().copy_buffer_to_buffer(
+                        &src.buffer,
+                        src.offset,
+                        &out.buffer,
+                        out.offset + row0 as u64 * row_c,
+                        c_bytes,
+                    ),
+                    (None, Some(staging)) => {
+                        rec.encoder().copy_buffer_to_buffer(&src.buffer, src.offset, staging, 0, c_bytes)
+                    }
+                    (None, None) => return Err(Hc4jError::Device("blocked matmul without an output sink".to_string())),
+                }
+                Ok(())
+            })?;
+            trap.finish()?;
+            if let Some(ring) = ring.as_mut() {
+                ring.arm(slot, c_bytes, submission);
+            } else {
+                inflight.push_back(submission);
+            }
+        }
+        if let Some(ring) = ring.as_mut() {
+            for block in row_blocks.saturating_sub(slots as u32)..row_blocks {
+                ring.drain(engine, block as usize % slots, &mut |chunk: &[u8]| sink.append(chunk))?;
+            }
+        }
+        Ok(())
+    };
+
+    if need_ring {
+        mgr.with_ring(|ring| run(Some(ring)))?;
+    } else {
+        run(None)?;
+    }
+
+    if let Some(residency) = sink.into_residency() {
+        mgr.replace_residency(id_out, residency)?;
+    }
+    mgr.record_streamed_op();
+    Ok(())
+}
+
 pub fn run_transpose(id_in: TensorId, id_out: TensorId, rows: u32, cols: u32) -> Hc4jResult<()> {
     if rows == 0 || cols == 0 {
         return Err(Hc4jError::InvalidParam("transpose dimensions must be non-zero"));
@@ -798,7 +1356,7 @@ pub fn run_transpose(id_in: TensorId, id_out: TensorId, rows: u32, cols: u32) ->
     let trap = ErrorTrap::push(&engine.device);
     let recorded = engine
         .stream
-        .record(1, |rec| encode_transpose(rec, engine, &pipeline, src, dst, rows, cols));
+        .record(1, "transpose", |rec| encode_transpose(rec, engine, &pipeline, src, dst, rows, cols));
     let trapped = trap.finish();
     recorded.and(trapped)
 }

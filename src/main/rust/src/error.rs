@@ -59,6 +59,20 @@ impl Hc4jError {
     }
 }
 
+impl Hc4jError {
+    /// Appends diagnostic context to the message-carrying variants. Used to
+    /// name the ops a failed command batch contained, since a batch is
+    /// validated when it is submitted rather than when each op is recorded.
+    pub fn with_context(self, context: &str) -> Self {
+        match self {
+            Hc4jError::Readback(msg) => Hc4jError::Readback(format!("{msg} ({context})")),
+            Hc4jError::Device(msg) => Hc4jError::Device(format!("{msg} ({context})")),
+            Hc4jError::GpuValidation(msg) => Hc4jError::GpuValidation(format!("{msg} ({context})")),
+            other => other,
+        }
+    }
+}
+
 impl fmt::Display for Hc4jError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -119,5 +133,28 @@ pub fn ffi_guard(op: &str, body: impl FnOnce() -> Hc4jResult<()>) -> i32 {
             eprintln!("[HC4J] {op} panicked; the error was contained at the FFI boundary");
             HC4J_ERR_DEVICE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{HC4J_ERR_GPU_VALIDATION, HC4J_ERR_NOT_FOUND, Hc4jError};
+
+    #[test]
+    fn context_names_the_batch_that_failed() {
+        let err = Hc4jError::GpuValidation("bad bind group".to_string())
+            .with_context("batch of 3 ops: elementwise, matmul (gemm), transpose");
+        assert_eq!(
+            err.to_string(),
+            "GPU validation error: bad bind group (batch of 3 ops: elementwise, matmul (gemm), transpose)"
+        );
+        assert_eq!(err.code(), HC4J_ERR_GPU_VALIDATION, "context must not change the status code");
+    }
+
+    #[test]
+    fn context_leaves_message_free_variants_alone() {
+        let err = Hc4jError::NotFound.with_context("batch of 1 ops: elementwise");
+        assert_eq!(err.to_string(), "tensor handle not found");
+        assert_eq!(err.code(), HC4J_ERR_NOT_FOUND);
     }
 }

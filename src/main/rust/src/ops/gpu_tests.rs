@@ -277,3 +277,116 @@ fn a_batch_is_one_submission() {
     free(x);
     free(out);
 }
+
+#[test]
+fn matmul_streams_when_the_working_set_exceeds_vram() {
+    let Some(_gpu) = gpu() else { return };
+    let mgr = manager().unwrap();
+    let restore = mgr.stats().vram_budget;
+    // 1 MiB of VRAM: B (256 KiB) stays resident, A and C (2 MiB each) cannot.
+    mgr.configure(1 << 20, 0).unwrap();
+    let before = mgr.stats().streamed_ops;
+
+    let (m, n, k) = (2048usize, 256usize, 256usize);
+    let a = noise(m * k, 31);
+    let b = noise(k * n, 32);
+    let (ia, ib) = (upload(&a), upload(&b));
+    let out = hc4j_gpu_alloc_uninit(m * n);
+    assert_ne!(crate::memory::hc4j_mem_residency(ia), 0, "A should not be VRAM-resident at this budget");
+
+    for flags in [0, FLAG_TRANS_B] {
+        let status = dispatch_matmul_f32_ex(ia, ib, out, m as u32, n as u32, k as u32, flags);
+        assert_eq!(status, 0, "flags={flags}");
+        let got = download(out, m * n);
+        let want = cpu_matmul(&a, &b, m, n, k, false, flags & 2 != 0);
+        let unit = f32::EPSILON as f64 / 2.0;
+        for (idx, (&g, &(w, abs))) in got.iter().zip(&want).enumerate() {
+            let tol = 2.0 * k as f64 * unit * abs + 1e-6;
+            assert!((g as f64 - w).abs() <= tol, "flags={flags} @{idx}: got {g} want {w}");
+        }
+    }
+    // A streamed GEMV: 8 MiB of A, one row block at a time.
+    let (gm, gk) = (4096usize, 512usize);
+    let ga = noise(gm * gk, 33);
+    let gx = noise(gk, 34);
+    let (iga, igx) = (upload(&ga), upload(&gx));
+    let gout = hc4j_gpu_alloc_uninit(gm);
+    assert_eq!(dispatch_matmul_f32_ex(iga, igx, gout, gm as u32, 1, gk as u32, 0), 0);
+    let got = download(gout, gm);
+    let want = cpu_matmul(&ga, &gx, gm, 1, gk, false, false);
+    let unit = f32::EPSILON as f64 / 2.0;
+    for (idx, (&g, &(w, abs))) in got.iter().zip(&want).enumerate() {
+        assert!((g as f64 - w).abs() <= 2.0 * gk as f64 * unit * abs + 1e-6, "gemv @{idx}");
+    }
+
+    let after = mgr.stats().streamed_ops;
+    assert!(after >= before + 3, "streaming path ran ({} ops)", after - before);
+    // A stored-transposed A cannot be streamed: reading its logical rows would
+    // need the whole matrix resident. Same A storage, read as K x M = 2048 x 256.
+    let wide_b = upload(&noise(m * n, 35)); // k' = 2048 by n' = 256
+    let small_out = hc4j_gpu_alloc_uninit(k * n);
+    assert_eq!(
+        dispatch_matmul_f32_ex(ia, wide_b, small_out, k as u32, n as u32, m as u32, FLAG_TRANS_A),
+        crate::error::HC4J_ERR_UNSUPPORTED
+    );
+
+    for id in [ia, ib, out, iga, igx, gout, wide_b, small_out] {
+        free(id);
+    }
+    mgr.configure(restore, 0).unwrap();
+}
+
+#[test]
+fn matmul_blocks_over_k_when_b_does_not_fit_either() {
+    let Some(_gpu) = gpu() else { return };
+    let mgr = manager().unwrap();
+    let restore = mgr.stats().vram_budget;
+    // 256 KiB of VRAM: B alone (512 KiB) cannot be resident, so the product
+    // has to be blocked over K and accumulated in VRAM.
+    mgr.configure(256 << 10, 0).unwrap();
+    let before = mgr.stats().streamed_ops;
+    let unit = f32::EPSILON as f64 / 2.0;
+
+    // Blocked GEMM.
+    let (m, n, k) = (512usize, 256usize, 512usize);
+    let a = noise(m * k, 41);
+    let b = noise(k * n, 42);
+    let (ia, ib) = (upload(&a), upload(&b));
+    let out = hc4j_gpu_alloc_uninit(m * n);
+    assert_eq!(dispatch_matmul_f32_ex(ia, ib, out, m as u32, n as u32, k as u32, 0), 0);
+    let got = download(out, m * n);
+    let want = cpu_matmul(&a, &b, m, n, k, false, false);
+    for (idx, (&g, &(w, abs))) in got.iter().zip(&want).enumerate() {
+        let tol = 2.0 * k as f64 * unit * abs + 1e-6;
+        assert!((g as f64 - w).abs() <= tol, "gemm @{idx}: got {g} want {w} tol {tol}");
+    }
+
+    // Blocked GEMV: the vector itself (512 KiB) does not fit, so the row
+    // kernel accumulates across K blocks.
+    let (gm, gk) = (8usize, 131_072usize);
+    let ga = noise(gm * gk, 43);
+    let gx = noise(gk, 44);
+    let (iga, igx) = (upload(&ga), upload(&gx));
+    let gout = hc4j_gpu_alloc_uninit(gm);
+    assert_eq!(dispatch_matmul_f32_ex(iga, igx, gout, gm as u32, 1, gk as u32, 0), 0);
+    let got = download(gout, gm);
+    let want = cpu_matmul(&ga, &gx, gm, 1, gk, false, false);
+    for (idx, (&g, &(w, abs))) in got.iter().zip(&want).enumerate() {
+        assert!((g as f64 - w).abs() <= 2.0 * gk as f64 * unit * abs + 1e-6, "gemv @{idx}: got {g} want {w}");
+    }
+
+    assert!(mgr.stats().streamed_ops >= before + 2, "blocked path ran");
+    // A stored-transposed B cannot be transposed in place when it does not
+    // fit: ib (512x256) serves as both A (m x k) and a stored-transposed
+    // B (n x k) for m = n = 512, k = 256.
+    let square_out = hc4j_gpu_alloc_uninit(m * m);
+    assert_eq!(
+        dispatch_matmul_f32_ex(ib, ib, square_out, m as u32, m as u32, n as u32, FLAG_TRANS_B),
+        crate::error::HC4J_ERR_UNSUPPORTED
+    );
+
+    for id in [ia, ib, out, iga, igx, gout, square_out] {
+        free(id);
+    }
+    mgr.configure(restore, 0).unwrap();
+}

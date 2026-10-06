@@ -107,6 +107,7 @@ impl ReadbackRing {
             Ok(Err(e)) => return Err(Hc4jError::Readback(format!("map_async failed: {e}"))),
             Err(_) => return Err(Hc4jError::Readback("map callback never fired".to_string())),
         }
+        engine.stream.count_download(pending.len);
         let buffer = &self.slots[slot].buffer;
         let result = match buffer.get_mapped_range(0..pending.len) {
             Ok(view) => sink(&view),

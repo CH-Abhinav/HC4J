@@ -63,12 +63,25 @@ tasks.register('engineSmokeTest', JavaExec) {
     maxHeapSize = '2g'
 }
 
+tasks.register('smokeTests') {
+    description = 'Runs both GPU smoke suites (end-to-end verification).'
+    group = 'verification'
+    dependsOn 'trignoSmokeTest', 'engineSmokeTest'
+}
+
+// `check` (and therefore `build`) runs the smoke suites, which need a GPU.
+// Drop this line to keep the GPU out of the default build.
+tasks.named('check').configure { dependsOn 'smokeTests' }
+
 tasks.withType(Test).configureEach {
     useJUnitPlatform()
     jvmArgs += ['--enable-native-access=ALL-UNNAMED']
 } 
 jmh {
-    
+    // Pin the harness: the plugin otherwise tracks its own default (1.36), while the
+    // dependency cache holds 1.37.
+    jmhVersion = '1.37'
+
     jvmArgsAppend = ['--enable-native-access=ALL-UNNAMED']
     
     

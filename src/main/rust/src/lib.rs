@@ -380,7 +380,40 @@ impl ErrorTrap {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn hc4j_init_gpu() -> i32 {
-    error::ffi_guard("hc4j_init_gpu", || memory::manager().map(|_| ()))
+    error::ffi_guard("hc4j_init_gpu", || {
+        memory::manager()?;
+        spawn_warmup();
+        Ok(())
+    })
+}
+
+static WARMUP_STARTED: AtomicBool = AtomicBool::new(false);
+
+/// Compiles the expensive matmul kernels on a background thread, so the first
+/// matmul does not pay for shader compilation (0.5-5 s under D3D12's FXC).
+/// The pipeline cache is shared and lock-free during compilation, so a caller
+/// that gets there first simply compiles it itself. `HC4J_WARMUP=0` opts out.
+fn spawn_warmup() {
+    if std::env::var("HC4J_WARMUP").is_ok_and(|v| v == "0") {
+        return;
+    }
+    if WARMUP_STARTED.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let spawned = std::thread::Builder::new().name("hc4j-warmup".to_string()).spawn(|| {
+        let Ok(engine) = get_engine() else { return };
+        let started = std::time::Instant::now();
+        for (name, source) in ops::matmul::warmup_kernels(engine) {
+            if let Err(err) = engine.get_or_compile(&name, "main", &source) {
+                eprintln!("[HC4J] warm-up of {name} failed: {err}");
+                return;
+            }
+        }
+        crate::hc4j_trace!("warm-up compiled matmul kernels in {:?}", started.elapsed());
+    });
+    if let Err(err) = spawned {
+        hc4j_trace!("warm-up thread could not start: {err}");
+    }
 }
 
 /// Opens a command-batching scope: ops record into one command buffer until
@@ -419,6 +452,8 @@ pub struct EngineStats {
     pub submissions: u64,
     pub dispatches: u64,
     pub kernel_bytes: u64,
+    pub host_to_device_bytes: u64,
+    pub device_to_host_bytes: u64,
     pub batches: u64,
     pub completed_epoch: u64,
     pub submitted_epoch: u64,
@@ -446,6 +481,8 @@ pub unsafe extern "C" fn hc4j_engine_stats(out: *mut EngineStats) -> i32 {
             submissions: s.submissions,
             dispatches: s.dispatches,
             kernel_bytes: s.kernel_bytes,
+            host_to_device_bytes: s.host_to_device_bytes,
+            device_to_host_bytes: s.device_to_host_bytes,
             batches: s.batches,
             completed_epoch: s.completed_epoch,
             submitted_epoch: s.submitted_epoch,

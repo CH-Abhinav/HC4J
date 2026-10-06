@@ -40,12 +40,14 @@ public final class EngineSmokeTest {
                 engine.subgroupMinSize(), engine.subgroupMaxSize(), engine.hasShaderF16());
 
         elementwiseCallerAllocated();
+        observability();
         gridBeyond67M();
         matmulPlans(engine);
         matmulCorrectness();
         matmulValidation();
         transposeKernel();
         matmulThroughput();
+        matmulBeyondVram();
         fusion();
         slabs();
         batching();
@@ -87,6 +89,28 @@ public final class EngineSmokeTest {
         }
         try (Tensor x = Tensor.fromArray(new float[] {1, 2, 3}, 3); Tensor wrong = Tensor.empty(DType.f32, 4)) {
             expectThrows(IllegalArgumentException.class, () -> x.sin(wrong), "sin into a mismatched result");
+        }
+    }
+
+    private static void observability() {
+        section("Transfer counters and the residency API");
+        int n = 1 << 18; // 1 MiB
+        float[] host = ramp(n, -1f, 1f);
+        long bytes = (long) n * Float.BYTES;
+        EngineStats before = WgpuBackend.engineStats();
+        try (Tensor t = Tensor.fromArray(host, n)) {
+            float[] back = t.toFloatArray();
+            EngineStats after = WgpuBackend.engineStats();
+            expect(Arrays.equals(back, host), "host round trip is exact");
+            expect(after.hostToDeviceBytes() - before.hostToDeviceBytes() >= bytes, "upload bytes counted");
+            expect(after.deviceToHostBytes() - before.deviceToHostBytes() >= bytes, "readback bytes counted");
+            expect(t.residency() == WgpuBackend.Residency.DEVICE, "a fresh tensor is VRAM-resident");
+            t.evict();
+            expect(t.residency() != WgpuBackend.Residency.DEVICE, "evict() pages it out (" + t.residency() + ")");
+            try (Tensor s = t.sin()) {
+                expect(t.residency() == WgpuBackend.Residency.DEVICE, "the next op pages it back in");
+                expect(maxError(s.toFloatArray(), host, Math::sin) < WGSL_TOL, "sin after page-in");
+            }
         }
     }
 
@@ -252,6 +276,48 @@ public final class EngineSmokeTest {
         }
     }
 
+    private static void matmulBeyondVram() {
+        section("Matmul with a working set larger than VRAM (streamed row blocks)");
+        MemoryStats before = WgpuBackend.memoryStats();
+        // 1 MiB of VRAM: B (256 KiB) stays resident, A and C (2 MiB each) cannot.
+        WgpuBackend.configureMemory(1 << 20, 0);
+        try {
+            int m = 2048, k = 256, n = 256;
+            SplittableRandom rng = new SplittableRandom(99);
+            float[] ha = random(rng, m * k);
+            float[] hb = random(rng, k * n);
+            try (Tensor a = Tensor.fromArray(ha, m, k);
+                 Tensor b = Tensor.fromArray(hb, k, n);
+                 Tensor c = Tensor.empty(DType.f32, m, n)) {
+                expect(WgpuBackend.residency(a.getVramId()) != WgpuBackend.Residency.DEVICE,
+                        "A sits off-device at a 1 MiB budget (" + WgpuBackend.residency(a.getVramId()) + ")");
+                long streamedBefore = WgpuBackend.memoryStats().streamedOps();
+                a.matmul(b, c);
+                expect(WgpuBackend.memoryStats().streamedOps() > streamedBefore, "matmul took the streaming path");
+                String bad = compareMatmul(c.toFloatArray(), ha, hb, m, n, k, false, false);
+                expect(bad == null, "streamed matmul matches CPU" + (bad == null ? "" : ": " + bad));
+            }
+
+            // 256 KiB: B alone (512 KiB) cannot be resident either, so the
+            // product is blocked over K and accumulated in VRAM.
+            WgpuBackend.configureMemory(256 << 10, 0);
+            int bm = 512, bn = 256, bk = 512;
+            float[] hba = random(rng, bm * bk);
+            float[] hbb = random(rng, bk * bn);
+            try (Tensor a = Tensor.fromArray(hba, bm, bk);
+                 Tensor b = Tensor.fromArray(hbb, bk, bn);
+                 Tensor c = Tensor.empty(DType.f32, bm, bn)) {
+                long streamedBefore = WgpuBackend.memoryStats().streamedOps();
+                a.matmul(b, c);
+                expect(WgpuBackend.memoryStats().streamedOps() > streamedBefore, "matmul blocked over K");
+                String bad = compareMatmul(c.toFloatArray(), hba, hbb, bm, bn, bk, false, false);
+                expect(bad == null, "K-blocked matmul matches CPU" + (bad == null ? "" : ": " + bad));
+            }
+        } finally {
+            WgpuBackend.configureMemory(before.vramBudget(), before.hostBudget());
+        }
+    }
+
     // ------------------------------------------------------------------------------------------
 
     private static void fusion() {
@@ -317,6 +383,14 @@ public final class EngineSmokeTest {
                 worst = Math.max(worst, Math.abs(got[i] - (ha[i] * ha[i] + s * s)));
             }
             expect(worst < 2 * WGSL_TOL, String.format("in-place eval with CSE, max err %.2e", worst));
+
+            // Scalar on the left of the operator.
+            try (Tensor r = b.lazy().rsub(1f).eval()) {
+                expect(maxError(r.toFloatArray(), hb, v -> 1 - v) < 1e-6, "rsub: 1 - x");
+            }
+            try (Tensor r = b.lazy().abs().rdiv(2f).eval()) {
+                expect(maxError(r.toFloatArray(), hb, v -> 2 / Math.abs(v)) < 1e-4, "rdiv: 2 / |x|");
+            }
         }
     }
 

@@ -16,6 +16,11 @@ import java.util.Objects;
 /**
  * Matrix multiplication and transposition ({@code ops/matmul.rs}).
  *
+ * <p>Operands larger than VRAM are handled natively: the product is streamed in row blocks with B
+ * resident, and if B does not fit either, blocked over K as well (one row of B plus one row of the
+ * result must still fit). A stored-transposed operand that has to be streamed must be materialised
+ * with {@link #transpose} first; otherwise this reports {@link UnsupportedOperationException}.
+ *
  * <p>{@code res = op(a) · op(b)} where {@code op} optionally transposes an operand that is
  * <em>stored</em> transposed. The native dispatcher picks a register-tiled GEMM, a 16×16 tiled
  * GEMM, or a GEMV kernel from the shape and device; {@link #plan} reports its choice.

@@ -285,6 +285,19 @@ public class Tensor implements AutoCloseable {
         return result;
     }
 
+    /** Which memory tier currently holds this tensor's bytes. */
+    public WgpuBackend.Residency residency() {
+        return WgpuBackend.residency(vramId);
+    }
+
+    /**
+     * Pages this tensor out of VRAM to host RAM (or disk). A no-op if it is already off-device or
+     * in use by an operation that has not been submitted yet. Ops page it back in on demand.
+     */
+    public void evict() {
+        WgpuBackend.evict(vramId);
+    }
+
     /** Frees the tensor's storage. Idempotent. */
     @Override
     public void close() {

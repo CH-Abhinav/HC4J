@@ -57,6 +57,11 @@ struct StreamState {
     /// Dispatches recorded into `encoder` since it was opened.
     recorded: u32,
     batch_depth: u32,
+    /// Op labels recorded since the last submission, so a batch that fails to
+    /// submit can name what it contained. Bounded; `batch_ops_total` counts
+    /// everything.
+    batch_ops: Vec<&'static str>,
+    batch_ops_total: u32,
     submitted_epoch: u64,
     pending_clears: Vec<PendingClear>,
     uniform_ring: Option<wgpu::Buffer>,
@@ -80,6 +85,11 @@ impl StreamState {
 pub struct StreamStats {
     pub submissions: u64,
     pub dispatches: u64,
+    /// Bytes copied host-to-device and device-to-host across the FFI
+    /// boundary: uploads, page-ins, readbacks and evictions. Per-dispatch
+    /// uniform blocks are excluded.
+    pub host_to_device_bytes: u64,
+    pub device_to_host_bytes: u64,
     /// Bytes bound to kernels as inputs plus outputs: the logical memory
     /// traffic the dispatched kernels must move.
     pub kernel_bytes: u64,
@@ -94,6 +104,8 @@ struct Counters {
     dispatches: AtomicU64,
     kernel_bytes: AtomicU64,
     batches: AtomicU64,
+    host_to_device_bytes: AtomicU64,
+    device_to_host_bytes: AtomicU64,
 }
 
 pub struct CommandStream {
@@ -239,6 +251,8 @@ impl CommandStream {
         // UNIFORM_SLOTS dispatches fits one window without a wrap flush.
         state.window_start = 0;
         state.window.clear();
+        state.batch_ops.clear();
+        state.batch_ops_total = 0;
         self.register_epoch(state);
         self.pending.store(false, Ordering::SeqCst);
         Some(index)
@@ -277,9 +291,14 @@ impl CommandStream {
         &self,
         state: &mut StreamState,
         slots: u32,
+        label: &'static str,
         record: impl FnOnce(&mut Recorder<'_>) -> Hc4jResult<R>,
     ) -> Hc4jResult<R> {
         self.reserve_slots(state, slots)?;
+        state.batch_ops_total += 1;
+        if state.batch_ops.len() < 16 {
+            state.batch_ops.push(label);
+        }
         let ring = self.uniform_ring(state);
         let mut encoder = state.encoder.take().unwrap_or_else(|| self.new_encoder());
         // Zero-fills of freshly allocated regions must precede this op, and
@@ -313,11 +332,16 @@ impl CommandStream {
     /// Records one op. Outside a batch it is submitted before returning (so
     /// the caller's error trap sees any submission error); inside a batch,
     /// submission is deferred to batch end.
-    pub fn record<R>(&self, slots: u32, record: impl FnOnce(&mut Recorder<'_>) -> Hc4jResult<R>) -> Hc4jResult<R> {
+    pub fn record<R>(
+        &self,
+        slots: u32,
+        label: &'static str,
+        record: impl FnOnce(&mut Recorder<'_>) -> Hc4jResult<R>,
+    ) -> Hc4jResult<R> {
         let mut state = lock_or_recover(&self.state);
         // On error the encoder is kept: passes recorded before the failure are
         // complete, and earlier batched ops must not be dropped.
-        let result = self.run_recorder(&mut state, slots, record);
+        let result = self.run_recorder(&mut state, slots, label, record);
         if state.batch_depth == 0 || state.recorded >= MAX_BATCH_PASSES {
             self.flush_locked(&mut state);
         }
@@ -334,7 +358,7 @@ impl CommandStream {
         let mut state = lock_or_recover(&self.state);
         // Earlier batched work must execute first.
         self.flush_locked(&mut state);
-        let result = self.run_recorder(&mut state, slots, record);
+        let result = self.run_recorder(&mut state, slots, "immediate", record);
         let index = self.flush_locked(&mut state);
         match (result, index) {
             (Ok(value), Some(index)) => Ok((value, index)),
@@ -366,6 +390,12 @@ impl CommandStream {
         let mut state = lock_or_recover(&self.state);
         self.flush_locked(&mut state);
         self.queue.write_buffer(buffer, offset, data);
+        self.counters.host_to_device_bytes.fetch_add(data.len() as u64, Ordering::Relaxed);
+    }
+
+    /// Records bytes handed back to the host by the readback ring.
+    pub fn count_download(&self, bytes: u64) {
+        self.counters.device_to_host_bytes.fetch_add(bytes, Ordering::Relaxed);
     }
 
     /// Queues a zero-fill that will be encoded before the next recorded op.
@@ -401,10 +431,15 @@ impl CommandStream {
             return Ok(());
         }
         self.counters.batches.fetch_add(1, Ordering::Relaxed);
+        // A batch is validated at submission, so name what it held if that fails.
+        let (ops, total) = (state.batch_ops.join(", "), state.batch_ops_total);
         let trap = crate::ErrorTrap::push(&self.device);
         self.flush_locked(&mut state);
         drop(state);
-        trap.finish()
+        trap.finish().map_err(|err| {
+            let more = if total as usize > 16 { format!(", +{} more", total as usize - 16) } else { String::new() };
+            err.with_context(&format!("batch of {total} ops: {ops}{more}"))
+        })
     }
 
     /// The epoch of the submission that will contain everything recorded so
@@ -456,6 +491,8 @@ impl CommandStream {
         StreamStats {
             submissions: self.counters.submissions.load(Ordering::Relaxed),
             dispatches: self.counters.dispatches.load(Ordering::Relaxed),
+            host_to_device_bytes: self.counters.host_to_device_bytes.load(Ordering::Relaxed),
+            device_to_host_bytes: self.counters.device_to_host_bytes.load(Ordering::Relaxed),
             kernel_bytes: self.counters.kernel_bytes.load(Ordering::Relaxed),
             batches: self.counters.batches.load(Ordering::Relaxed),
             completed_epoch: self.completed_epoch.load(Ordering::Acquire),

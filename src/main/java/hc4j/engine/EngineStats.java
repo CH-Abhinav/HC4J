@@ -12,6 +12,8 @@ import java.lang.foreign.ValueLayout;
  * @param submissions {@code queue.submit} calls
  * @param dispatches compute dispatches recorded
  * @param kernelBytes bytes bound to kernels as inputs plus outputs: the logical memory traffic
+ * @param hostToDeviceBytes bytes uploaded across the FFI boundary (writes, page-ins)
+ * @param deviceToHostBytes bytes read back (downloads, evictions)
  * @param batches command-batch scopes closed
  * @param features bitmask of {@link #FEATURE_SUBGROUPS} and {@link #FEATURE_SHADER_F16}
  * @param deviceType 0 other, 1 integrated, 2 discrete, 3 virtual, 4 CPU
@@ -21,6 +23,8 @@ public record EngineStats(
         long submissions,
         long dispatches,
         long kernelBytes,
+        long hostToDeviceBytes,
+        long deviceToHostBytes,
         long batches,
         long completedEpoch,
         long submittedEpoch,
@@ -33,14 +37,14 @@ public record EngineStats(
     public static final long FEATURE_SUBGROUPS = 1;
     public static final long FEATURE_SHADER_F16 = 2;
 
-    private static final int FIELDS = 11;
+    private static final int FIELDS = 13;
 
     static final StructLayout LAYOUT = MemoryLayout.structLayout(
             MemoryLayout.sequenceLayout(FIELDS, ValueLayout.JAVA_LONG).withName("fields"));
 
     static EngineStats read(MemorySegment s) {
         long[] v = s.toArray(ValueLayout.JAVA_LONG);
-        return new EngineStats(v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8], v[9], v[10]);
+        return new EngineStats(v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8], v[9], v[10], v[11], v[12]);
     }
 
     public boolean hasSubgroups() {

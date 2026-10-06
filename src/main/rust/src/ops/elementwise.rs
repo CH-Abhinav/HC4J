@@ -355,7 +355,7 @@ fn dispatch_resident(
     let tiles = u32::try_from(size.div_ceil(tile)).map_err(|_| Hc4jError::Unsupported("too many tiles"))?;
     let layout = pipeline.get_bind_group_layout(0);
     let trap = ErrorTrap::push(&engine.device);
-    let recorded = engine.stream.record(tiles, |rec| {
+    let recorded = engine.stream.record(tiles, "elementwise", |rec| {
         let mut offset = 0;
         while offset < size {
             let len = tile.min(size - offset);
@@ -387,8 +387,10 @@ fn dispatch_resident(
     recorded.and(trapped)
 }
 
-/// Where streamed output tiles land.
-enum OutputSink {
+/// Where streamed output blocks land: in place when the output tensor is
+/// already VRAM-resident, otherwise in fresh storage that replaces the
+/// output tensor's when the op completes. Shared with the streaming matmul.
+pub(crate) enum OutputSink {
     /// The output tensor is VRAM-resident (and pinned): write in place.
     Existing(DeviceSpan),
     /// Fresh storage that replaces the output's when the op completes.
@@ -398,7 +400,7 @@ enum OutputSink {
 }
 
 impl OutputSink {
-    fn device_span(&self) -> Option<&DeviceSpan> {
+    pub(crate) fn device_span(&self) -> Option<&DeviceSpan> {
         match self {
             OutputSink::Existing(span) => Some(span),
             OutputSink::Device(block) => Some(block.span()),
@@ -406,7 +408,7 @@ impl OutputSink {
         }
     }
 
-    fn append(&mut self, chunk: &[u8]) -> Hc4jResult<()> {
+    pub(crate) fn append(&mut self, chunk: &[u8]) -> Hc4jResult<()> {
         match self {
             OutputSink::Existing(_) | OutputSink::Device(_) => {
                 Err(Hc4jError::Device("device sink does not stream".to_string()))
@@ -430,7 +432,7 @@ impl OutputSink {
 
     /// New storage to install for the output, or `None` if it was written in
     /// place.
-    fn into_residency(self) -> Option<Residency> {
+    pub(crate) fn into_residency(self) -> Option<Residency> {
         match self {
             OutputSink::Existing(_) => None,
             OutputSink::Device(block) => Some(Residency::DeviceResident(block)),
@@ -440,7 +442,7 @@ impl OutputSink {
     }
 }
 
-fn open_output_sink(mgr: &TieredMemoryManager, size: u64) -> Hc4jResult<OutputSink> {
+pub(crate) fn open_output_sink(mgr: &TieredMemoryManager, size: u64) -> Hc4jResult<OutputSink> {
     match mgr.allocate_device(size, false) {
         Ok(block) => return Ok(OutputSink::Device(block)),
         Err(Hc4jError::OutOfMemory) => {}
@@ -658,7 +660,7 @@ pub fn run_strided(pipeline: &wgpu::ComputePipeline, operands: &[TensorId], dims
     let layout = pipeline.get_bind_group_layout(0);
 
     let trap = ErrorTrap::push(&engine.device);
-    let recorded = engine.stream.record(1, |rec| {
+    let recorded = engine.stream.record(1, "elementwise (strided)", |rec| {
         let uniform_binding = rec.uniform(dims)?;
         let mut entries: Vec<wgpu::BindGroupEntry> = resident
             .spans
