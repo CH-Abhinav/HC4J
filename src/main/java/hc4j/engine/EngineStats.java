@@ -15,9 +15,17 @@ import java.lang.foreign.ValueLayout;
  * @param hostToDeviceBytes bytes uploaded across the FFI boundary (writes, page-ins)
  * @param deviceToHostBytes bytes read back (downloads, evictions)
  * @param batches command-batch scopes closed
+ * @param completedEpoch highest submission epoch the GPU has finished; the slab allocator
+ *     reclaims a quarantined region once the epoch that last touched it reaches this
+ * @param submittedEpoch highest epoch handed to the queue, so {@code submittedEpoch -
+ *     completedEpoch} is the work still in flight
  * @param features bitmask of {@link #FEATURE_SUBGROUPS} and {@link #FEATURE_SHADER_F16}
  * @param deviceType 0 other, 1 integrated, 2 discrete, 3 virtual, 4 CPU
  * @param backend 0 none, 1 Vulkan, 2 Metal, 3 DX12, 4 GL, 5 browser WebGPU
+ * @param subgroupMinSize smallest subgroup (wave) size the adapter reports, or 0 without the
+ *     subgroup feature
+ * @param subgroupMaxSize largest subgroup size the adapter reports; the GEMV kernel only takes
+ *     its subgroup path when this permits a 256-lane workgroup
  */
 public record EngineStats(
         long submissions,

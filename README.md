@@ -1,5 +1,7 @@
 # HC4J — Heterogeneous Compute for Java
 
+**0.1.0** · Apache-2.0 · Windows / Linux / macOS · JDK 25 · see [CHANGELOG.md](CHANGELOG.md)
+
 GPU tensor execution for the JVM: a Rust `cdylib` built on [wgpu](https://wgpu.rs) with WGSL
 compute kernels, bound into Java 25 through the Panama Foreign Function & Memory API. No JNI, no
 native glue to compile, no CUDA. Tensors live in VRAM and are identified by an opaque `u64` handle;
@@ -20,9 +22,12 @@ Metal on macOS — and picks the most capable adapter it can find, preferring a 
 
 | Area | Capability |
 | --- | --- |
-| Elementwise | 12 trigonometric, 5 exponential/log, 4 arithmetic ops, f32 (plus i32 arithmetic), contiguous and strided |
+| Elementwise | 12 trigonometric, 5 exponential/log, 4 arithmetic ops, scalar arithmetic, f32 (plus i32 arithmetic), contiguous and strided |
 | Linear algebra | GEMM with register-tiled, shared-memory and GEMV kernels chosen per shape; in-VRAM transpose |
-| Kernel fusion | `a.lazy().sin().add(b).mul(c).eval()` compiles to one kernel: 4N bytes moved instead of 8N, one allocation instead of three |
+| Neural networks | 7 activations (ReLU, leaky ReLU, ELU, GELU, SiLU, sigmoid, softplus), softmax and log-softmax, layer norm and RMS norm, cross entropy, bias broadcast, `linear` |
+| Reductions | sum, mean, max, min over a whole tensor or along the last axis; argmax/argmin; folded variants (`sum(x²)`, MSE) that need no intermediate tensor |
+| Collectives | Multi-GPU ring AllReduce with a bandwidth topology probe, spread across the machine's GPUs (loopback on a single-GPU box). Host-staged transport — see the limitations |
+| Kernel fusion | `a.lazy().sin().add(b).mul(c).eval()` compiles to one kernel: 4N bytes moved instead of 8N, one allocation instead of three. Activations fuse too |
 | Memory | Three-tier manager (VRAM → host RAM → disk) with LRU eviction, page-in on use, and streaming for tensors larger than the whole VRAM budget |
 | Allocation | Slab sub-allocation with epoch-based quarantine: 200 consecutive op outputs cost 0 driver allocations |
 | Batching | `GpuBatch` records many ops into one command buffer and one submission (20× for small ops) |
@@ -108,18 +113,53 @@ try (Tensor x = Tensor.fromArray(new float[] {0f, 1f, 2f, 3f}, 4)) {
 }
 ```
 
+A feed-forward layer, which is the shape most inference work takes:
+
+```java
+// logits = softmax(gelu(x · W1 + b1) · W2 + b2), as one submission
+try (Tensor h = Tensor.empty(DType.f32, batch, hidden);
+     Tensor logits = Tensor.empty(DType.f32, batch, classes);
+     Tensor probs = Tensor.empty(DType.f32, batch, classes)) {
+
+    try (GpuBatch gpu = GpuBatch.open()) {
+        x.linear(w1, b1, h);     // GEMM + bias broadcast
+        h.gelu(h);               // in place
+        h.linear(w2, b2, logits);
+        logits.softmax(probs);   // stable, along the last axis
+    }
+
+    try (Tensor predicted = probs.argmaxRows();   // i32 class per row
+         Tensor loss = logits.crossEntropy(targets)) {
+        float batchLoss = loss.mean();
+    }
+}
+```
+
 ## Limitations
 
 - **f32 only** outside arithmetic (which also does i32). No f16 compute yet, even where the adapter
   reports `SHADER_F16`; the feature is probed and exposed, not used.
-- **No broadcasting.** Binary ops and fusion require identical shapes. Non-contiguous inputs work
+- **Forward pass only.** There is no autograd and no optimizer: the NN ops compute activations,
+  normalisations and losses, not their gradients. This runs inference and evaluates a loss; it does
+  not train.
+- **No general broadcasting.** Binary ops and fusion require identical shapes; the one broadcast
+  that exists is a bias over rows (`addRowBias`, and so `linear`). Non-contiguous inputs work
   through the strided path (a transposed view reads correctly), but the shapes must still match.
+- **Row-wise ops need a contiguous operand** that fits one storage binding (2 GiB on most
+  adapters), and no host-streaming fallback covers them — unlike the elementwise ops and matmul.
 - **Matmul is 2-D** (with the NumPy 1-D conventions: matrix·vector, vector·matrix, dot product).
   No batched GEMM.
 - **Out-of-core matmul does not transpose.** When an operand is larger than the VRAM budget the
   streamed and K-blocked paths reject stored-transposed operands; materialise them with
   `transpose` first.
-- **One device.** Multi-GPU and concurrent devices are out of scope.
+- **Collectives are host-staged and synchronous.** wgpu exposes neither external-memory
+  export/import nor timeline semaphores, so there is no true peer-to-peer path and no way to
+  pipeline a staged hop: every hop goes GPU → host → GPU and blocks before the reduction consuming
+  it is recorded. Reaching `dma_buf` / `OPAQUE_WIN32` handles needs raw Vulkan through `wgpu-hal`.
+  Collective buffers are also separate from `Tensor` VRAM — data crosses through `write`/`read`,
+  with no zero-copy bridge yet.
+- **Single-device ops.** Everything outside `hc4j.collective` runs on one device; the engine itself
+  is not multi-GPU.
 - **Precision follows WGSL**, which guarantees only 2⁻¹¹ absolute error for `sin`/`cos` and
   inherits `atan2`'s ~4096 ULP for the inverse trig functions. Tests are toleranced accordingly —
   do not expect `StrictMath` agreement.
@@ -129,14 +169,33 @@ try (Tensor x = Tensor.fromArray(new float[] {0f, 1f, 2f, 3f}, 4)) {
 ```
 src/main/java/hc4j/          Tensor, FusedExpr, DType
             hc4j/engine/     WgpuBackend (FFM downcalls), GpuBatch, stats records
-            hc4j/ops/        TrignoOps, ExponentialOps, ArithmeticOps, MatmulOps, Layouts
-            hc4j/test/       Main demo and the two smoke suites
+            hc4j/ops/        TrignoOps, ExponentialOps, ArithmeticOps, MatmulOps, NnOps, Layouts
+            hc4j/collective/ Collective, CollectiveBuffer, Link, Transport
+            hc4j/test/       Main demo and the four smoke suites
 src/main/rust/src/           lib.rs (engine, adapter selection, pipeline cache, C ABI)
                              stream.rs (command batching), error.rs (panic guard, status codes)
+                             collective.rs (ranks, topology probe, ring AllReduce)
                   memory/    manager, budget, lru, slab, spill, transfer
-                  ops/       elementwise, trigno, exponential, arithmetic, matmul, fusion
+                  ops/       elementwise, trigno, exponential, arithmetic, matmul, fusion,
+                             reduce, nn
 src/jmh/java/hc4j/bench/     JMH microbenchmarks
 docs/                        ARCHITECTURE.md, API.md, PERFORMANCE.md
 ```
 
-Roughly 7 kLOC of Rust and 2.6 kLOC of Java.
+Roughly 10 kLOC of Rust and 4.8 kLOC of Java.
+
+## Verification
+
+Every release is checked against CPU references on both Windows backends:
+
+| | |
+| --- | --- |
+| `cargo test --release` | 86 tests — adapter ranking, memory tiers, naga shader validation, GPU vs CPU |
+| `gradlew build` | 286 end-to-end GPU checks (trig 86, engine 96, neural-network 79, collective 25) |
+| `HC4J_BACKEND=vulkan gradlew smokeTests` | the same 286 checks on Vulkan |
+| `cargo clippy --all-targets -- -D warnings` | clean |
+| `gradlew javadoc` | clean (`-Xdoclint:all,-missing`) |
+
+## License
+
+[Apache License 2.0](LICENSE).

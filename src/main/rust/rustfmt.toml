@@ -1,0 +1,9 @@
+# The codebase is hand-formatted to 120 columns, not rustfmt's default 100:
+# the WGSL string literals, the long `pub use` re-export lists and the kernel
+# dispatch signatures all read better unwrapped.
+#
+# `cargo fmt --check` is NOT a gate here — the tree has never been run through
+# rustfmt, and it would still rewrite ~170 sites. This file exists so that if
+# anyone does run `cargo fmt`, it preserves the intended width instead of
+# rewrapping everything to 100 (which touches twice as much).
+max_width = 120

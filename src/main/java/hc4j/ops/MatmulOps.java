@@ -58,7 +58,13 @@ public final class MatmulOps {
         }
     }
 
-    /** The dispatcher's choice, including in-VRAM pre-transposition of stored-transposed operands. */
+    /**
+     * The dispatcher's choice, including in-VRAM pre-transposition of stored-transposed operands.
+     *
+     * @param kernel the kernel selected for the shape and the device's capabilities
+     * @param pretransposeA whether A is copied into transposed scratch before the GEMM
+     * @param pretransposeB whether B is copied into transposed scratch before the GEMM
+     */
     public record Plan(Kernel kernel, boolean pretransposeA, boolean pretransposeB) {}
 
     private static final int FLAG_TRANS_A = 1;
@@ -94,7 +100,15 @@ public final class MatmulOps {
         return linker.downcallHandle(address, desc);
     }
 
-    /** Logical GEMM dimensions of {@code op(a) · op(b)}. */
+    /**
+     * Logical GEMM dimensions of {@code op(a) · op(b)}.
+     *
+     * @param m rows of the result
+     * @param n columns of the result
+     * @param k the reduction length, {@code op(a).cols == op(b).rows}
+     * @param resultShape shape the result tensor must have, which drops the degenerate axis for
+     *     1-D operands ({@code [m]}, {@code [n]} or {@code [1]})
+     */
     public record Dims(int m, int n, int k, int[] resultShape) {}
 
     /**

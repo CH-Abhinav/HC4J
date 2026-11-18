@@ -1,7 +1,14 @@
 [package]
-name = "rust"
+name = "hc4j"
 version = "0.1.0"
 edition = "2024"
+# Floor set by let-chains in edition 2024 (1.88) and `is_multiple_of` (1.87),
+# both used throughout. Verified against 1.96.
+rust-version = "1.88"
+description = "GPU tensor engine behind HC4J: wgpu/WGSL compute kernels exposed over a C ABI for Java Panama FFM."
+license = "Apache-2.0"
+repository = "https://github.com/CH-Abhinav/HC4J"
+publish = false
 
 [lib]
 name = "hc4j"

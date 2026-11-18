@@ -1,3 +1,4 @@
+pub mod collective;
 pub mod error;
 pub mod memory;
 pub mod ops;
@@ -85,7 +86,7 @@ pub fn get_engine() -> Hc4jResult<&'static GpuEngine> {
 
 /// Backends to consider. `HC4J_BACKEND=dx12|vulkan|metal` narrows the set;
 /// the default on Windows is DX12 + Vulkan.
-fn requested_backends() -> wgpu::Backends {
+pub(crate) fn requested_backends() -> wgpu::Backends {
     match std::env::var("HC4J_BACKEND").map(|v| v.to_ascii_lowercase()).as_deref() {
         Ok("dx12") => wgpu::Backends::DX12,
         Ok("vulkan") => wgpu::Backends::VULKAN,
@@ -95,7 +96,7 @@ fn requested_backends() -> wgpu::Backends {
     }
 }
 
-fn device_rank(kind: wgpu::DeviceType) -> u8 {
+pub(crate) fn device_rank(kind: wgpu::DeviceType) -> u8 {
     match kind {
         wgpu::DeviceType::DiscreteGpu => 4,
         wgpu::DeviceType::IntegratedGpu => 3,
@@ -107,7 +108,7 @@ fn device_rank(kind: wgpu::DeviceType) -> u8 {
 
 /// On Windows wgpu's D3D12 backend is the more mature path for the same
 /// physical GPU; elsewhere Vulkan/Metal are native.
-fn backend_rank(backend: wgpu::Backend) -> u8 {
+pub(crate) fn backend_rank(backend: wgpu::Backend) -> u8 {
     match backend {
         wgpu::Backend::Dx12 if cfg!(windows) => 3,
         wgpu::Backend::Vulkan | wgpu::Backend::Metal => 2,

@@ -15,6 +15,7 @@ use crate::error::{Hc4jError, ffi_guard};
 use crate::get_engine;
 use crate::memory::TensorId;
 use crate::ops::elementwise::run_contiguous;
+use crate::ops::nn::Activation;
 
 pub mod op {
     pub const LOAD: u32 = 0x01;
@@ -37,6 +38,14 @@ pub mod op {
     pub const EXP: u32 = 0x1E;
     pub const LOG: u32 = 0x1F;
     pub const SQRT: u32 = 0x20;
+
+    // Activations. Only the parameterless ones can be fused: the program has
+    // no place to carry a per-op alpha, so leaky ReLU and ELU stay standalone.
+    pub const RELU: u32 = 0x21;
+    pub const SIGMOID: u32 = 0x22;
+    pub const GELU: u32 = 0x23;
+    pub const SILU: u32 = 0x24;
+    pub const SOFTPLUS: u32 = 0x25;
 
     pub const ADD: u32 = 0x40;
     pub const SUB: u32 = 0x41;
@@ -76,8 +85,26 @@ pub struct FusedKernel {
     pub n_inputs: u32,
 }
 
+/// Activations the fused kernel can call, and the helper each one needs
+/// defined in the generated shader. Definitions come from
+/// [`crate::ops::nn::Activation`], so a fused `gelu` is the same arithmetic as
+/// a standalone one.
+fn fused_activation(opcode: u32) -> Option<(Activation, &'static str)> {
+    Some(match opcode {
+        op::RELU => (Activation::Relu, "hc4j_relu"),
+        op::SIGMOID => (Activation::Sigmoid, "hc4j_sigmoid"),
+        op::GELU => (Activation::Gelu, "hc4j_gelu"),
+        op::SILU => (Activation::Silu, "hc4j_silu"),
+        op::SOFTPLUS => (Activation::Softplus, "hc4j_softplus"),
+        _ => return None,
+    })
+}
+
 fn unary_fn(opcode: u32) -> Option<&'static str> {
     use op::*;
+    if let Some((_, name)) = fused_activation(opcode) {
+        return Some(name);
+    }
     Some(match opcode {
         ABS => "abs",
         SIN => "sin",
@@ -132,6 +159,8 @@ pub fn compile(program: &[u32], n_inputs: u32) -> Result<FusedKernel, FusionErro
     let mut used_inputs = vec![false; n_inputs as usize];
     let mut next_id = 0usize;
     let mut pc = 0usize;
+    // Activation helpers the program calls, in first-use order.
+    let mut used_acts: Vec<(Activation, &'static str)> = Vec::new();
 
     while pc < program.len() {
         let (opcode, operand) = (program[pc] >> 24, program[pc] & 0x00FF_FFFF);
@@ -157,6 +186,15 @@ pub fn compile(program: &[u32], n_inputs: u32) -> Result<FusedKernel, FusionErro
             }
             _ if let Some(name) = unary_fn(opcode) => {
                 let a = stack.pop().ok_or(FusionError::StackUnderflow)?;
+                // Activations are not built-ins: note which helpers the
+                // generated shader has to define. Collected here rather than
+                // by scanning the program, since a CONST payload is raw f32
+                // bits whose top byte can look like any opcode.
+                if let Some(act) = fused_activation(opcode).map(|(act, _)| act)
+                    && !used_acts.iter().any(|(_, n)| *n == name)
+                {
+                    used_acts.push((act, name));
+                }
                 ((opcode, a as u64, 0), format!("{name}(v{a})"))
             }
             _ => {
@@ -194,6 +232,12 @@ pub fn compile(program: &[u32], n_inputs: u32) -> Result<FusedKernel, FusionErro
     }
     let _ = writeln!(wgsl, "@group(0) @binding({n}) var<storage, read_write> out: array<f32>;");
     let _ = writeln!(wgsl, "@group(0) @binding({}) var<uniform> dims: Dims;\n", n + 1);
+
+    // Define only the activation helpers this program calls: an unused
+    // function still costs shader-compile time, which D3D12 charges dearly.
+    for (act, name) in &used_acts {
+        let _ = writeln!(wgsl, "{}", act.vec4_fn(name));
+    }
 
     let params: Vec<String> = (0..n).map(|k| format!("x{k}: vec4<f32>")).collect();
     let _ = writeln!(wgsl, "fn fused({}) -> vec4<f32> {{\n{body}    return v{result};\n}}\n", params.join(", "));

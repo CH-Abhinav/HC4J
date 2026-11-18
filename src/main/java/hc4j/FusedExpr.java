@@ -39,6 +39,9 @@ public final class FusedExpr {
     private static final int NEG = 0x10, ABS = 0x11, SIN = 0x12, COS = 0x13, TAN = 0x14;
     private static final int ASIN = 0x15, ACOS = 0x16, ATAN = 0x17, SINH = 0x18, COSH = 0x19, TANH = 0x1A;
     private static final int ASINH = 0x1B, ACOSH = 0x1C, ATANH = 0x1D, EXP = 0x1E, LOG = 0x1F, SQRT = 0x20;
+    // Parameterless activations only: a fused program carries no per-op alpha,
+    // so leakyRelu and elu stay standalone Tensor ops.
+    private static final int RELU = 0x21, SIGMOID = 0x22, GELU = 0x23, SILU = 0x24, SOFTPLUS = 0x25;
     private static final int ADD = 0x40, SUB = 0x41, MUL = 0x42, DIV = 0x43, MAX = 0x44, MIN = 0x45, POW = 0x46;
 
     /** Mirrors fusion.rs MAX_PROGRAM_WORDS; a constant costs two words. */
@@ -97,6 +100,13 @@ public final class FusedExpr {
     public FusedExpr exp()   { return unary(EXP); }
     public FusedExpr log()   { return unary(LOG); }
     public FusedExpr sqrt()  { return unary(SQRT); }
+
+    /** Activations, computed by the same arithmetic as the standalone ops. */
+    public FusedExpr relu()     { return unary(RELU); }
+    public FusedExpr sigmoid()  { return unary(SIGMOID); }
+    public FusedExpr gelu()     { return unary(GELU); }
+    public FusedExpr silu()     { return unary(SILU); }
+    public FusedExpr softplus() { return unary(SOFTPLUS); }
 
     public FusedExpr add(FusedExpr o) { return binary(ADD, o); }
     public FusedExpr sub(FusedExpr o) { return binary(SUB, o); }

@@ -9,6 +9,14 @@ use crate::ops::arithmetic::dispatch_add_f32;
 use crate::ops::exponential::dispatch_exp_f32;
 use crate::ops::fusion::{hc4j_fused_dispatch, op};
 use crate::ops::matmul::{FLAG_TRANS_A, FLAG_TRANS_B, dispatch_matmul_f32_ex};
+use crate::ops::nn::{
+    Activation, dispatch_activation_f32, dispatch_add_row_bias_f32, dispatch_cross_entropy_rows,
+    dispatch_layernorm_rows_f32, dispatch_rmsnorm_rows_f32, dispatch_softmax_rows_f32,
+};
+use crate::ops::reduce::{
+    dispatch_argmax_rows, dispatch_reduce_diff2_f32, dispatch_reduce_f32, dispatch_reduce_rows_f32,
+    dispatch_reduce_square_f32,
+};
 use crate::ops::trigno::{dispatch_cos_f32, dispatch_sin_f32};
 use crate::{get_engine, hc4j_batch_begin, hc4j_batch_end};
 
@@ -389,4 +397,479 @@ fn matmul_blocks_over_k_when_b_does_not_fit_either() {
         free(id);
     }
     mgr.configure(restore, 0).unwrap();
+}
+
+/// f64 reference for one activation, so the GPU is compared against the
+/// mathematical definition rather than against another f32 computation.
+fn cpu_activation(act: Activation, x: f64, alpha: f64) -> f64 {
+    match act {
+        Activation::Relu => x.max(0.0),
+        Activation::LeakyRelu => {
+            if x > 0.0 {
+                x
+            } else {
+                alpha * x
+            }
+        }
+        Activation::Elu => {
+            if x > 0.0 {
+                x
+            } else {
+                alpha * (x.exp() - 1.0)
+            }
+        }
+        Activation::Gelu => {
+            let inner = 0.797_884_560_802_865_4 * (x + 0.044715 * x * x * x);
+            0.5 * x * (1.0 + inner.tanh())
+        }
+        Activation::Silu => x / (1.0 + (-x).exp()),
+        Activation::Sigmoid => 1.0 / (1.0 + (-x).exp()),
+        Activation::Softplus => x.max(0.0) + (1.0 + (-x.abs()).exp()).ln(),
+    }
+}
+
+#[test]
+fn activations_match_cpu_including_the_vec4_tail() {
+    let Some(_guard) = gpu() else { return };
+    // 1003 is not a multiple of 4, so the scalar tail path runs as well as
+    // the vec4 fast path.
+    let n = 1003;
+    let mut host = noise(n, 11);
+    // Pin down the saturating ends and the kink at zero, where the stable
+    // formulations differ from the naive ones.
+    host[0] = 0.0;
+    host[1] = -0.0;
+    host[2] = 88.0;
+    host[3] = -88.0;
+    host[4] = 1e-8;
+    host[5] = -1e-8;
+    let a = upload(&host);
+    let out = hc4j_gpu_alloc_uninit(n);
+
+    for act in [
+        Activation::Relu,
+        Activation::LeakyRelu,
+        Activation::Elu,
+        Activation::Gelu,
+        Activation::Silu,
+        Activation::Sigmoid,
+        Activation::Softplus,
+    ] {
+        let alpha = 0.125f32;
+        let status = unsafe {
+            dispatch_activation_f32(
+                a,
+                out,
+                0,
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+                n,
+                1,
+                act as u32,
+                alpha.to_bits(),
+            )
+        };
+        assert_eq!(status, 0, "{} dispatch", act.name());
+        let got = download(out, n);
+        for (i, (&g, &x)) in got.iter().zip(host.iter()).enumerate() {
+            let want = cpu_activation(act, x as f64, alpha as f64);
+            let tol = 1e-5 * want.abs().max(1.0);
+            assert!(
+                (g as f64 - want).abs() <= tol,
+                "{} at {i}: x={x} got {g} want {want}",
+                act.name()
+            );
+            assert!(g.is_finite(), "{} at {i}: x={x} produced {g}", act.name());
+        }
+    }
+    free(a);
+    free(out);
+}
+
+#[test]
+fn activations_run_in_place() {
+    let Some(_guard) = gpu() else { return };
+    let n = 257;
+    let host = noise(n, 12);
+    let a = upload(&host);
+    let status = unsafe {
+        dispatch_activation_f32(
+            a,
+            a,
+            0,
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null(),
+            n,
+            1,
+            Activation::Relu as u32,
+            0,
+        )
+    };
+    assert_eq!(status, 0);
+    for (i, (&g, &x)) in download(a, n).iter().zip(host.iter()).enumerate() {
+        assert_eq!(g, x.max(0.0), "in-place relu at {i}");
+    }
+    free(a);
+}
+
+#[test]
+fn full_reductions_match_cpu_at_sizes_that_need_two_passes() {
+    let Some(_guard) = gpu() else { return };
+    // Past 256 * 4 * 1024 elements pass 1 saturates at MAX_PARTIALS and the
+    // grid-stride loop covers the rest, which is the path worth testing.
+    for &n in &[1usize, 3, 256, 1024, 1_048_577] {
+        let host = noise(n, 13);
+        let a = upload(&host);
+        let out = hc4j_gpu_alloc_uninit(1);
+        for (code, name) in [(0u32, "sum"), (1, "mean"), (2, "max"), (3, "min")] {
+            assert_eq!(dispatch_reduce_f32(a, out, n as u64, code), 0, "{name} dispatch");
+            let got = download(out, 1)[0] as f64;
+            let want: f64 = match code {
+                0 => host.iter().map(|&v| v as f64).sum(),
+                1 => host.iter().map(|&v| v as f64).sum::<f64>() / n as f64,
+                2 => host.iter().fold(f64::NEG_INFINITY, |m, &v| m.max(v as f64)),
+                _ => host.iter().fold(f64::INFINITY, |m, &v| m.min(v as f64)),
+            };
+            // Tree summation error grows with log(n), not n.
+            let tol = 1e-6 * (n as f64).log2().max(1.0) * want.abs().max(1.0);
+            assert!((got - want).abs() <= tol, "{name} n={n}: got {got} want {want}");
+        }
+        free(a);
+        free(out);
+    }
+}
+
+#[test]
+fn mse_reduces_a_difference_without_an_intermediate_tensor() {
+    let Some(_guard) = gpu() else { return };
+    let n = 4096;
+    let (pred, target) = (noise(n, 14), noise(n, 15));
+    let (a, b) = (upload(&pred), upload(&target));
+    let out = hc4j_gpu_alloc_uninit(1);
+    assert_eq!(dispatch_reduce_diff2_f32(a, b, out, n as u64, 1), 0);
+    let got = download(out, 1)[0] as f64;
+    let want = pred
+        .iter()
+        .zip(target.iter())
+        .map(|(&p, &t)| (p as f64 - t as f64).powi(2))
+        .sum::<f64>()
+        / n as f64;
+    assert!((got - want).abs() <= 1e-6 * want.max(1.0), "mse: got {got} want {want}");
+
+    // Sum of squares, the other folded load.
+    assert_eq!(dispatch_reduce_square_f32(a, out, n as u64, 0), 0);
+    let sq = download(out, 1)[0] as f64;
+    let want_sq = pred.iter().map(|&p| (p as f64).powi(2)).sum::<f64>();
+    assert!((sq - want_sq).abs() <= 1e-5 * want_sq.max(1.0), "sumsq: got {sq} want {want_sq}");
+    free(a);
+    free(b);
+    free(out);
+}
+
+#[test]
+fn row_reductions_and_argmax_match_cpu() {
+    let Some(_guard) = gpu() else { return };
+    // cols > 256 forces the strided walk; rows > 1 exercises the grid.
+    let (rows, cols) = (37usize, 613usize);
+    let host = noise(rows * cols, 16);
+    let a = upload(&host);
+    let out = hc4j_gpu_alloc_uninit(rows);
+
+    for (code, name) in [(0u32, "sum"), (1, "mean"), (2, "max"), (3, "min")] {
+        assert_eq!(dispatch_reduce_rows_f32(a, out, rows as u32, cols as u32, code), 0, "{name}");
+        let got = download(out, rows);
+        for r in 0..rows {
+            let row = &host[r * cols..(r + 1) * cols];
+            let want: f64 = match code {
+                0 => row.iter().map(|&v| v as f64).sum(),
+                1 => row.iter().map(|&v| v as f64).sum::<f64>() / cols as f64,
+                2 => row.iter().fold(f64::NEG_INFINITY, |m, &v| m.max(v as f64)),
+                _ => row.iter().fold(f64::INFINITY, |m, &v| m.min(v as f64)),
+            };
+            let tol = 1e-5 * want.abs().max(1.0);
+            assert!((got[r] as f64 - want).abs() <= tol, "{name} row {r}: got {} want {want}", got[r]);
+        }
+    }
+
+    let idx = hc4j_gpu_alloc_uninit(rows);
+    assert_eq!(dispatch_argmax_rows(a, idx, rows as u32, cols as u32, 1), 0);
+    let mut got_idx = vec![0i32; rows];
+    assert_eq!(
+        unsafe { hc4j_gpu_download(idx, got_idx.as_mut_ptr().cast::<f32>(), rows) },
+        0
+    );
+    for r in 0..rows {
+        let row = &host[r * cols..(r + 1) * cols];
+        let want = row
+            .iter()
+            .enumerate()
+            .fold((0usize, f32::NEG_INFINITY), |(bi, bv), (i, &v)| if v > bv { (i, v) } else { (bi, bv) })
+            .0;
+        assert_eq!(got_idx[r] as usize, want, "argmax row {r}");
+    }
+    free(a);
+    free(out);
+    free(idx);
+}
+
+#[test]
+fn softmax_is_stable_and_sums_to_one() {
+    let Some(_guard) = gpu() else { return };
+    let (rows, cols) = (11usize, 500usize);
+    let mut host = noise(rows * cols, 17);
+    // A row whose logits would overflow exp() without the max subtraction.
+    for (c, slot) in host[..cols].iter_mut().enumerate() {
+        *slot = 90.0 + c as f32;
+    }
+    let a = upload(&host);
+    let out = hc4j_gpu_alloc_uninit(rows * cols);
+
+    assert_eq!(dispatch_softmax_rows_f32(a, out, rows as u32, cols as u32, 0), 0);
+    let got = download(out, rows * cols);
+    for r in 0..rows {
+        let row = &host[r * cols..(r + 1) * cols];
+        let m = row.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b)) as f64;
+        let exps: Vec<f64> = row.iter().map(|&v| (v as f64 - m).exp()).collect();
+        let sum: f64 = exps.iter().sum();
+        let mut total = 0.0f64;
+        for c in 0..cols {
+            let want = exps[c] / sum;
+            let g = got[r * cols + c] as f64;
+            assert!(g.is_finite(), "softmax row {r} col {c} is {g}");
+            assert!((g - want).abs() <= 1e-6, "softmax row {r} col {c}: got {g} want {want}");
+            total += g;
+        }
+        assert!((total - 1.0).abs() < 1e-4, "softmax row {r} sums to {total}");
+    }
+
+    // log-softmax over the same data.
+    assert_eq!(dispatch_softmax_rows_f32(a, out, rows as u32, cols as u32, 1), 0);
+    let got_log = download(out, rows * cols);
+    for r in 0..rows {
+        let row = &host[r * cols..(r + 1) * cols];
+        let m = row.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b)) as f64;
+        let lse = m + row.iter().map(|&v| (v as f64 - m).exp()).sum::<f64>().ln();
+        for c in 0..cols {
+            let want = row[c] as f64 - lse;
+            let g = got_log[r * cols + c] as f64;
+            assert!((g - want).abs() <= 1e-4, "log_softmax row {r} col {c}: got {g} want {want}");
+        }
+    }
+    free(a);
+    free(out);
+}
+
+#[test]
+fn layer_norm_and_rms_norm_match_cpu() {
+    let Some(_guard) = gpu() else { return };
+    let (rows, cols) = (9usize, 777usize);
+    let host = noise(rows * cols, 18);
+    let gamma: Vec<f32> = (0..cols).map(|c| 0.5 + (c % 7) as f32 * 0.1).collect();
+    let beta: Vec<f32> = (0..cols).map(|c| -0.25 + (c % 5) as f32 * 0.05).collect();
+    let (a, g, b) = (upload(&host), upload(&gamma), upload(&beta));
+    let out = hc4j_gpu_alloc_uninit(rows * cols);
+    let eps = 1e-5f32;
+
+    assert_eq!(
+        dispatch_layernorm_rows_f32(a, g, b, out, rows as u32, cols as u32, eps.to_bits()),
+        0
+    );
+    let got = download(out, rows * cols);
+    for r in 0..rows {
+        let row = &host[r * cols..(r + 1) * cols];
+        let mean = row.iter().map(|&v| v as f64).sum::<f64>() / cols as f64;
+        let var = row.iter().map(|&v| (v as f64 - mean).powi(2)).sum::<f64>() / cols as f64;
+        let inv = 1.0 / (var + eps as f64).sqrt();
+        for c in 0..cols {
+            let want = (row[c] as f64 - mean) * inv * gamma[c] as f64 + beta[c] as f64;
+            let g = got[r * cols + c] as f64;
+            assert!((g - want).abs() <= 1e-4, "layernorm row {r} col {c}: got {g} want {want}");
+        }
+    }
+
+    // Without the affine transform each row must come out zero-mean and
+    // unit-variance.
+    assert_eq!(
+        dispatch_layernorm_rows_f32(a, 0, 0, out, rows as u32, cols as u32, eps.to_bits()),
+        0
+    );
+    let plain = download(out, rows * cols);
+    for r in 0..rows {
+        let row = &plain[r * cols..(r + 1) * cols];
+        let mean = row.iter().map(|&v| v as f64).sum::<f64>() / cols as f64;
+        let var = row.iter().map(|&v| (v as f64 - mean).powi(2)).sum::<f64>() / cols as f64;
+        assert!(mean.abs() < 1e-4, "layernorm row {r} mean {mean}");
+        assert!((var - 1.0).abs() < 1e-3, "layernorm row {r} var {var}");
+    }
+
+    assert_eq!(
+        dispatch_rmsnorm_rows_f32(a, g, out, rows as u32, cols as u32, eps.to_bits()),
+        0
+    );
+    let rms = download(out, rows * cols);
+    for r in 0..rows {
+        let row = &host[r * cols..(r + 1) * cols];
+        let ms = row.iter().map(|&v| (v as f64).powi(2)).sum::<f64>() / cols as f64;
+        let inv = 1.0 / (ms + eps as f64).sqrt();
+        for c in 0..cols {
+            let want = row[c] as f64 * inv * gamma[c] as f64;
+            let g = rms[r * cols + c] as f64;
+            assert!((g - want).abs() <= 1e-4, "rmsnorm row {r} col {c}: got {g} want {want}");
+        }
+    }
+    free(a);
+    free(g);
+    free(b);
+    free(out);
+}
+
+#[test]
+fn layer_norm_rejects_half_an_affine_pair() {
+    let Some(_guard) = gpu() else { return };
+    let (rows, cols) = (2usize, 8usize);
+    let a = upload(&noise(rows * cols, 19));
+    let g = upload(&vec![1.0; cols]);
+    let out = hc4j_gpu_alloc_uninit(rows * cols);
+    assert_eq!(
+        dispatch_layernorm_rows_f32(a, g, 0, out, rows as u32, cols as u32, 0),
+        crate::error::HC4J_ERR_INVALID_PARAM
+    );
+    free(a);
+    free(g);
+    free(out);
+}
+
+#[test]
+fn cross_entropy_matches_cpu_and_flags_bad_classes() {
+    let Some(_guard) = gpu() else { return };
+    let (rows, cols) = (13usize, 101usize);
+    let logits = noise(rows * cols, 20);
+    let targets: Vec<i32> = (0..rows).map(|r| (r * 7 % cols) as i32).collect();
+    let a = upload(&logits);
+    let t = hc4j_gpu_alloc(rows);
+    assert_eq!(unsafe { hc4j_gpu_write(t, targets.as_ptr().cast::<f32>(), rows) }, 0);
+    let out = hc4j_gpu_alloc_uninit(rows);
+
+    assert_eq!(dispatch_cross_entropy_rows(a, t, out, rows as u32, cols as u32), 0);
+    let got = download(out, rows);
+    for r in 0..rows {
+        let row = &logits[r * cols..(r + 1) * cols];
+        let m = row.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b)) as f64;
+        let lse = m + row.iter().map(|&v| (v as f64 - m).exp()).sum::<f64>().ln();
+        let want = lse - row[targets[r] as usize] as f64;
+        assert!(
+            (got[r] as f64 - want).abs() <= 1e-5,
+            "cross entropy row {r}: got {} want {want}",
+            got[r]
+        );
+    }
+
+    // An out-of-range class must surface, not read a neighbouring row.
+    let bad: Vec<i32> = vec![cols as i32; rows];
+    assert_eq!(unsafe { hc4j_gpu_write(t, bad.as_ptr().cast::<f32>(), rows) }, 0);
+    assert_eq!(dispatch_cross_entropy_rows(a, t, out, rows as u32, cols as u32), 0);
+    assert!(download(out, rows).iter().all(|v| v.is_nan()), "bad class must give NaN");
+    free(a);
+    free(t);
+    free(out);
+}
+
+#[test]
+fn row_bias_broadcasts_and_runs_in_place() {
+    let Some(_guard) = gpu() else { return };
+    let (rows, cols) = (64usize, 71usize);
+    let host = noise(rows * cols, 21);
+    let bias = noise(cols, 22);
+    let (a, b) = (upload(&host), upload(&bias));
+    let out = hc4j_gpu_alloc_uninit(rows * cols);
+
+    assert_eq!(dispatch_add_row_bias_f32(a, b, out, rows as u32, cols as u32), 0);
+    for (i, &g) in download(out, rows * cols).iter().enumerate() {
+        let want = host[i] + bias[i % cols];
+        assert!((g - want).abs() <= 1e-6, "bias at {i}: got {g} want {want}");
+    }
+
+    // In place: the output aliases the input.
+    assert_eq!(dispatch_add_row_bias_f32(a, b, a, rows as u32, cols as u32), 0);
+    for (i, &g) in download(a, rows * cols).iter().enumerate() {
+        let want = host[i] + bias[i % cols];
+        assert!((g - want).abs() <= 1e-6, "in-place bias at {i}: got {g} want {want}");
+    }
+    free(a);
+    free(b);
+    free(out);
+}
+
+#[test]
+fn an_mlp_layer_composes_gemm_bias_and_activation() {
+    let Some(_guard) = gpu() else { return };
+    // y = gelu(x . w + b), the shape of every feed-forward block.
+    let (m, k, n) = (24usize, 40usize, 16usize);
+    let (x, w, b) = (noise(m * k, 23), noise(k * n, 24), noise(n, 25));
+    let (idx, idw, idb) = (upload(&x), upload(&w), upload(&b));
+    let out = hc4j_gpu_alloc_uninit(m * n);
+
+    assert_eq!(dispatch_matmul_f32_ex(idx, idw, out, m as u32, n as u32, k as u32, 0), 0);
+    assert_eq!(dispatch_add_row_bias_f32(out, idb, out, m as u32, n as u32), 0);
+    let status = unsafe {
+        dispatch_activation_f32(
+            out,
+            out,
+            0,
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null(),
+            m * n,
+            1,
+            Activation::Gelu as u32,
+            0,
+        )
+    };
+    assert_eq!(status, 0);
+
+    let got = download(out, m * n);
+    for r in 0..m {
+        for c in 0..n {
+            let mut acc = 0.0f64;
+            for i in 0..k {
+                acc += x[r * k + i] as f64 * w[i * n + c] as f64;
+            }
+            let want = cpu_activation(Activation::Gelu, acc + b[c] as f64, 0.0);
+            let g = got[r * n + c] as f64;
+            assert!((g - want).abs() <= 1e-4, "mlp at ({r},{c}): got {g} want {want}");
+        }
+    }
+    free(idx);
+    free(idw);
+    free(idb);
+    free(out);
+}
+
+#[test]
+fn a_cancelled_zero_fill_leaves_no_phantom_epoch() {
+    let Some(_gpu) = gpu() else { return };
+    let engine = get_engine().unwrap();
+    let mgr = manager().unwrap();
+    engine.stream.flush();
+
+    // hc4j_gpu_alloc zeroes, which queues a clear; writing the whole tensor
+    // cancels it again. That used to leave `pending` set with nothing to
+    // submit, so retire_epoch named an epoch no submission would claim and
+    // any region quarantined against it could never be reclaimed.
+    let n = 1000;
+    let host = noise(n, 44);
+    let id = hc4j_gpu_alloc(n);
+    assert_ne!(id, 0, "alloc failed");
+    assert_eq!(unsafe { hc4j_gpu_write(id, host.as_ptr(), n) }, 0);
+
+    // The invariant: whatever retire_epoch hands out, wait_epoch can satisfy.
+    let epoch = engine.stream.retire_epoch();
+    engine.stream.wait_epoch(epoch).expect("retire_epoch must name a reachable epoch");
+
+    free(id);
+    let budget = mgr.stats().vram_budget;
+    mgr.configure(budget, 0).expect("quarantine must drain");
+    assert_eq!(mgr.stats().quarantined, 0, "freed region should be back in its slab");
 }

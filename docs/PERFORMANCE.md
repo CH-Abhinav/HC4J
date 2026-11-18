@@ -49,7 +49,60 @@ on Windows.
 | `transpose` 512×512 | 0.697 ms | submission-latency bound |
 
 The GEMV and transpose figures sit at this machine's ~0.6 ms submit-and-wait floor; they measure
-round-trip latency, not kernel throughput.
+round-trip latency, not kernel throughput. This table came from a short run (`-wi 1 -i 2`) with no
+confidence intervals, so read it as indicative — the NN table below is the one with error bars.
+
+The batching ratio here (4.2×) is far below the smoke suite's 20.4×, and both are correct: these
+are 64 ops over 1 Mi elements, where each op is memory-bound and submission overhead is a small
+share of it, while the smoke suite batches 100 *small* ops that are almost pure overhead. Batching
+pays in proportion to how latency-bound the work already is.
+
+### Neural-network ops, 1024 × 1024 f32 (4 MiB), DX12
+
+`-wi 3 -i 10 -f 1 -r 3s`, GPU already warm:
+
+| Benchmark | Time | |
+| --- | --- | --- |
+| `sumRows` — reduce along the last axis | 0.757 ± 0.150 ms | |
+| `sum` — full reduction (two dispatches) | 0.786 ± 0.135 ms | |
+| `geluChainFused` — `(gelu(x) + x) * x`, one kernel | **0.930 ± 0.035 ms** | 2.6× |
+| `softmax` — online max-and-sum, then a write pass | 0.962 ± 0.158 ms | |
+| `relu` | 0.971 ± 0.152 ms | |
+| `gelu` — cubic plus `tanh` | 1.015 ± 0.191 ms | |
+| `rmsNorm` | 1.082 ± 0.192 ms | |
+| `layerNorm` — Welford statistics | 1.157 ± 0.169 ms | |
+| `crossEntropy` — logsumexp and a gather | 1.204 ± 0.519 ms | |
+| `geluChainUnfused` — the same chain as three kernels | 2.379 ± 0.347 ms | |
+| `feedForwardLayer` — GEMM + bias + gelu, one submission | 2.926 ± 0.531 ms | ~183 GFLOP/s |
+
+Two things to read out of this. First, **almost everything clusters at 0.75–1.2 ms**, which is this
+machine's submit-and-wait floor for a 4 MiB tensor: at this size the ops are latency-bound, not
+throughput-bound, which is why `relu` and `gelu` cost the same despite one being a `max` and the
+other a cubic plus a `tanh`. Second, the one gap that is far outside the noise is **fusion**:
+2.379 ms as three kernels versus 0.930 ms as one, and the fused figure has the tightest confidence
+interval in the table.
+
+The feed-forward layer is a 1024×256×1024 GEMM (537 MFLOP) plus a bias pass and an activation,
+submitted once — about 183 GFLOP/s, in line with the standalone GEMM numbers above.
+
+### Collectives, 2 ranks in loopback on one integrated GPU
+
+| AllReduce | Time | Staged per rank |
+| --- | --- | --- |
+| 2 ranks × 6 elements | 65 ms | negligible |
+| 4 ranks × 4096 elements | 403 ms | 0.02 MiB |
+| 2 ranks × 1 Mi elements (4 MiB) | 104 ms | 4.00 MiB |
+| Probed hop bandwidth | 0.70–0.77 GB/s | 16 MiB per measurement |
+
+These are latency numbers, not bandwidth numbers: every hop is a synchronous GPU → host → GPU round
+trip, so the 6-element case costs 65 ms while 1 Mi elements cost 104 ms. The 4-rank case is slower
+than the 1 Mi case despite moving 200× less data, because it performs 3 + 3 rounds × 4 ranks = 24
+serialized hops against the 1 + 1 × 2 = 4 of the 2-rank ring. Pipelining the rounds is what this
+needs, not a faster kernel.
+
+One measurement worth keeping as a warning: with a rank accidentally placed on the WARP software
+adapter, the same 1 Mi AllReduce took **864 ms** and the hop into it measured **0.01 GB/s**.
+Filtering software adapters was worth 8×.
 
 ### Fusion and batching, as the smoke suite reports them
 
@@ -150,16 +203,16 @@ matrix wider than ~500M elements.
 ## Reproducing
 
 ```bash
-# Both GPU smoke suites, with the throughput, fusion and batching sections (182 checks)
+# All four GPU smoke suites: trig, engine, neural-network, collective (286 checks)
 ./gradlew smokeTests
 
 # Same, on Vulkan
 HC4J_BACKEND=vulkan ./gradlew smokeTests
 
-# The Rust suite: adapter ranking, memory tiers, naga shader validation, GPU vs CPU (48 tests)
+# The Rust suite: adapter ranking, memory tiers, shader validation, ring schedule, GPU vs CPU (86 tests)
 cargo test --release --manifest-path src/main/rust/Cargo.toml
 
-# JMH: 10 benchmarks, 2 warmup + 5 measurement iterations, 1 fork
+# JMH: 24 benchmarks, 2 warmup + 5 measurement iterations, 1 fork
 ./gradlew jmh                       # results in build/reports/jmh/results.json
 ```
 
@@ -167,15 +220,24 @@ For a quick targeted run, build the benchmark jar once and drive JMH directly:
 
 ```bash
 ./gradlew jmhJar
-java --enable-native-access=ALL-UNNAMED -jar build/libs/HC4J-0.0.2-jmh.jar -l
-java --enable-native-access=ALL-UNNAMED -jar build/libs/HC4J-0.0.2-jmh.jar \
+java --enable-native-access=ALL-UNNAMED -jar build/libs/HC4J-0.1.0-jmh.jar -l
+java --enable-native-access=ALL-UNNAMED -jar build/libs/HC4J-0.1.0-jmh.jar \
      "ElementwiseBenchmark.(chainFused|chainUnfused)" -wi 1 -i 2 -f 1
 ```
 
 Benchmarks live in `src/jmh/java/hc4j/bench/`: `ElementwiseBenchmark` (dispatch, in-place, fusion,
-batching) and `MatmulBenchmark` (GEMM, both GEMV mappings, transpose; `-p size=512,1024,2048`).
+batching), `MatmulBenchmark` (GEMM, both GEMV mappings, transpose; `-p size=512,1024,2048`) and
+`NnBenchmark` (activations, fused activation chains, reductions, softmax, normalisation, cross
+entropy, a feed-forward layer; `-p rows=...,cols=...`).
 The first `./gradlew jmh` needs network access to fetch `jmh-core` and `jmh-generator-bytecode`
 (1.37, pinned in `build.gradle`); everything else builds offline.
+
+**Warm the GPU before you believe the first number.** A short run put cross entropy at 5.97 ms,
+*above* softmax — impossible, since it reads each row once where softmax reads twice and writes
+once. The cause was the power state, not the kernel: measured first in a cold session it came out
+6.80 ± 7.07 ms, and the same benchmark against a warm GPU gives 0.877 ± 0.219 ms. Run the set once
+to warm the device, then take the numbers from a second run, and treat any sub-millisecond
+difference as noise unless the confidence interval says otherwise.
 
 ## Tuning
 

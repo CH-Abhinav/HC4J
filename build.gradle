@@ -5,7 +5,8 @@ plugins {
 }
 
 group = 'hc4j'
-version = '0.0.2'
+// Keep in step with src/main/rust/Cargo.toml.
+version = '0.1.0'
 
 java {
     toolchain {
@@ -63,15 +64,39 @@ tasks.register('engineSmokeTest', JavaExec) {
     maxHeapSize = '2g'
 }
 
-tasks.register('smokeTests') {
-    description = 'Runs both GPU smoke suites (end-to-end verification).'
+tasks.register('nnSmokeTest', JavaExec) {
+    description = 'End-to-end check of the neural-network ops: activations, reductions, softmax, norms, losses.'
     group = 'verification'
-    dependsOn 'trignoSmokeTest', 'engineSmokeTest'
+    classpath = sourceSets.main.runtimeClasspath
+    mainClass = 'hc4j.test.NnSmokeTest'
+    javaLauncher = javaToolchains.launcherFor(java.toolchain)
+}
+
+tasks.register('collectiveSmokeTest', JavaExec) {
+    description = 'End-to-end check of the multi-GPU collective layer: topology discovery and ring AllReduce.'
+    group = 'verification'
+    classpath = sourceSets.main.runtimeClasspath
+    mainClass = 'hc4j.test.CollectiveSmokeTest'
+    javaLauncher = javaToolchains.launcherFor(java.toolchain)
+}
+
+tasks.register('smokeTests') {
+    description = 'Runs every GPU smoke suite (end-to-end verification).'
+    group = 'verification'
+    dependsOn 'trignoSmokeTest', 'engineSmokeTest', 'nnSmokeTest', 'collectiveSmokeTest'
 }
 
 // `check` (and therefore `build`) runs the smoke suites, which need a GPU.
 // Drop this line to keep the GPU out of the default build.
 tasks.named('check').configure { dependsOn 'smokeTests' }
+
+// Javadoc is a real gate: broken {@link}s, malformed tags and bad HTML fail the
+// build. `-missing` drops the "every parameter needs an @param" nagging, which
+// on an API this shape is noise — the records that carry non-obvious fields
+// (EngineStats, MemoryStats, Dims, Plan, Rows) document theirs explicitly.
+tasks.withType(Javadoc).configureEach {
+    options.addStringOption('Xdoclint:all,-missing', '-quiet')
+}
 
 tasks.withType(Test).configureEach {
     useJUnitPlatform()

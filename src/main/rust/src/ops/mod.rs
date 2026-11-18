@@ -6,6 +6,8 @@ pub mod elementwise;
 pub mod exponential;
 pub mod fusion;
 pub mod matmul;
+pub mod nn;
+pub mod reduce;
 pub mod trigno;
 
 #[cfg(test)]

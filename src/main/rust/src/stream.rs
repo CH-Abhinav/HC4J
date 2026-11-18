@@ -228,6 +228,9 @@ impl CommandStream {
     /// the staged uniform window.
     fn flush_locked(&self, state: &mut StreamState) -> Option<wgpu::SubmissionIndex> {
         if !state.has_work() {
+            // Nothing outstanding, so nothing is pending: keep the lock-free
+            // mirror honest at every flush point.
+            self.pending.store(false, Ordering::SeqCst);
             return None;
         }
         // End the shared compute pass: finish() needs an unlocked encoder.
@@ -411,6 +414,11 @@ impl CommandStream {
         let mut state = lock_or_recover(&self.state);
         let before = state.pending_clears.len();
         state.pending_clears.retain(|c| !(c.offset == offset && &c.buffer == buffer));
+        // Cancelling the only pending work must retract the flag too: a
+        // `pending` left standing with nothing to submit makes `retire_epoch`
+        // name an epoch no submission will ever claim, and a region
+        // quarantined against it could never be reclaimed.
+        self.pending.store(state.has_work(), Ordering::SeqCst);
         state.pending_clears.len() != before
     }
 
@@ -463,15 +471,22 @@ impl CommandStream {
         if self.completed_epoch() >= epoch {
             return Ok(());
         }
-        let submitted = {
+        let (submitted, idle) = {
             let mut state = lock_or_recover(&self.state);
             if state.submitted_epoch < epoch {
                 self.flush_locked(&mut state);
             }
-            state.submitted_epoch
+            (state.submitted_epoch, !state.has_work())
         };
         if submitted < epoch {
-            return Err(Hc4jError::Device(format!("epoch {epoch} was never submitted")));
+            // `retire_epoch` reads `pending` without the lock and may name one
+            // epoch beyond the last submission. With nothing left to submit,
+            // that epoch covers no work, so everything the caller is waiting
+            // on is already in `submitted`. A larger gap is a logic error.
+            if !(idle && epoch == submitted + 1) {
+                return Err(Hc4jError::Device(format!("epoch {epoch} was never submitted")));
+            }
+            return self.wait_epoch(submitted);
         }
         self.device
             .poll(wgpu::PollType::Wait {

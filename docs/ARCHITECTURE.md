@@ -59,7 +59,36 @@ int32_t hc4j_matmul_plan(uint32_t m, uint32_t n, uint32_t k, uint32_t flags);  /
 // Fusion
 int32_t hc4j_fused_dispatch(const uint32_t* program, uint32_t program_len,
         const uint64_t* inputs, uint32_t n_inputs, uint64_t id_out);
+
+// Activations — the unary ABI plus an op code and an f32 parameter as raw bits
+int32_t dispatch_activation_f32(/* as the unary ABI */, uint32_t act, uint32_t alpha_bits);
+
+// Reductions — op: 0 sum, 1 mean, 2 max, 3 min
+int32_t dispatch_reduce_f32(uint64_t id_a, uint64_t id_out, uint64_t length, uint32_t op);
+int32_t dispatch_reduce_square_f32(/* as above */);                     // folds x*x
+int32_t dispatch_reduce_diff2_f32(uint64_t id_a, uint64_t id_b, uint64_t id_out,
+        uint64_t length, uint32_t op);                                  // folds (a-b)^2
+int32_t dispatch_reduce_rows_f32(uint64_t id_a, uint64_t id_out,
+        uint32_t rows, uint32_t cols, uint32_t op);
+int32_t dispatch_argmax_rows(uint64_t id_a, uint64_t id_out,
+        uint32_t rows, uint32_t cols, uint32_t largest);                // i32 output
+
+// Neural-network row ops — a 0 handle means "absent" for gamma/beta
+int32_t dispatch_softmax_rows_f32(uint64_t id_a, uint64_t id_out,
+        uint32_t rows, uint32_t cols, uint32_t log_variant);
+int32_t dispatch_layernorm_rows_f32(uint64_t id_a, uint64_t id_gamma, uint64_t id_beta,
+        uint64_t id_out, uint32_t rows, uint32_t cols, uint32_t eps_bits);
+int32_t dispatch_rmsnorm_rows_f32(uint64_t id_a, uint64_t id_gamma, uint64_t id_out,
+        uint32_t rows, uint32_t cols, uint32_t eps_bits);
+int32_t dispatch_cross_entropy_rows(uint64_t id_logits, uint64_t id_targets,
+        uint64_t id_out, uint32_t rows, uint32_t cols);                 // i32 targets
+int32_t dispatch_add_row_bias_f32(uint64_t id_a, uint64_t id_bias, uint64_t id_out,
+        uint32_t rows, uint32_t cols);
 ```
+
+Float parameters cross as **raw bits in a `uint32_t`** (`alpha_bits`, `eps_bits`) rather than as a
+float argument, so the whole ABI is integers and handles — no float registers, no calling-convention
+differences to get wrong between Panama and the platform ABI.
 
 Contiguous calls pass null layout pointers and `is_contiguous = 1`, so the common case costs no
 off-heap marshalling at all. Strided calls pass three (or four) `rank`-length `u32` arrays
@@ -68,7 +97,8 @@ describing a view, which is how a transposed tensor can be an operand without be
 Plus memory and engine control: `hc4j_gpu_alloc`, `hc4j_gpu_alloc_uninit`, `hc4j_gpu_write`,
 `hc4j_gpu_download`, `hc4j_gpu_free`, `hc4j_mem_configure`, `hc4j_mem_stats`, `hc4j_mem_residency`,
 `hc4j_mem_evict`, `hc4j_init_gpu`, `hc4j_batch_begin`, `hc4j_batch_end`, `hc4j_synchronize`,
-`hc4j_engine_stats` — **44 exported symbols** in total.
+`hc4j_engine_stats` — and the eleven `hc4j_collective_*` entry points of section 6. **66 exported
+symbols** in total.
 
 ### Java side
 
@@ -187,6 +217,16 @@ Every `queue.submit` in HC4J goes through one `CommandStream`, which buys four p
   persistent uniform buffer (256 slots) and uploaded with a single `write_buffer` per submission,
   replacing a `create_buffer_init` — i.e. a driver allocation — per dispatch.
 
+Epoch numbers are mirrored outside the lock (an atomic `submitted` plus a `pending` flag) so
+`retire_epoch` can run from a `Drop` impl in any context. That mirror may over-report by one, and
+the quarantine depends on it never naming an epoch that cannot arrive: `pending` is therefore
+retracted the moment nothing is left to submit, including when a queued zero-fill is *cancelled*
+(an allocation the next kernel fully overwrites). Before that, a cancelled clear could leave
+`pending` set with an empty encoder, so a region freed just afterwards was quarantined against an
+epoch no submission would ever claim — and the region could never be reclaimed. The symptom
+appeared nowhere near the cause: `configure` failing with "epoch N was never submitted" while
+lowering a budget.
+
 Transfers also route through it: uploads use `Queue::write_buffer` so they are ordered after
 recorded work, with at most 2 chunks of 32 MiB in flight to bound wgpu's internal staging memory,
 except that tensors under 256 MiB upload in one shot (chunking them cost 35%). Downloads use a
@@ -242,6 +282,86 @@ selects the other kernel.
 
 Neither path supports stored-transposed operands (`-8 UNSUPPORTED`): materialise with `transpose`.
 
+### Reductions
+
+The primitive the ML layer is built on, in two shapes.
+
+**Full reduce** is always **exactly two dispatches**, whatever the input size. Pass 1 launches a
+*bounded* grid — at most `MAX_PARTIALS` (1024) workgroups — and each workgroup walks its slice with
+a grid-stride loop, reduces it in workgroup memory, and writes one partial. Pass 2 is a single
+workgroup that strides over the partials. So the scratch buffer is at most 4 KiB regardless of
+input size, and there is no recursion and no log-many passes. Inputs larger than one storage
+binding are tiled, each tile contributing its own partials.
+
+**Row reduce** (`[rows, cols] -> [rows]`) is one dispatch: one workgroup per row, striding over the
+row and reducing in workgroup memory. Row indices come from a folded grid, so the row count is not
+capped at 65535. Workgroups are 256 threads regardless of `cols`, which wastes lanes on narrow rows
+— a lanes-per-row mapping like the GEMV kernel's would fix that, and has not been needed yet.
+
+Three design points are worth naming:
+
+- **The identities are finite**, `±f32::MAX` rather than `±inf`, because the pairwise combines
+  (softmax's and Welford's) subtract two accumulators and `inf - inf` is NaN.
+- **Load variants** let a reduction fold a cheap expression in instead of materialising it:
+  `A[i]`, `A[i]*A[i]`, and `(A[i]-B[i])^2`. An L2 norm and an MSE are therefore one kernel with no
+  intermediate tensor.
+- **Mean divides in the final pass only**, guarded on a non-zero count in the uniform, so pass 1
+  and pass 2 share one kernel.
+
+The barriers sit in workgroup-uniform control flow in both loops: the tree loop's bound does not
+depend on the invocation, the guard is inside the loop body and the barrier outside it, and the
+early `row >= rows` return is taken by a whole workgroup at once.
+
+### Neural-network ops
+
+**Activations** are ordinary elementwise ops and reuse the unary executor, so they inherit tiling,
+grid folding, in-place output and the streaming fallback. They are not WGSL built-ins, and WGSL has
+neither overloading nor generics, so the unary template gained a *prelude* slot and separate
+`vec4`/scalar callables. Each activation is written **once**, with `__T__` standing for the width,
+and both functions are generated from that one body — the two paths cannot drift apart. A parameter
+(a leaky-ReLU slope, an ELU alpha) rides in `dims.params.z` as raw f32 bits and is read back with
+`bitcast`, so no new uniform layout was needed.
+
+Numerics are the reason these are kernels and not one-liners:
+
+- `sigmoid`, `silu` and `softplus` are written so every `exp` argument is non-positive
+  (`e = exp(-|x|)`, then select), which keeps them finite for large `|x|` where the naive forms
+  overflow.
+- `gelu` (the tanh approximation) **clamps its cubic argument to ±10** before `tanh`. Unclamped, the
+  argument reaches ~24000 at x = 88, and a driver that evaluates `tanh` as `(e^2a-1)/(e^2a+1)`
+  returns `inf/inf` = NaN. This was a real failure, caught by comparing against an f64 reference at
+  the saturating ends rather than only on random input in [-1, 1].
+- `relu` uses `max(x, 0)`; leaky ReLU uses `select`, not `max`, because a slope above 1 would make
+  `max` wrong.
+
+**Row-wise ops** run one workgroup per row: a reduction over the row in workgroup memory, then a
+write pass over the same row, as a single dispatch.
+
+| Op | Statistics phase | Reads per row |
+| --- | --- | --- |
+| softmax, log-softmax | online `(max, sum exp)` recurrence | 2 |
+| layer norm | Welford `(n, mean, M2)` triples, combined pairwise | 2 |
+| RMS norm | sum of squares | 2 |
+| cross entropy | online `(max, sum exp)`, then a gather at the target | 1 |
+
+The **online softmax** recurrence (Milakov & Gimelshein) combines `(m1,s1)` and `(m2,s2)` as
+`m = max(m1,m2)`, `s = s1·exp(m1-m) + s2·exp(m2-m)`, which folds the maximum and the sum into one
+pass — a row is read twice rather than three times, and no `exp` ever sees a positive argument.
+**Welford** accumulation gives layer norm its variance without `E[x²] - E[x]²`; a thread that saw
+no elements contributes `(0,0,0)`, which the combine absorbs.
+
+Cross entropy cannot report an error from the GPU, so an out-of-range class index writes **NaN**
+for that row instead of reading a neighbouring one — the value is the signal, and the host contract
+says so.
+
+**Bias broadcast** (`out[r,c] = a[r,c] + bias[c]`) is its own flat kernel because fusion requires
+identical shapes and cannot express it, and because a GEMM followed by a bias add is the shape of
+every linear layer.
+
+Affine variants are separate pipelines rather than one kernel with a flag: a bind-group layout is
+derived from the shader, so "with gamma and beta" and "without" are different layouts. They are
+cached under different names, which is all the pipeline cache needs.
+
 ### Fusion
 
 `FusedExpr` builds an immutable expression tree on the Java side and lowers it to a **postfix u32
@@ -258,7 +378,103 @@ compiles once.
 `sin(a) + b) * c` becomes one dispatch moving 4N floats (3 reads, 1 write) instead of three
 dispatches moving 8N, with one allocation instead of three.
 
-## 6. Engine startup
+Activations fuse too (`relu`, `sigmoid`, `gelu`, `silu`, `softplus`). They are not built-ins, so the
+generator emits each called activation's `vec4` helper — taken from the same `Activation` body the
+standalone kernels use — and **only** the ones the program calls, since an unused function still
+costs shader-compile time under D3D12. Which activations are called is collected during lowering,
+not by scanning the program: a `CONST` payload is raw f32 bits whose top byte can look like any
+opcode. The parameterised activations stay out, because a fused program has nowhere to carry a
+per-op alpha.
+
+
+## 6. Collectives
+
+`collective.rs` adds a second, independent execution context: a ring of **ranks**, each with its
+own `wgpu::Device`, queue and reduction pipeline, plus a topology probe and ring AllReduce.
+
+```
+        rank 0                 rank 1                 rank 2
+   ┌──────────────┐       ┌──────────────┐       ┌──────────────┐
+   │ Device+Queue │       │ Device+Queue │       │ Device+Queue │
+   │ add pipeline │       │ add pipeline │       │ add pipeline │
+   │ data, recv   │       │ data, recv   │       │ data, recv   │
+   └──────┬───────┘       └──────┬───────┘       └──────┬───────┘
+          │  GPU→host→GPU        │  GPU→host→GPU        │
+          └──────────────────────┴──────────────────────┘ (ring)
+```
+
+### Why it is separate from the engine
+
+A rank is deliberately **not** a `GpuEngine`. The engine is a process-wide singleton with a tiered
+memory manager, a command stream and an epoch-based slab allocator, all keyed to one device;
+making it multi-device would mean threading a device index through every op and every allocation.
+The collective instead owns its devices and buffers outright, which keeps the verified
+single-device engine untouched. The cost is explicit: collective buffers are not `Tensor`s, so data
+crosses through `write`/`read`. A zero-copy bridge for rank 0 is separate work.
+
+What *is* shared: the backend selection (`HC4J_BACKEND`), the adapter and backend ranking functions,
+and the convention that every storage binding is `read_write`.
+
+### Picking devices for ranks
+
+Two filters, both of which a naive implementation gets wrong — and both of which the probe caught:
+
+- **One physical GPU can enumerate twice.** With DX12 and Vulkan both enabled, the same card
+  appears once per backend. Ranks are therefore assigned over adapters deduplicated by
+  `(vendor, device, name)`, keeping the better-ranked backend. Without this, a 2-rank ring on a
+  single-GPU machine put rank 0 on Vulkan and rank 1 on DX12 and called them two devices.
+- **Software adapters are excluded.** Windows enumerates WARP ("Microsoft Basic Render Driver",
+  `DeviceType::Cpu`) beside the real GPU. A ring that placed a rank there measured 0.01 GB/s on
+  that hop, and a 1 Mi-element AllReduce took 864 ms instead of 104 ms. They are used only when
+  nothing else exists.
+
+Remaining devices are sorted best-first, then ranks are assigned round-robin, so extra ranks beyond
+the GPU count reuse a GPU — **loopback mode**, which exists so the whole path is exercisable on a
+single-GPU machine. Loopback is reported per link, because an intra-GPU copy must not be read as a
+PCIe measurement.
+
+### Transport
+
+Every hop is host-staged: the source copies its chunk into a persistent `MAP_READ` buffer, the host
+maps and reads it, and the destination uploads it. wgpu has no external-memory export/import, so
+`dma_buf` / `OPAQUE_WIN32` handle passing — the thing that makes real P2P fast — is not reachable
+from this stack; it needs the raw `VkDevice` through `wgpu-hal`. The `Transport` enum already
+carries the distinction so the Java API and the reports do not have to change when it lands.
+
+Staging buffers are allocated once per AllReduce rather than once per hop, which is the same idea
+as the engine's readback ring; the ring itself cannot be reused because it belongs to the engine's
+device, not to a rank.
+
+Hops are synchronous — a transfer completes before the reduction consuming it is recorded. Correct,
+and dominated by round-trip latency rather than bandwidth. Pipelining the rounds is the obvious
+next step.
+
+The reference design orchestrates its staged transfers with Vulkan **timeline semaphores**, so the
+CPU never blocks waiting for a stage to land. wgpu exposes no timeline-semaphore API, so each hop
+instead blocks on `Device::poll(PollType::Wait)`. That is the second thing, after external memory,
+that a `wgpu-hal` transport would recover — and it is why the hop cost here is a round trip rather
+than a pipeline stage.
+
+### The ring
+
+`n - 1` rounds of scatter-reduce followed by `n - 1` rounds of allgather, over `n` chunks:
+
+| Phase | Round `r`, rank `i` | Effect |
+| --- | --- | --- |
+| Scatter-reduce | sends chunk `(i - r) mod n` to `i + 1` | the receiver *adds* it into its own copy |
+| Allgather | sends chunk `(i + 1 - r) mod n` to `i + 1` | the receiver *overwrites* its copy |
+
+The index arithmetic has a property worth stating, because it is easy to assert incorrectly: each
+rank receives exactly **one** add per chunk, for every chunk but its own — a chunk accumulates as it
+travels rather than piling up on one rank. The chunk a rank receives in the *last* scatter-reduce
+round is the one that has now seen every contribution, and that is where the allgather begins
+(rank `r` starts holding chunk `r + 1`). Both properties are unit-tested for `n = 2..8` without a
+GPU, alongside an end-to-end check that every rank ends up with the exact sum.
+
+The reduction kernel is 256 threads wide with a folded 2-D grid, matching the engine's elementwise
+convention; the reference design used one invocation per workgroup.
+
+## 7. Engine startup
 
 1. `requested_backends()` — `HC4J_BACKEND` narrows the set; the default on Windows is DX12 + Vulkan.
 2. `enumerate_adapters` and rank: **discrete first**, then by backend (DX12 preferred on Windows),
@@ -280,7 +496,7 @@ Compilation sets `zero_initialize_workgroup_memory: false`: under D3D12's FXC, z
 workgroup memory scaled catastrophically with its size (190 s for the 128×128 GEMM), so kernels
 that need zeroed workgroup storage zero it explicitly.
 
-## 7. Invariants worth keeping
+## 8. Invariants worth keeping
 
 - Java holds handles, never pointers. Only the Rust registry knows where the bytes are.
 - One submission point. Anything that submits outside `CommandStream` breaks epochs, and therefore
@@ -291,3 +507,24 @@ that need zeroed workgroup storage zero it explicitly.
 - Native struct layouts are mirrored with an asserted field count on the Java side.
 - Kernels rebuild their linear index from `num_workgroups`, never from a hardcoded grid width.
 - The matmul dispatcher stays pure and unit-tested; capability probing happens in `Caps::of`.
+- `retire_epoch()` only ever names an epoch `wait_epoch()` can satisfy. It reads the lock-free
+  `pending` mirror, so it may name one epoch past the last submission; that is safe **only** because
+  `pending` is retracted whenever nothing is left to submit (a cancelled zero-fill, an empty flush)
+  and `wait_epoch` treats the one-past case as satisfied by the last submission. Break either half
+  and a slab region quarantined against a phantom epoch can never be reclaimed, which surfaces far
+  away as `configure` failing with "epoch N was never submitted".
+- Reduction identities are finite (`±f32::MAX`, not `±inf`): the pairwise combines subtract two
+  accumulators.
+- `workgroupBarrier()` stays in workgroup-uniform control flow. Loop bounds must not depend on the
+  invocation, guards go inside the loop body with the barrier outside it, and an early return must
+  be taken by the whole workgroup (so its condition may depend only on `workgroup_id`).
+- WGSL has no shadowing and a long reserved-word list. `meta` and `target` both got through review
+  and failed at shader-compile time; the naga validation tests exist to catch the next one.
+- An adapter list is not a device list. Deduplicate by physical identity before treating entries as
+  separate GPUs, and exclude `DeviceType::Cpu`: both mistakes produce a working-but-wrong topology
+  that only a bandwidth number exposes.
+- A collective owns its devices and buffers; it must not reach into the engine's memory manager or
+  command stream. Anything that blurs that line pulls multi-device concerns into the single-device
+  engine, which is the refactor this design exists to avoid.
+- The ring schedule is unit-tested as pure index arithmetic for `n = 2..8`. A collective bug that
+  only shows up as a wrong sum on four GPUs is not something to debug on hardware.

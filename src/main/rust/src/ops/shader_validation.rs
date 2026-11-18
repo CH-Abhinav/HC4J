@@ -5,7 +5,9 @@
 use naga::valid::{Capabilities, ValidationFlags, Validator};
 
 use super::arithmetic::{DataType, generate_elem_shader};
-use super::elementwise::generate_unary_shader;
+use super::elementwise::{generate_unary_shader, generate_unary_shader_with};
+use super::nn::{Activation, RowOp, row_bias_wgsl};
+use super::reduce::{Load, ReduceOp, flat_kernel_wgsl, row_argmax_wgsl, row_kernel_wgsl};
 use super::fusion::{self, op};
 use super::matmul::{
     TILE_64, TILE_128, TILED16_WGSL, TRANSPOSE_WGSL, gemv_cols_wgsl, gemv_rows_wgsl, register_kernel_wgsl,
@@ -62,6 +64,9 @@ fn fused_kernels() {
     let unary = [
         op::NEG, op::ABS, op::SIN, op::COS, op::TAN, op::ASIN, op::ACOS, op::ATAN, op::SINH, op::COSH, op::TANH,
         op::ASINH, op::ACOSH, op::ATANH, op::EXP, op::LOG, op::SQRT,
+        // Activations: not built-ins, so each one also has to bring its
+        // helper definition into the generated shader.
+        op::RELU, op::SIGMOID, op::GELU, op::SILU, op::SOFTPLUS,
     ];
     let binary = [op::ADD, op::SUB, op::MUL, op::DIV, op::MAX, op::MIN, op::POW];
     let mut program = vec![op::word(op::LOAD, 0)];
@@ -107,4 +112,70 @@ fn subgroup_gemv_needs_and_passes_with_the_subgroup_capability() {
             "subgroup kernel must not validate without the capability"
         );
     }
+}
+
+#[test]
+fn activation_suite() {
+    for act in [
+        Activation::Relu,
+        Activation::LeakyRelu,
+        Activation::Elu,
+        Activation::Gelu,
+        Activation::Silu,
+        Activation::Sigmoid,
+        Activation::Softplus,
+    ] {
+        let prelude = act.prelude();
+        let wgsl = generate_unary_shader_with(&prelude, "hc4j_act4", "hc4j_act1");
+        validate(act.name(), &wgsl);
+    }
+}
+
+#[test]
+fn reduction_kernels() {
+    for op in [ReduceOp::Sum, ReduceOp::Mean, ReduceOp::Max, ReduceOp::Min] {
+        for load in [Load::Value, Load::Square, Load::Diff2] {
+            for finalize in [false, true] {
+                validate(&format!("flat {} {:?} fin={finalize}", op.name(), load), &flat_kernel_wgsl(op, load, finalize));
+            }
+            validate(&format!("rows {} {:?}", op.name(), load), &row_kernel_wgsl(op, load));
+        }
+    }
+    validate("argmax rows", &row_argmax_wgsl(true));
+    validate("argmin rows", &row_argmax_wgsl(false));
+}
+
+#[test]
+fn nn_row_kernels() {
+    for op in [
+        RowOp::Softmax,
+        RowOp::LogSoftmax,
+        RowOp::LayerNorm { affine: true },
+        RowOp::LayerNorm { affine: false },
+        RowOp::RmsNorm { affine: true },
+        RowOp::RmsNorm { affine: false },
+        RowOp::CrossEntropy,
+    ] {
+        validate(&op.name(), &op.wgsl());
+    }
+    validate("row bias", &row_bias_wgsl());
+}
+
+#[test]
+fn fused_activations_define_only_the_helpers_they_use() {
+    // A fused relu must declare hc4j_relu and nothing else: an unused
+    // function still costs shader-compile time under D3D12.
+    let program = [op::word(op::LOAD, 0), op::word(op::RELU, 0)];
+    let wgsl = fusion::compile(&program, 1).unwrap().wgsl;
+    assert!(wgsl.contains("fn hc4j_relu(x: vec4<f32>)"));
+    assert!(!wgsl.contains("hc4j_gelu"));
+    validate("fused relu", &wgsl);
+
+    // A constant whose raw bits look like an opcode must not pull in a
+    // helper: payload words are data, not instructions.
+    let payload = f32::from_bits(0x2300_0000).to_bits();
+    let tricky = [op::word(op::LOAD, 0), op::word(op::CONST, 0), payload, op::word(op::MUL, 0)];
+    let wgsl = fusion::compile(&tricky, 1).unwrap().wgsl;
+    assert!(!wgsl.contains("hc4j_"), "a CONST payload must not define a helper");
+    validate("fused const payload", &wgsl);
 }

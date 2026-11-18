@@ -4,6 +4,7 @@ import hc4j.engine.WgpuBackend;
 import hc4j.ops.ArithmeticOps;
 import hc4j.ops.ExponentialOps;
 import hc4j.ops.MatmulOps;
+import hc4j.ops.NnOps;
 import hc4j.ops.TrignoOps;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
@@ -241,6 +242,260 @@ public class Tensor implements AutoCloseable {
 
     public Tensor transpose(Tensor res) {
         return MatmulOps.transpose(this, res);
+    }
+
+    // ------------------------------------------------------------------------------------------
+    // Scalar arithmetic (one fused kernel each)
+    // ------------------------------------------------------------------------------------------
+
+    public Tensor add(float c) { return lazy().add(c).eval(); }
+    public Tensor sub(float c) { return lazy().sub(c).eval(); }
+    public Tensor mul(float c) { return lazy().mul(c).eval(); }
+    public Tensor div(float c) { return lazy().div(c).eval(); }
+
+    /** {@code res = this + c}; {@code res} may be {@code this}. */
+    public Tensor add(float c, Tensor res) { return lazy().add(c).eval(res); }
+    public Tensor sub(float c, Tensor res) { return lazy().sub(c).eval(res); }
+    public Tensor mul(float c, Tensor res) { return lazy().mul(c).eval(res); }
+    public Tensor div(float c, Tensor res) { return lazy().div(c).eval(res); }
+
+    // ------------------------------------------------------------------------------------------
+    // NnOps: activations, reductions, softmax, normalisation, losses
+    // ------------------------------------------------------------------------------------------
+
+    public Tensor relu() { return activation(NnOps.Activation.RELU, 0f); }
+    public Tensor gelu() { return activation(NnOps.Activation.GELU, 0f); }
+    public Tensor silu() { return activation(NnOps.Activation.SILU, 0f); }
+    public Tensor sigmoid() { return activation(NnOps.Activation.SIGMOID, 0f); }
+    public Tensor softplus() { return activation(NnOps.Activation.SOFTPLUS, 0f); }
+
+    /** {@code max(x, slope * x)}; the usual slope is 0.01. */
+    public Tensor leakyRelu(float slope) { return activation(NnOps.Activation.LEAKY_RELU, slope); }
+
+    /** {@code x > 0 ? x : alpha * (exp(x) - 1)}. */
+    public Tensor elu(float alpha) { return activation(NnOps.Activation.ELU, alpha); }
+
+    public Tensor relu(Tensor res) { return NnOps.activation(NnOps.Activation.RELU, this, res, 0f); }
+    public Tensor gelu(Tensor res) { return NnOps.activation(NnOps.Activation.GELU, this, res, 0f); }
+    public Tensor silu(Tensor res) { return NnOps.activation(NnOps.Activation.SILU, this, res, 0f); }
+    public Tensor sigmoid(Tensor res) { return NnOps.activation(NnOps.Activation.SIGMOID, this, res, 0f); }
+    public Tensor softplus(Tensor res) { return NnOps.activation(NnOps.Activation.SOFTPLUS, this, res, 0f); }
+
+    public Tensor leakyRelu(float slope, Tensor res) {
+        return NnOps.activation(NnOps.Activation.LEAKY_RELU, this, res, slope);
+    }
+
+    public Tensor elu(float alpha, Tensor res) {
+        return NnOps.activation(NnOps.Activation.ELU, this, res, alpha);
+    }
+
+    private Tensor activation(NnOps.Activation act, float alpha) {
+        requireF32(act.name());
+        Tensor res = empty(dtype, shape);
+        try {
+            return NnOps.activation(act, this, res, alpha);
+        } catch (RuntimeException | Error e) {
+            res.close();
+            throw e;
+        }
+    }
+
+    /** Sum of every element, read back to the host (a blocking round trip). */
+    public float sum() { return reduceToScalar(NnOps.Reduction.SUM); }
+
+    /** Mean of every element, read back to the host. */
+    public float mean() { return reduceToScalar(NnOps.Reduction.MEAN); }
+
+    /** Largest element, read back to the host. */
+    public float maxValue() { return reduceToScalar(NnOps.Reduction.MAX); }
+
+    /** Smallest element, read back to the host. */
+    public float minValue() { return reduceToScalar(NnOps.Reduction.MIN); }
+
+    /** {@code sum(x^2)}, read back to the host: the squared L2 norm. */
+    public float sumSquares() {
+        try (Tensor r = empty(DType.f32, 1)) {
+            NnOps.reduceSquare(NnOps.Reduction.SUM, this, r);
+            return r.toFloatArray()[0];
+        }
+    }
+
+    /** Mean squared error against {@code target}, read back to the host. */
+    public float mse(Tensor target) {
+        try (Tensor r = empty(DType.f32, 1)) {
+            NnOps.reduceDiffSquared(NnOps.Reduction.MEAN, this, target, r);
+            return r.toFloatArray()[0];
+        }
+    }
+
+    /** Reduction into a one-element tensor, leaving the result on the device. */
+    public Tensor sum(Tensor res) { return NnOps.reduce(NnOps.Reduction.SUM, this, res); }
+    public Tensor mean(Tensor res) { return NnOps.reduce(NnOps.Reduction.MEAN, this, res); }
+    public Tensor maxValue(Tensor res) { return NnOps.reduce(NnOps.Reduction.MAX, this, res); }
+    public Tensor minValue(Tensor res) { return NnOps.reduce(NnOps.Reduction.MIN, this, res); }
+
+    private float reduceToScalar(NnOps.Reduction op) {
+        try (Tensor r = empty(DType.f32, 1)) {
+            NnOps.reduce(op, this, r);
+            return r.toFloatArray()[0];
+        }
+    }
+
+    /**
+     * Reductions along the last axis: {@code [4, 8, 128]} gives {@code [4, 8]} (see
+     * {@link NnOps} for the row convention).
+     */
+    public Tensor sumRows() { return reduceRowsFresh(NnOps.Reduction.SUM); }
+    public Tensor meanRows() { return reduceRowsFresh(NnOps.Reduction.MEAN); }
+    public Tensor maxRows() { return reduceRowsFresh(NnOps.Reduction.MAX); }
+    public Tensor minRows() { return reduceRowsFresh(NnOps.Reduction.MIN); }
+
+    public Tensor sumRows(Tensor res) { return NnOps.reduceRows(NnOps.Reduction.SUM, this, res); }
+    public Tensor meanRows(Tensor res) { return NnOps.reduceRows(NnOps.Reduction.MEAN, this, res); }
+    public Tensor maxRows(Tensor res) { return NnOps.reduceRows(NnOps.Reduction.MAX, this, res); }
+    public Tensor minRows(Tensor res) { return NnOps.reduceRows(NnOps.Reduction.MIN, this, res); }
+
+    /** Index of the largest element in each row of the last axis, as an i32 tensor. */
+    public Tensor argmaxRows() { return argRowsFresh(true); }
+
+    /** Index of the smallest element in each row of the last axis, as an i32 tensor. */
+    public Tensor argminRows() { return argRowsFresh(false); }
+
+    public Tensor argmaxRows(Tensor res) { return NnOps.argmaxRows(this, res, true); }
+
+    public Tensor argminRows(Tensor res) { return NnOps.argmaxRows(this, res, false); }
+
+    private Tensor reduceRowsFresh(NnOps.Reduction op) {
+        Tensor res = empty(DType.f32, NnOps.rows(this).reducedShape(this));
+        try {
+            return NnOps.reduceRows(op, this, res);
+        } catch (RuntimeException | Error e) {
+            res.close();
+            throw e;
+        }
+    }
+
+    private Tensor argRowsFresh(boolean largest) {
+        Tensor res = empty(DType.i32, NnOps.rows(this).reducedShape(this));
+        try {
+            return NnOps.argmaxRows(this, res, largest);
+        } catch (RuntimeException | Error e) {
+            res.close();
+            throw e;
+        }
+    }
+
+    /** Numerically stable softmax along the last axis. */
+    public Tensor softmax() { return softmaxFresh(false); }
+
+    /** Log-softmax along the last axis; prefer this to {@code softmax().log()}. */
+    public Tensor logSoftmax() { return softmaxFresh(true); }
+
+    public Tensor softmax(Tensor res) { return NnOps.softmaxRows(this, res, false); }
+
+    public Tensor logSoftmax(Tensor res) { return NnOps.softmaxRows(this, res, true); }
+
+    private Tensor softmaxFresh(boolean logarithmic) {
+        requireF32("softmax");
+        Tensor res = empty(dtype, shape);
+        try {
+            return NnOps.softmaxRows(this, res, logarithmic);
+        } catch (RuntimeException | Error e) {
+            res.close();
+            throw e;
+        }
+    }
+
+    /** Layer norm along the last axis, without an affine transform. */
+    public Tensor layerNorm(float eps) { return layerNormFresh(null, null, eps); }
+
+    /** Layer norm along the last axis, scaled by {@code gamma} and shifted by {@code beta}. */
+    public Tensor layerNorm(Tensor gamma, Tensor beta, float eps) {
+        return layerNormFresh(gamma, beta, eps);
+    }
+
+    public Tensor layerNorm(Tensor gamma, Tensor beta, float eps, Tensor res) {
+        return NnOps.layerNormRows(this, gamma, beta, res, eps);
+    }
+
+    /** RMS norm along the last axis; {@code gamma} may be null. */
+    public Tensor rmsNorm(Tensor gamma, float eps) {
+        requireF32("rmsNorm");
+        Tensor res = empty(dtype, shape);
+        try {
+            return NnOps.rmsNormRows(this, gamma, res, eps);
+        } catch (RuntimeException | Error e) {
+            res.close();
+            throw e;
+        }
+    }
+
+    public Tensor rmsNorm(Tensor gamma, float eps, Tensor res) {
+        return NnOps.rmsNormRows(this, gamma, res, eps);
+    }
+
+    private Tensor layerNormFresh(Tensor gamma, Tensor beta, float eps) {
+        requireF32("layerNorm");
+        Tensor res = empty(dtype, shape);
+        try {
+            return NnOps.layerNormRows(this, gamma, beta, res, eps);
+        } catch (RuntimeException | Error e) {
+            res.close();
+            throw e;
+        }
+    }
+
+    /**
+     * Per-row softmax cross entropy, treating {@code this} as logits along the last axis and
+     * {@code targets} as i32 class indices. Average the result for a batch loss.
+     */
+    public Tensor crossEntropy(Tensor targets) {
+        Tensor res = empty(DType.f32, NnOps.rows(this).reducedShape(this));
+        try {
+            return NnOps.crossEntropyRows(this, targets, res);
+        } catch (RuntimeException | Error e) {
+            res.close();
+            throw e;
+        }
+    }
+
+    public Tensor crossEntropy(Tensor targets, Tensor res) {
+        return NnOps.crossEntropyRows(this, targets, res);
+    }
+
+    /** Adds {@code bias} to every row of the last axis. */
+    public Tensor addRowBias(Tensor bias) {
+        requireF32("addRowBias");
+        Tensor res = empty(dtype, shape);
+        try {
+            return NnOps.addRowBias(this, bias, res);
+        } catch (RuntimeException | Error e) {
+            res.close();
+            throw e;
+        }
+    }
+
+    public Tensor addRowBias(Tensor bias, Tensor res) { return NnOps.addRowBias(this, bias, res); }
+
+    /**
+     * A linear layer: {@code this · weights + bias}, with {@code bias} broadcast over rows (null
+     * for none). One GEMM and one bias pass; wrap the pair in a {@link hc4j.engine.GpuBatch} with
+     * the activation to submit them together.
+     */
+    public Tensor linear(Tensor weights, Tensor bias) {
+        Tensor res = matmul(weights);
+        try {
+            return bias == null ? res : NnOps.addRowBias(res, bias, res);
+        } catch (RuntimeException | Error e) {
+            res.close();
+            throw e;
+        }
+    }
+
+    /** A linear layer into {@code res}, which must not be {@code this} or {@code weights}. */
+    public Tensor linear(Tensor weights, Tensor bias, Tensor res) {
+        matmul(weights, res);
+        return bias == null ? res : NnOps.addRowBias(res, bias, res);
     }
 
     // ------------------------------------------------------------------------------------------

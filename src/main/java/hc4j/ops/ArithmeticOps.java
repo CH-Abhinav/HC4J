@@ -6,6 +6,14 @@ import hc4j.engine.WgpuBackend;
 import java.lang.foreign.*;
 import java.lang.invoke.MethodHandle;
 
+/**
+ * Binary elementwise arithmetic (add, sub, mul, div) for f32 and i32, caller-allocated: the result
+ * tensor is passed in, so it may be one of the operands ({@code add(a, b, a)}).
+ *
+ * <p>Contiguous operands take a fast path with no off-heap layout arrays; a non-contiguous operand
+ * (a transposed view) is read through the strided kernel without being materialised. Shapes must
+ * match exactly — there is no broadcasting. Use {@link NnOps#addRowBias} for a bias over rows.
+ */
 public class ArithmeticOps {
 
     private static final MethodHandle dispatchAdd;

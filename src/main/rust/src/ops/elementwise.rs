@@ -99,8 +99,14 @@ pub struct UnaryElemDims {
 
 impl UnaryElemDims {
     pub fn contiguous(length: u32) -> Self {
+        Self::contiguous_with(length, 0)
+    }
+
+    /// `alpha_bits` is an f32 op parameter (a leaky-ReLU slope, an ELU alpha)
+    /// passed as raw bits in `params.z` and read back with `bitcast`.
+    pub fn contiguous_with(length: u32, alpha_bits: u32) -> Self {
         Self {
-            params: [length, 1, 0, 0],
+            params: [length, 1, alpha_bits, 0],
             shape: [1; 8],
             strides_a: [0; 8],
             strides_c: [0; 8],
@@ -180,6 +186,12 @@ struct Dims {
 @group(0) @binding(1) var<storage, read_write> arrayC: array<f32>;
 @group(0) @binding(2) var<uniform> dims: Dims; // UNIFORM: Hits fast constant cache!
 
+// Helper definitions for ops that are not WGSL built-ins. Empty for the
+// built-in suites; activations declare a vec4 and a scalar function here,
+// since WGSL has neither overloading nor generics. Functions may read
+// `dims.params.z` for an op parameter (alpha).
+__WGSL_PRELUDE__
+
 @compute @workgroup_size(256)
 fn main(
     @builtin(global_invocation_id) gid: vec3<u32>,
@@ -199,18 +211,18 @@ fn main(
         if (base + 3u < length) {
             // Highly optimized contiguous execution (4-wide vectorization)
             let val_a = vec4<f32>(arrayA[base], arrayA[base+1u], arrayA[base+2u], arrayA[base+3u]);
-            let res = __WGSL_OP__(val_a);
+            let res = __WGSL_OP4__(val_a);
             arrayC[base] = res.x;
             arrayC[base+1u] = res.y;
             arrayC[base+2u] = res.z;
             arrayC[base+3u] = res.w;
         } else {
             // Manually unrolled tail execution (avoids 'for' loop overhead on the GPU)
-            arrayC[base] = __WGSL_OP__(arrayA[base]);
+            arrayC[base] = __WGSL_OP1__(arrayA[base]);
             if (base + 1u < length) {
-                arrayC[base+1u] = __WGSL_OP__(arrayA[base+1u]);
+                arrayC[base+1u] = __WGSL_OP1__(arrayA[base+1u]);
                 if (base + 2u < length) {
-                    arrayC[base+2u] = __WGSL_OP__(arrayA[base+2u]);
+                    arrayC[base+2u] = __WGSL_OP1__(arrayA[base+2u]);
                 }
             }
         }
@@ -239,18 +251,63 @@ fn main(
             }
         }
 
-        arrayC[offset_c] = __WGSL_OP__(arrayA[offset_a]);
+        arrayC[offset_c] = __WGSL_OP1__(arrayA[offset_a]);
     }
 }
 "#;
 
+/// Specialises the template for an op whose callable works on both `vec4<f32>`
+/// and `f32` — every WGSL built-in, and prefixed expressions like
+/// `"0.4342944819032518 * log"`.
 pub fn generate_unary_shader(wgsl_op: &str) -> String {
-    UNARY_F32_SHADER_TEMPLATE.replace("__WGSL_OP__", wgsl_op)
+    generate_unary_shader_with("", wgsl_op, wgsl_op)
+}
+
+/// Specialises the template with a prelude of WGSL helper definitions and
+/// separate vec4 / scalar callables. WGSL has no overloading, so an op that
+/// is not a built-in needs one function per width.
+pub fn generate_unary_shader_with(prelude: &str, wgsl_op4: &str, wgsl_op1: &str) -> String {
+    UNARY_F32_SHADER_TEMPLATE
+        .replace("__WGSL_PRELUDE__", prelude)
+        .replace("__WGSL_OP4__", wgsl_op4)
+        .replace("__WGSL_OP1__", wgsl_op1)
 }
 
 pub fn unary_pipeline(family: &str, op_name: &str, wgsl_op: &str) -> Hc4jResult<wgpu::ComputePipeline> {
     let shader_name = format!("{family}_{op_name}_f32");
     get_engine()?.get_or_compile(&shader_name, "main", &generate_unary_shader(wgsl_op))
+}
+
+/// How to specialise the unary template for one op.
+#[derive(Copy, Clone, Debug)]
+pub struct UnaryKernel<'a> {
+    /// Groups ops in the pipeline-cache key: `{family}_{op_name}_f32`.
+    pub family: &'a str,
+    pub op_name: &'a str,
+    /// WGSL helper definitions, or `""` for built-in ops.
+    pub prelude: &'a str,
+    /// Callable applied to a `vec4<f32>` (the contiguous fast path).
+    pub op4: &'a str,
+    /// Callable applied to an `f32` (the tail and strided paths).
+    pub op1: &'a str,
+    /// Raw bits of the f32 op parameter exposed as `dims.params.z`.
+    pub alpha_bits: u32,
+}
+
+impl<'a> UnaryKernel<'a> {
+    /// An op whose callable is width-generic (a WGSL built-in).
+    pub fn builtin(family: &'a str, op_name: &'a str, wgsl_op: &'a str) -> Self {
+        Self { family, op_name, prelude: "", op4: wgsl_op, op1: wgsl_op, alpha_bits: 0 }
+    }
+
+    pub fn pipeline(&self) -> Hc4jResult<wgpu::ComputePipeline> {
+        let shader_name = format!("{}_{}_f32", self.family, self.op_name);
+        get_engine()?.get_or_compile(
+            &shader_name,
+            "main",
+            &generate_unary_shader_with(self.prelude, self.op4, self.op1),
+        )
+    }
 }
 
 /// FFI body shared by every unary f32 op (trigonometric and exponential).
@@ -272,13 +329,46 @@ pub unsafe fn dispatch_unary(
     length: usize,
     is_contiguous: u32,
 ) -> i32 {
-    ffi_guard(op_name, || {
-        let pipeline = unary_pipeline(family, op_name, wgsl_op)?;
+    unsafe {
+        dispatch_unary_kernel(
+            UnaryKernel::builtin(family, op_name, wgsl_op),
+            id_a,
+            id_out,
+            rank,
+            ptr_shape,
+            ptr_strides_a,
+            ptr_strides_c,
+            length,
+            is_contiguous,
+        )
+    }
+}
+
+/// As [`dispatch_unary`], for an op that needs a prelude or a parameter.
+///
+/// # Safety
+/// When `is_contiguous == 0` and `rank > 0`, the three pointers must each
+/// point to `rank` readable `u32` values.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn dispatch_unary_kernel(
+    kernel: UnaryKernel<'_>,
+    id_a: u64,
+    id_out: u64,
+    rank: u32,
+    ptr_shape: *const u32,
+    ptr_strides_a: *const u32,
+    ptr_strides_c: *const u32,
+    length: usize,
+    is_contiguous: u32,
+) -> i32 {
+    ffi_guard(kernel.op_name, || {
+        let pipeline = kernel.pipeline()?;
+        let alpha = kernel.alpha_bits;
         if is_contiguous != 0 {
             check_contiguous_length(id_out, length)?;
             return run_contiguous(
                 &pipeline,
-                &|len| bytemuck::bytes_of(&UnaryElemDims::contiguous(len)).to_vec(),
+                &|len| bytemuck::bytes_of(&UnaryElemDims::contiguous_with(len, alpha)).to_vec(),
                 &[id_a],
                 id_out,
             );
@@ -286,7 +376,7 @@ pub unsafe fn dispatch_unary(
         let length = u32::try_from(length).map_err(|_| Hc4jError::InvalidParam("strided length exceeds u32"))?;
         let (shape, strides) = unsafe { pruned_layout(rank, ptr_shape, &[ptr_strides_a, ptr_strides_c])? };
         let dims = UnaryElemDims {
-            params: [length, 0, 0, 0],
+            params: [length, 0, alpha, 0],
             shape,
             strides_a: strides[0],
             strides_c: strides[1],
