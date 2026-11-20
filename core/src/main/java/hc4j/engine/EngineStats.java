@@ -1,0 +1,106 @@
+/*
+ * Copyright © 2026 Abhinav Chinnala (chinnala.abhinav5@gmail.com)
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package hc4j.engine;
+
+import java.lang.foreign.MemoryLayout;
+import java.lang.foreign.MemorySegment;
+import java.lang.foreign.StructLayout;
+import java.lang.foreign.ValueLayout;
+
+/**
+ * Snapshot of the engine's command stream and device capabilities, mirroring
+ * {@code #[repr(C)] struct EngineStats}.
+ *
+ * @param submissions {@code queue.submit} calls
+ * @param dispatches compute dispatches recorded
+ * @param kernelBytes bytes bound to kernels as inputs plus outputs: the logical memory traffic
+ * @param hostToDeviceBytes bytes uploaded across the FFI boundary (writes, page-ins)
+ * @param deviceToHostBytes bytes read back (downloads, evictions)
+ * @param batches command-batch scopes closed
+ * @param completedEpoch highest submission epoch the GPU has finished; the slab allocator
+ *     reclaims a quarantined region once the epoch that last touched it reaches this
+ * @param submittedEpoch highest epoch handed to the queue, so {@code submittedEpoch -
+ *     completedEpoch} is the work still in flight
+ * @param features bitmask of {@link #FEATURE_SUBGROUPS} and {@link #FEATURE_SHADER_F16}
+ * @param deviceType 0 other, 1 integrated, 2 discrete, 3 virtual, 4 CPU
+ * @param backend 0 none, 1 Vulkan, 2 Metal, 3 DX12, 4 GL, 5 browser WebGPU
+ * @param subgroupMinSize smallest subgroup (wave) size the adapter reports, or 0 without the
+ *     subgroup feature
+ * @param subgroupMaxSize largest subgroup size the adapter reports; the GEMV kernel only takes
+ *     its subgroup path when this permits a 256-lane workgroup
+ */
+public record EngineStats(
+        long submissions,
+        long dispatches,
+        long kernelBytes,
+        long hostToDeviceBytes,
+        long deviceToHostBytes,
+        long batches,
+        long completedEpoch,
+        long submittedEpoch,
+        long features,
+        long deviceType,
+        long backend,
+        long subgroupMinSize,
+        long subgroupMaxSize) {
+
+    public static final long FEATURE_SUBGROUPS = 1;
+    public static final long FEATURE_SHADER_F16 = 2;
+
+    private static final int FIELDS = 13;
+
+    public static final StructLayout LAYOUT = MemoryLayout.structLayout(
+            MemoryLayout.sequenceLayout(FIELDS, ValueLayout.JAVA_LONG).withName("fields"));
+
+    public static EngineStats read(MemorySegment s) {
+        long[] v = s.toArray(ValueLayout.JAVA_LONG);
+        return new EngineStats(v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8], v[9], v[10], v[11], v[12]);
+    }
+
+    public boolean hasSubgroups() {
+        return (features & FEATURE_SUBGROUPS) != 0;
+    }
+
+    public boolean hasShaderF16() {
+        return (features & FEATURE_SHADER_F16) != 0;
+    }
+
+    public boolean isDiscrete() {
+        return deviceType == 2;
+    }
+
+    public String backendName() {
+        return switch ((int) backend) {
+            case 1 -> "Vulkan";
+            case 2 -> "Metal";
+            case 3 -> "DX12";
+            case 4 -> "GL";
+            case 5 -> "WebGPU";
+            default -> "unknown";
+        };
+    }
+
+    public String deviceTypeName() {
+        return switch ((int) deviceType) {
+            case 1 -> "integrated";
+            case 2 -> "discrete";
+            case 3 -> "virtual";
+            case 4 -> "cpu";
+            default -> "other";
+        };
+    }
+}

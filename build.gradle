@@ -1,125 +1,21 @@
-plugins {
-    id 'java'
-    id 'application'
-    id 'me.champeau.jmh' version '0.7.3' 
-}
+subprojects {
+    apply plugin: 'java'
 
-group = 'hc4j'
-// Keep in step with src/main/rust/Cargo.toml.
-version = '0.1.0'
+    group = 'io.github.ch-abhinav'
+    version = '0.1.0'
 
-java {
-    toolchain {
-        languageVersion = JavaLanguageVersion.of(25)
+    java {
+        toolchain {
+            languageVersion = JavaLanguageVersion.of(25)
+        }
     }
-}
 
-
-application {
-    mainClass = 'hc4j.test.Main' 
-}
-
-repositories {
-    mavenCentral()
-}
-
-
-task buildRust(type: Exec) {
-    description = 'Compiles the HC4J Rust WebGPU backend via Cargo.'
-    group = 'build'
-    workingDir = rootDir
-
-    
-    if (System.getProperty("os.name").toLowerCase().contains("windows")) {
-        commandLine 'cmd', '/c', 'cargo build --manifest-path src/main/rust/Cargo.toml --release'
-    } else {
-        commandLine 'sh', '-c', 'cargo build --manifest-path src/main/rust/Cargo.toml --release'
+    repositories {
+        mavenCentral()
     }
-}
 
-processResources.dependsOn buildRust
-classes.dependsOn buildRust
-
-
-tasks.withType(JavaExec).configureEach {
-    
-    jvmArgs += ['--enable-native-access=ALL-UNNAMED']
-}
-
-tasks.register('trignoSmokeTest', JavaExec) {
-    description = 'End-to-end check of the trig FFM bindings and the tiered VRAM manager on the real GPU.'
-    group = 'verification'
-    classpath = sourceSets.main.runtimeClasspath
-    mainClass = 'hc4j.test.TrignoSmokeTest'
-    javaLauncher = javaToolchains.launcherFor(java.toolchain)
-}
-
-tasks.register('engineSmokeTest', JavaExec) {
-    description = 'End-to-end check of matmul, fusion, slabs, batching and >67M-element grid folding on the real GPU.'
-    group = 'verification'
-    classpath = sourceSets.main.runtimeClasspath
-    mainClass = 'hc4j.test.EngineSmokeTest'
-    javaLauncher = javaToolchains.launcherFor(java.toolchain)
-    // The >67M-element checks hold two 269 MB float[] copies at once.
-    maxHeapSize = '2g'
-}
-
-tasks.register('nnSmokeTest', JavaExec) {
-    description = 'End-to-end check of the neural-network ops: activations, reductions, softmax, norms, losses.'
-    group = 'verification'
-    classpath = sourceSets.main.runtimeClasspath
-    mainClass = 'hc4j.test.NnSmokeTest'
-    javaLauncher = javaToolchains.launcherFor(java.toolchain)
-}
-
-tasks.register('collectiveSmokeTest', JavaExec) {
-    description = 'End-to-end check of the multi-GPU collective layer: topology discovery and ring AllReduce.'
-    group = 'verification'
-    classpath = sourceSets.main.runtimeClasspath
-    mainClass = 'hc4j.test.CollectiveSmokeTest'
-    javaLauncher = javaToolchains.launcherFor(java.toolchain)
-}
-
-tasks.register('smokeTests') {
-    description = 'Runs every GPU smoke suite (end-to-end verification).'
-    group = 'verification'
-    dependsOn 'trignoSmokeTest', 'engineSmokeTest', 'nnSmokeTest', 'collectiveSmokeTest'
-}
-
-// `check` (and therefore `build`) runs the smoke suites, which need a GPU.
-// Drop this line to keep the GPU out of the default build.
-tasks.named('check').configure { dependsOn 'smokeTests' }
-
-// Javadoc is a real gate: broken {@link}s, malformed tags and bad HTML fail the
-// build. `-missing` drops the "every parameter needs an @param" nagging, which
-// on an API this shape is noise — the records that carry non-obvious fields
-// (EngineStats, MemoryStats, Dims, Plan, Rows) document theirs explicitly.
-tasks.withType(Javadoc).configureEach {
-    options.addStringOption('Xdoclint:all,-missing', '-quiet')
-}
-
-tasks.withType(Test).configureEach {
-    useJUnitPlatform()
-    jvmArgs += ['--enable-native-access=ALL-UNNAMED']
-} 
-jmh {
-    // Pin the harness: the plugin otherwise tracks its own default (1.36), while the
-    // dependency cache holds 1.37.
-    jmhVersion = '1.37'
-
-    jvmArgsAppend = ['--enable-native-access=ALL-UNNAMED']
-    
-    
-    warmupIterations = 2
-    iterations = 5
-    fork = 1
-    threads = 1
-    
-    
-    resultFormat = 'JSON'
-    resultsFile = project.file("$buildDir/reports/jmh/results.json")
-}
-
-tasks.named('jmh').configure {
-    dependsOn buildRust
+    tasks.withType(JavaCompile).configureEach {
+        options.encoding = 'UTF-8'
+        options.compilerArgs += ['-Xlint:all,-serial']
+    }
 }

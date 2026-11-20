@@ -1,0 +1,41 @@
+plugins {
+    id 'java-library'
+}
+
+base {
+    archivesName = 'hc4j'
+}
+
+dependencies {
+    testImplementation platform('org.junit:junit-bom:5.12.2')
+    testImplementation 'org.junit.jupiter:junit-jupiter'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+}
+
+def skipRust = project.hasProperty('skipRustBuild') && project.property('skipRustBuild') == 'true'
+
+tasks.register('buildRust', Exec) {
+    description = 'Compiles the HC4J Rust WebGPU backend via Cargo.'
+    group = 'build'
+    workingDir = rootDir
+
+    onlyIf { !skipRust }
+
+    if (System.getProperty("os.name").toLowerCase().contains("windows")) {
+        commandLine 'cmd', '/c', 'cargo build --manifest-path native/Cargo.toml --release'
+    } else {
+        commandLine 'sh', '-c', 'cargo build --manifest-path native/Cargo.toml --release'
+    }
+}
+
+tasks.named('test') {
+    if (!skipRust) {
+        dependsOn 'buildRust'
+    }
+    useJUnitPlatform()
+    modularity.inferModulePath = false
+    jvmArgs += ['--enable-native-access=ALL-UNNAMED']
+    if (System.getProperty("hc4j.native.path") != null) {
+        systemProperty 'hc4j.native.path', System.getProperty("hc4j.native.path")
+    }
+}

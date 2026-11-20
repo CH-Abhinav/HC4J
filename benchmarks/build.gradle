@@ -1,0 +1,23 @@
+plugins {
+    id 'java'
+    id 'me.champeau.jmh' version '0.7.3'
+}
+
+dependencies {
+    implementation project(':core')
+}
+
+tasks.withType(JavaExec).configureEach {
+    jvmArgs += ['--enable-native-access=ALL-UNNAMED']
+}
+
+jmh {
+    jmhVersion = '1.37'
+    jvmArgsAppend = ['--enable-native-access=ALL-UNNAMED']
+    warmupIterations = 2
+    iterations = 5
+    fork = 1
+    threads = 1
+    resultFormat = 'JSON'
+    resultsFile = project.file("$buildDir/reports/jmh/results.json")
+}

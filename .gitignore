@@ -10,17 +10,19 @@
 .env.*.local
 
 # --- Rust / Cargo ---
+target/
 /target/
+native/target/
+/native/target/
 **/*.rs.bk
 
-# Cargo.lock is committed on purpose. The Rust crate here is not a library
-# published to crates.io; it is a cdylib built as part of the application, so
-# pinning the exact dependency graph is what makes a release reproducible.
-!src/main/rust/Cargo.lock
-
+# Cargo.lock is committed on purpose.
+!native/Cargo.lock
 
 # --- Java / Build Systems (Maven & Gradle) ---
+build/
 /build/
+**/build/
 .gradle/
 *.class
 *.jar
@@ -28,10 +30,11 @@
 *.ear
 hs_err_pid*
 
-# The wrapper jar MUST be committed: without it a fresh clone cannot run
-# ./gradlew at all, and the whole build (including the Rust cdylib) is driven
-# through the wrapper.
+# The wrapper jar MUST be committed:
 !gradle/wrapper/gradle-wrapper.jar
+
+# --- Audit & Local Docs ---
+HC4J_AUDIT.md
 
 # --- IDEs & Editors ---
 .idea/
@@ -56,5 +59,3 @@ hs_err_pid*
 .Trashes
 ehthumbs.db
 Thumbs.db
-
-

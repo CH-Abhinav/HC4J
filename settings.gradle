@@ -1,1 +1,3 @@
-rootProject.name = 'HC4J'
+rootProject.name = 'hc4j-parent'
+
+include ':core', ':benchmarks'
