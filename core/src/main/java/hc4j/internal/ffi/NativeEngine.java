@@ -82,6 +82,10 @@ public final class NativeEngine {
     private static MethodHandle collWriteHandle;
     private static MethodHandle collReadHandle;
     private static MethodHandle collAllReduceHandle;
+    private static MethodHandle collDeviceProfileHandle;
+    private static MethodHandle collRingOrderHandle;
+    private static MethodHandle collIslandCountHandle;
+    private static MethodHandle collIslandHandle;
 
     private NativeEngine() {
         throw new AssertionError("No instances of NativeEngine");
@@ -233,6 +237,18 @@ public final class NativeEngine {
 
         collAllReduceHandle = linker.downcallHandle(lookup.find("hc4j_collective_allreduce_sum").orElseThrow(),
                 FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.JAVA_LONG, ValueLayout.ADDRESS, ValueLayout.JAVA_INT));
+
+        collDeviceProfileHandle = linker.downcallHandle(lookup.find("hc4j_collective_device_profile").orElseThrow(),
+                FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.JAVA_LONG, ValueLayout.JAVA_INT, ValueLayout.ADDRESS));
+
+        collRingOrderHandle = linker.downcallHandle(lookup.find("hc4j_collective_ring_order").orElseThrow(),
+                FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.JAVA_LONG, ValueLayout.ADDRESS, ValueLayout.JAVA_INT));
+
+        collIslandCountHandle = linker.downcallHandle(lookup.find("hc4j_collective_island_count").orElseThrow(),
+                FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.JAVA_LONG));
+
+        collIslandHandle = linker.downcallHandle(lookup.find("hc4j_collective_island").orElseThrow(),
+                FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.JAVA_LONG, ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.JAVA_INT));
     }
 
     public static void checkStatus(int statusCode, String context) {
@@ -600,6 +616,53 @@ public final class NativeEngine {
         } catch (Throwable t) {
             if (t instanceof RuntimeException re) throw re;
             throw new RuntimeException("HC4J collective allReduceSum failed", t);
+        }
+    }
+
+    public static void collectiveDeviceProfile(long handle, int rank, MemorySegment out) {
+        ensureInitialized();
+        try {
+            int status = (int) collDeviceProfileHandle.invokeExact(handle, rank, out);
+            checkStatus(status, "Collective.deviceProfiles");
+        } catch (Throwable t) {
+            if (t instanceof RuntimeException re) throw re;
+            throw new RuntimeException("HC4J collective device profile query failed", t);
+        }
+    }
+
+    public static int collectiveRingOrder(long handle, MemorySegment outRanks, int cap) {
+        ensureInitialized();
+        try {
+            int count = (int) collRingOrderHandle.invokeExact(handle, outRanks, cap);
+            if (count < 0) checkStatus(count, "Collective.ringOrder");
+            return count;
+        } catch (Throwable t) {
+            if (t instanceof RuntimeException re) throw re;
+            throw new RuntimeException("HC4J collective ring order query failed", t);
+        }
+    }
+
+    public static int collectiveIslandCount(long handle) {
+        ensureInitialized();
+        try {
+            int count = (int) collIslandCountHandle.invokeExact(handle);
+            if (count < 0) checkStatus(count, "Collective.islands");
+            return count;
+        } catch (Throwable t) {
+            if (t instanceof RuntimeException re) throw re;
+            throw new RuntimeException("HC4J collective island count query failed", t);
+        }
+    }
+
+    public static int collectiveIsland(long handle, int index, MemorySegment outHeader, MemorySegment outRanks, int cap) {
+        ensureInitialized();
+        try {
+            int written = (int) collIslandHandle.invokeExact(handle, index, outHeader, outRanks, cap);
+            if (written < 0) checkStatus(written, "Collective.islands");
+            return written;
+        } catch (Throwable t) {
+            if (t instanceof RuntimeException re) throw re;
+            throw new RuntimeException("HC4J collective island query failed", t);
         }
     }
 }

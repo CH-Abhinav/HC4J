@@ -26,7 +26,11 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import hc4j.collective.Collective;
 import hc4j.collective.CollectiveBuffer;
+import hc4j.collective.DeviceProfile;
+import hc4j.collective.Island;
 import hc4j.collective.Link;
+import hc4j.collective.ShardAllocation;
+import hc4j.collective.WorkloadPlan;
 import hc4j.testutil.GpuTestSupport;
 import hc4j.testutil.TestAssertions;
 import java.util.List;
@@ -261,5 +265,42 @@ class CollectiveTest {
                 }
             }
         }
+    }
+
+    @Test
+    @DisplayName("Device profiles, optimal ring order, islands, and planWork on real hardware")
+    void testDeviceProfilesRingOrderAndIslands() {
+        try (Collective ring = Collective.open(2)) {
+            List<DeviceProfile> profiles = ring.deviceProfiles();
+            assertEquals(2, profiles.size());
+            for (int i = 0; i < 2; i++) {
+                DeviceProfile p = profiles.get(i);
+                assertEquals(i, p.rank());
+                assertNotNull(p.name());
+                assertNotNull(p.deviceType());
+                assertTrue(p.vramBytes() > 0, "VRAM bytes must be > 0");
+                assertTrue(p.computeGflops() > 0.0, "Compute GFLOP/s must be > 0.0");
+            }
+
+            List<Integer> order = ring.ringOrder();
+            assertEquals(2, order.size());
+            assertEquals(List.of(0, 1), order);
+
+            List<Island> islands = ring.islands();
+            assertNotNull(islands);
+            assertFalse(islands.isEmpty());
+
+            WorkloadPlan plan = ring.planWork(10_000L);
+            assertNotNull(plan);
+            assertEquals(10_000L, plan.totalUnits());
+            long sum = plan.allocations().stream().mapToLong(ShardAllocation::units).sum();
+            assertEquals(10_000L, sum);
+        }
+    }
+
+    @Test
+    @DisplayName("Numerical equivalence for 2-rank uneven AllReduce")
+    void testAllReduceUnevenEquivalence() {
+        verifyAllReduce(2, 1003);
     }
 }

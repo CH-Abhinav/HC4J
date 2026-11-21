@@ -6,6 +6,7 @@
 
 pub(crate) mod device;
 pub(crate) mod pipeline;
+pub(crate) mod profile;
 pub(crate) mod ring;
 pub(crate) mod topology;
 pub(crate) mod transport;
@@ -15,11 +16,12 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use ash::vk;
 
-use crate::collective::backend::{CollectiveBackend, LinkInfo};
+use crate::collective::backend::{CollectiveBackend, DeviceProfileC, LinkInfo};
+use crate::collective::planner::{detect_islands, solve_optimal_ring, IslandInfo};
 use crate::collective::vulkan::device::{BufMem, GpuNode, alloc_device_local, alloc_staging, build_node, create_instance, destroy_buf, device_name, device_type_str, enum_physical_devices, one_shot_submit};
 use crate::collective::vulkan::pipeline::ReducePipeline;
-use crate::collective::vulkan::ring::execute_ring_allreduce;
-use crate::collective::vulkan::topology::{TopoGraph, build_topology};
+use crate::collective::vulkan::ring::execute_allreduce;
+use crate::collective::vulkan::topology::{TopoGraph, build_topology_and_profiles};
 use crate::error::{Hc4jError, Hc4jResult};
 
 pub struct VulkanP2pBackend {
@@ -28,6 +30,9 @@ pub struct VulkanP2pBackend {
     nodes: Vec<GpuNode>,
     pipelines: Mutex<Vec<ReducePipeline>>,
     graph: TopoGraph,
+    profiles: Vec<DeviceProfileC>,
+    ring_order: Vec<u32>,
+    islands: Vec<IslandInfo>,
     buffers: Mutex<HashMap<u64, (usize, BufMem, usize)>>,
     next_buffer_id: AtomicU64,
 }
@@ -53,7 +58,9 @@ impl VulkanP2pBackend {
             nodes.push(node);
         }
 
-        let graph = build_topology(&nodes)?;
+        let (graph, profiles) = build_topology_and_profiles(&nodes)?;
+        let ring_order = solve_optimal_ring(nodes.len(), &graph.links);
+        let islands = detect_islands(nodes.len(), &profiles, &graph.links);
 
         let mut pipelines = Vec::with_capacity(ranks as usize);
         for node in &nodes {
@@ -69,11 +76,19 @@ impl VulkanP2pBackend {
             if num_physical < ranks as usize { " -> virtual loopback mode" } else { "" }
         );
         for (i, node) in nodes.iter().enumerate() {
+            let p = &profiles[i];
+            let vram_str = if p.vram_bytes >= 1024 * 1024 * 1024 {
+                format!("{:.1} GiB", p.vram_bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+            } else {
+                format!("{:.1} MiB", p.vram_bytes as f64 / (1024.0 * 1024.0))
+            };
             eprintln!(
-                "[HC4J] collective rank {}: {} | {}",
+                "[HC4J] collective rank {}: {} | {} | VRAM={} | {:.1} GFLOP/s",
                 i,
                 device_name(&node.props),
-                device_type_str(node.props.device_type)
+                device_type_str(node.props.device_type),
+                vram_str,
+                p.compute_gflops
             );
         }
         for link in &graph.links {
@@ -92,12 +107,56 @@ impl VulkanP2pBackend {
             );
         }
 
+        let algo_var = std::env::var("HC4J_COLLECTIVE_ALGO")
+            .map(|v| v.trim().to_ascii_lowercase())
+            .unwrap_or_else(|_| "auto".to_string());
+        let effective_algo = match algo_var.as_str() {
+            "ring" => "ring",
+            "hierarchical" => "hierarchical",
+            _ => {
+                if islands.len() > 1 && islands.iter().any(|isl| isl.members.len() > 1) {
+                    "hierarchical"
+                } else {
+                    "ring"
+                }
+            }
+        };
+
+        let island_strs: Vec<String> = islands
+            .iter()
+            .map(|isl| {
+                let members_str = isl
+                    .members
+                    .iter()
+                    .map(|m| m.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let tr_str = match isl.internal_transport {
+                    1 => "P2P",
+                    2 => "HOST_SHARED_DMA",
+                    _ => "HOST_STAGED",
+                };
+                format!("[{members_str}]@{tr_str} leader={}", isl.leader_rank)
+            })
+            .collect();
+
+        eprintln!(
+            "[HC4J] collective plan: ring={:?} | islands={} ({}) | algo={}",
+            ring_order,
+            islands.len(),
+            island_strs.join(", "),
+            effective_algo
+        );
+
         Ok(Self {
             _entry: entry,
             instance,
             nodes,
             pipelines: Mutex::new(pipelines),
             graph,
+            profiles,
+            ring_order,
+            islands,
             buffers: Mutex::new(HashMap::new()),
             next_buffer_id: AtomicU64::new(1),
         })
@@ -259,7 +318,27 @@ impl CollectiveBackend for VulkanP2pBackend {
         };
 
         let mut pipelines = self.pipelines.lock().unwrap();
-        execute_ring_allreduce(&self.nodes, &mut pipelines, &self.graph, &raw_buffers, elements)
+        execute_allreduce(
+            &self.nodes,
+            &mut pipelines,
+            &self.graph,
+            &raw_buffers,
+            elements,
+            &self.ring_order,
+            &self.islands,
+        )
+    }
+
+    fn device_profiles(&self) -> &[DeviceProfileC] {
+        &self.profiles
+    }
+
+    fn ring_order(&self) -> &[u32] {
+        &self.ring_order
+    }
+
+    fn islands(&self) -> &[IslandInfo] {
+        &self.islands
     }
 }
 
@@ -519,5 +598,102 @@ mod tests {
 
         backend.free(b0).expect("free b0");
         backend.free(b1).expect("free b1");
+    }
+
+    #[test]
+    fn test_vulkan_device_profiles_and_plan() {
+        let backend = match VulkanP2pBackend::new(2) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("Skipping Vulkan test (ICD unavailable): {e}");
+                return;
+            }
+        };
+
+        let profiles = backend.device_profiles();
+        assert_eq!(profiles.len(), 2);
+        for p in profiles {
+            assert!(p.vram_bytes > 0, "vram_bytes should be > 0, got {}", p.vram_bytes);
+            assert!(p.compute_gflops > 0.0, "compute_gflops should be > 0.0, got {}", p.compute_gflops);
+        }
+
+        let ring = backend.ring_order();
+        assert_eq!(ring.len(), 2);
+        assert_eq!(ring, &[0, 1]);
+
+        let islands = backend.islands();
+        assert!(!islands.is_empty());
+    }
+
+    #[test]
+    fn test_vulkan_ring_vs_hierarchical_equivalence() {
+        let rank_counts = [2, 4];
+        let len = 1003; // Prime uneven length
+
+        for &ranks in &rank_counts {
+            // Run under HC4J_COLLECTIVE_ALGO=ring
+            let res_ring = {
+                unsafe { std::env::set_var("HC4J_COLLECTIVE_ALGO", "ring") };
+                let backend = match VulkanP2pBackend::new(ranks as u32) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        eprintln!("Skipping Vulkan test for {ranks} ranks: {e}");
+                        return;
+                    }
+                };
+                let mut bufs = Vec::new();
+                for r in 0..ranks {
+                    let id = backend.alloc(r, len as u64).expect("alloc rank");
+                    let data: Vec<f32> = (0..len).map(|i| (r * len + i + 1) as f32).collect();
+                    backend.write(id, &data).expect("write rank data");
+                    bufs.push(id);
+                }
+                backend.allreduce_sum(&bufs).expect("allreduce_sum ring");
+                let mut out = vec![0.0f32; len];
+                backend.read(bufs[0], &mut out).expect("read rank 0");
+                for &id in &bufs {
+                    backend.free(id).expect("free rank buf");
+                }
+                out
+            };
+
+            // Run under HC4J_COLLECTIVE_ALGO=hierarchical
+            let res_hierarchical = {
+                unsafe { std::env::set_var("HC4J_COLLECTIVE_ALGO", "hierarchical") };
+                let backend = match VulkanP2pBackend::new(ranks as u32) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        eprintln!("Skipping Vulkan test for {ranks} ranks: {e}");
+                        return;
+                    }
+                };
+                let mut bufs = Vec::new();
+                for r in 0..ranks {
+                    let id = backend.alloc(r, len as u64).expect("alloc rank");
+                    let data: Vec<f32> = (0..len).map(|i| (r * len + i + 1) as f32).collect();
+                    backend.write(id, &data).expect("write rank data");
+                    bufs.push(id);
+                }
+                backend.allreduce_sum(&bufs).expect("allreduce_sum hierarchical");
+                let mut out = vec![0.0f32; len];
+                backend.read(bufs[0], &mut out).expect("read rank 0");
+                for &id in &bufs {
+                    backend.free(id).expect("free rank buf");
+                }
+                out
+            };
+
+            unsafe { std::env::remove_var("HC4J_COLLECTIVE_ALGO") };
+
+            // Verify numerical equivalence <= 1e-4
+            for i in 0..len {
+                assert!(
+                    (res_ring[i] - res_hierarchical[i]).abs() <= 1e-4,
+                    "mismatch at element {i} for ranks={ranks}: ring={}, hierarchical={}",
+                    res_ring[i],
+                    res_hierarchical[i]
+                );
+            }
+        }
     }
 }

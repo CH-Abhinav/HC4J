@@ -3,10 +3,14 @@ pub mod vulkan;
 
 pub mod abi;
 pub mod backend;
+pub mod cache;
+pub mod planner;
 pub mod wgpu_backend;
 
 pub use abi::*;
 pub use backend::*;
+pub use cache::*;
+pub use planner::*;
 pub use wgpu_backend::*;
 
 #[cfg(all(feature = "vulkan-p2p", any(target_os = "windows", target_os = "linux")))]

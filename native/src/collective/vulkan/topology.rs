@@ -4,9 +4,16 @@ use std::collections::HashMap;
 use std::time::Instant;
 use ash::vk;
 
-use crate::collective::backend::LinkInfo;
+use crate::collective::backend::{DeviceProfileC, LinkInfo};
+use crate::collective::cache::{
+    compute_fingerprint, get_cache_path, load_cache, serialize_cache, should_bypass_cache,
+    write_cache_atomic, CachedDevice, CachedEdge, PhysDeviceSummary,
+};
 use crate::collective::vulkan::device::{
-    GpuNode, alloc_device_local, alloc_staging, destroy_buf, one_shot_submit,
+    GpuNode, alloc_device_local, alloc_staging, destroy_buf, device_name, one_shot_submit,
+};
+use crate::collective::vulkan::profile::{
+    map_device_type, measure_compute_gflops, query_vram_bytes,
 };
 use crate::collective::vulkan::transport::TransportTier;
 use crate::error::{Hc4jError, Hc4jResult};
@@ -510,15 +517,191 @@ pub(crate) fn select_best_tier(
     }
 }
 
+#[allow(dead_code)]
 pub(crate) fn build_topology(nodes: &[GpuNode]) -> Hc4jResult<TopoGraph> {
+    build_topology_and_profiles(nodes).map(|(graph, _)| graph)
+}
+
+pub(crate) fn build_topology_and_profiles(
+    nodes: &[GpuNode],
+) -> Hc4jResult<(TopoGraph, Vec<DeviceProfileC>)> {
+    let mut unique_phds: Vec<vk::PhysicalDevice> = Vec::new();
+    let mut unique_node_indices: Vec<usize> = Vec::new();
+    for (i, node) in nodes.iter().enumerate() {
+        if !unique_phds.contains(&node.physical_device) {
+            unique_phds.push(node.physical_device);
+            unique_node_indices.push(i);
+        }
+    }
+    let num_physical = unique_phds.len();
+
+    let include_cpu = std::env::var("HC4J_COLLECTIVE_INCLUDE_CPU")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+
+    let device_names: Vec<String> = unique_node_indices
+        .iter()
+        .map(|&idx| device_name(&nodes[idx].props))
+        .collect();
+
+    let summaries: Vec<PhysDeviceSummary> = unique_node_indices
+        .iter()
+        .enumerate()
+        .map(|(k, &idx)| {
+            let node = &nodes[idx];
+            PhysDeviceSummary {
+                vendor_id: node.props.vendor_id,
+                device_id: node.props.device_id,
+                driver_version: node.props.driver_version,
+                device_type: map_device_type(node.props.device_type),
+                device_name: &device_names[k],
+            }
+        })
+        .collect();
+
+    let fingerprint = compute_fingerprint(include_cpu, &summaries);
+    let cache_path = get_cache_path(&fingerprint);
+    let bypass = should_bypass_cache();
+
+    #[allow(clippy::collapsible_if)]
+    if !bypass {
+        if let Some(cached) = load_cache(&cache_path, num_physical) {
+            let mut all_found = true;
+            for i in 0..nodes.len() {
+                for j in 0..nodes.len() {
+                    if i != j {
+                        let src_phys = unique_phds
+                            .iter()
+                            .position(|&p| p == nodes[i].physical_device)
+                            .unwrap();
+                        let dst_phys = unique_phds
+                            .iter()
+                            .position(|&p| p == nodes[j].physical_device)
+                            .unwrap();
+                        if !cached
+                            .edges
+                            .iter()
+                            .any(|e| e.src_phys_idx == src_phys && e.dst_phys_idx == dst_phys)
+                        {
+                            all_found = false;
+                            break;
+                        }
+                    }
+                }
+                if !all_found {
+                    break;
+                }
+            }
+
+            if all_found {
+                eprintln!(
+                    "[HC4J] collective topology: loaded from cache ({})",
+                    cache_path.display()
+                );
+                let mut profiles = Vec::with_capacity(nodes.len());
+                for (r, node) in nodes.iter().enumerate() {
+                    let phys_idx = unique_phds
+                        .iter()
+                        .position(|&p| p == node.physical_device)
+                        .unwrap();
+                    let dev = &cached.devices[phys_idx];
+                    profiles.push(DeviceProfileC {
+                        rank: r as u32,
+                        vendor_id: node.props.vendor_id,
+                        device_id: node.props.device_id,
+                        device_type: map_device_type(node.props.device_type),
+                        vram_bytes: dev.vram_bytes,
+                        compute_gflops: dev.compute_gflops,
+                    });
+                }
+
+                let mut edges = Vec::new();
+                let mut links = Vec::new();
+                for i in 0..nodes.len() {
+                    for j in 0..nodes.len() {
+                        if i != j {
+                            let src_phys = unique_phds
+                                .iter()
+                                .position(|&p| p == nodes[i].physical_device)
+                                .unwrap();
+                            let dst_phys = unique_phds
+                                .iter()
+                                .position(|&p| p == nodes[j].physical_device)
+                                .unwrap();
+                            let loopback = src_phys == dst_phys;
+                            let edge = cached
+                                .edges
+                                .iter()
+                                .find(|e| {
+                                    e.src_phys_idx == src_phys && e.dst_phys_idx == dst_phys
+                                })
+                                .unwrap();
+                            let tier = match edge.transport {
+                                1 => TransportTier::Tier1P2P {
+                                    bandwidth_gbps: edge.bandwidth_gbps,
+                                },
+                                #[cfg(target_os = "windows")]
+                                2 => TransportTier::Tier1_5HostMem {
+                                    bandwidth_gbps: edge.bandwidth_gbps,
+                                },
+                                _ => TransportTier::Tier2Staging {
+                                    bandwidth_gbps: edge.bandwidth_gbps,
+                                },
+                            };
+                            edges.push(TopoEdge { src: i, dst: j, tier });
+                            links.push(LinkInfo {
+                                src_rank: i as u32,
+                                dst_rank: j as u32,
+                                bandwidth_gbps: edge.bandwidth_gbps,
+                                transport: edge.transport,
+                                loopback: u32::from(loopback),
+                            });
+                        }
+                    }
+                }
+                return Ok((TopoGraph { edges, links }, profiles));
+            }
+        }
+    }
+
+    // Cache miss or bypass: measure profiles
+    let mut cached_devices = Vec::with_capacity(num_physical);
+    let mut phys_profiles = Vec::with_capacity(num_physical);
+    for (k, &idx) in unique_node_indices.iter().enumerate() {
+        let vram = query_vram_bytes(&nodes[idx]);
+        let gflops = measure_compute_gflops(&nodes[idx])?;
+        cached_devices.push(CachedDevice {
+            phys_idx: k,
+            vram_bytes: vram,
+            compute_gflops: gflops,
+        });
+        phys_profiles.push((vram, gflops));
+    }
+
+    let mut profiles = Vec::with_capacity(nodes.len());
+    for (r, node) in nodes.iter().enumerate() {
+        let phys_idx = unique_phds
+            .iter()
+            .position(|&p| p == node.physical_device)
+            .unwrap();
+        let (vram, gflops) = phys_profiles[phys_idx];
+        profiles.push(DeviceProfileC {
+            rank: r as u32,
+            vendor_id: node.props.vendor_id,
+            device_id: node.props.device_id,
+            device_type: map_device_type(node.props.device_type),
+            vram_bytes: vram,
+            compute_gflops: gflops,
+        });
+    }
+
     let force_tier_str = std::env::var("HC4J_COLLECTIVE_FORCE_TIER").ok();
     let force_tier = parse_force_tier(force_tier_str.as_deref())?;
 
     let mut edges = Vec::new();
     let mut links = Vec::new();
-
-    // Cache probe results by (src_physical_device, dst_physical_device)
-    let mut cache: HashMap<(vk::PhysicalDevice, vk::PhysicalDevice), (TransportTier, f64)> = HashMap::new();
+    let mut probe_cache: HashMap<(vk::PhysicalDevice, vk::PhysicalDevice), (TransportTier, f64)> =
+        HashMap::new();
 
     for i in 0..nodes.len() {
         for j in 0..nodes.len() {
@@ -526,7 +709,7 @@ pub(crate) fn build_topology(nodes: &[GpuNode]) -> Hc4jResult<TopoGraph> {
                 let pair_key = (nodes[i].physical_device, nodes[j].physical_device);
                 let loopback = nodes[i].physical_device == nodes[j].physical_device;
 
-                let (tier, final_bw) = if let Some(&cached) = cache.get(&pair_key) {
+                let (tier, final_bw) = if let Some(&cached) = probe_cache.get(&pair_key) {
                     cached
                 } else {
                     let (selected_tier, bw) = match force_tier {
@@ -626,7 +809,7 @@ pub(crate) fn build_topology(nodes: &[GpuNode]) -> Hc4jResult<TopoGraph> {
                         }
                     };
 
-                    cache.insert(pair_key, (selected_tier, bw));
+                    probe_cache.insert(pair_key, (selected_tier, bw));
                     (selected_tier, bw)
                 };
 
@@ -642,7 +825,24 @@ pub(crate) fn build_topology(nodes: &[GpuNode]) -> Hc4jResult<TopoGraph> {
         }
     }
 
-    Ok(TopoGraph { edges, links })
+    if !bypass {
+        let mut cached_edges = Vec::new();
+        for (&(src_phd, dst_phd), &(tier, bw)) in &probe_cache {
+            let src_phys = unique_phds.iter().position(|&p| p == src_phd).unwrap();
+            let dst_phys = unique_phds.iter().position(|&p| p == dst_phd).unwrap();
+            cached_edges.push(CachedEdge {
+                src_phys_idx: src_phys,
+                dst_phys_idx: dst_phys,
+                transport: tier.transport_code(),
+                bandwidth_gbps: bw,
+            });
+        }
+        let serialized = serialize_cache(&cached_devices, &cached_edges);
+        let _ = write_cache_atomic(&cache_path, &serialized);
+        eprintln!("[HC4J] collective topology: probed and cached");
+    }
+
+    Ok((TopoGraph { edges, links }, profiles))
 }
 
 #[cfg(test)]

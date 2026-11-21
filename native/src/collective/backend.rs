@@ -64,6 +64,24 @@ pub fn is_peer_class(gbps: f64) -> bool {
 }
 
 // ============================================================================
+// DeviceProfileC matching the exact 32-byte C-ABI DeviceProfile layout
+// ============================================================================
+
+/// Hardware profile of a single GPU rank (exact 32-byte C-ABI layout).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DeviceProfileC {
+    pub rank: u32,
+    pub vendor_id: u32,
+    pub device_id: u32,
+    pub device_type: u32, // 0=Other, 1=Integrated, 2=Discrete, 3=Virtual, 4=Cpu
+    pub vram_bytes: u64,
+    pub compute_gflops: f64,
+}
+
+pub type DeviceProfileInfo = DeviceProfileC;
+
+// ============================================================================
 // CollectiveBackend trait
 // ============================================================================
 
@@ -79,4 +97,9 @@ pub(crate) trait CollectiveBackend: Send + Sync {
     fn write(&self, buffer_id: u64, data: &[f32]) -> Hc4jResult<()>;
     fn read(&self, buffer_id: u64, out: &mut [f32]) -> Hc4jResult<()>;
     fn allreduce_sum(&self, buffers: &[u64]) -> Hc4jResult<()>;
+
+    // Step 3D: Profiling, Ring Order & Islands
+    fn device_profiles(&self) -> &[DeviceProfileC];
+    fn ring_order(&self) -> &[u32];
+    fn islands(&self) -> &[super::planner::IslandInfo];
 }

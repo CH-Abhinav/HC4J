@@ -1,6 +1,6 @@
 use crate::error::{self, Hc4jError};
 
-use super::backend::LinkInfo;
+use super::backend::{DeviceProfileC, LinkInfo};
 
 /// Opens a collective over `ranks` devices and writes its handle to `out`.
 ///
@@ -189,4 +189,141 @@ pub unsafe extern "C" fn hc4j_collective_allreduce_sum(handle: u64, ptr_buffers:
         let slice = unsafe { std::slice::from_raw_parts(ptr_buffers, count as usize) };
         super::with_backend(handle, |b| b.allreduce_sum(slice))
     })
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct IslandHeaderC {
+    pub id: u32,
+    pub leader_rank: u32,
+    pub internal_transport: u32,
+    pub member_count: u32,
+}
+
+/// Copies rank `rank`'s device profile into `out`.
+///
+/// # Safety
+/// `out` must point to writable memory for one [`DeviceProfileC`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn hc4j_collective_device_profile(
+    handle: u64,
+    rank: u32,
+    out: *mut DeviceProfileC,
+) -> i32 {
+    error::ffi_guard("hc4j_collective_device_profile", || {
+        if out.is_null() {
+            return Err(Hc4jError::InvalidParam("null out pointer"));
+        }
+        super::with_backend(handle, |b| {
+            let prof = b
+                .device_profiles()
+                .iter()
+                .find(|p| p.rank == rank)
+                .copied()
+                .ok_or(Hc4jError::InvalidParam("rank out of range"))?;
+            unsafe { out.write(prof) };
+            Ok(())
+        })
+    })
+}
+
+/// Writes planned ring order into `out_ranks` up to `cap` capacity.
+/// Returns the number of ranks written, or a negative status code.
+///
+/// # Safety
+/// `out_ranks` must point to writable memory for `cap` `u32` elements.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn hc4j_collective_ring_order(
+    handle: u64,
+    out_ranks: *mut u32,
+    cap: u32,
+) -> i32 {
+    let mut written = 0;
+    let status = error::ffi_guard("hc4j_collective_ring_order", || {
+        if out_ranks.is_null() && cap > 0 {
+            return Err(Hc4jError::InvalidParam("null out_ranks pointer"));
+        }
+        super::with_backend(handle, |b| {
+            let order = b.ring_order();
+            let count = (order.len() as u32).min(cap);
+            if count > 0 {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(order.as_ptr(), out_ranks, count as usize);
+                }
+            }
+            written = count as i32;
+            Ok(())
+        })
+    });
+    if status == error::HC4J_SUCCESS {
+        written
+    } else {
+        status
+    }
+}
+
+/// Number of detected islands, or a negative status code.
+#[unsafe(no_mangle)]
+pub extern "C" fn hc4j_collective_island_count(handle: u64) -> i32 {
+    let mut count = 0;
+    let status = error::ffi_guard("hc4j_collective_island_count", || {
+        super::with_backend(handle, |b| {
+            count = b.islands().len() as i32;
+            Ok(())
+        })
+    });
+    if status == error::HC4J_SUCCESS {
+        count
+    } else {
+        status
+    }
+}
+
+/// Writes island `index` header into `out_header` and member ranks into `out_ranks` up to `cap`.
+/// Returns the number of member ranks written, or a negative status code.
+///
+/// # Safety
+/// `out_header` must point to writable memory for one [`IslandHeaderC`].
+/// `out_ranks` must point to writable memory for `cap` `u32` elements.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn hc4j_collective_island(
+    handle: u64,
+    index: u32,
+    out_header: *mut IslandHeaderC,
+    out_ranks: *mut u32,
+    cap: u32,
+) -> i32 {
+    let mut written = 0;
+    let status = error::ffi_guard("hc4j_collective_island", || {
+        super::with_backend(handle, |b| {
+            let islands = b.islands();
+            let isl = islands
+                .get(index as usize)
+                .ok_or(Hc4jError::InvalidParam("island index out of range"))?;
+
+            if !out_header.is_null() {
+                let header = IslandHeaderC {
+                    id: isl.id,
+                    leader_rank: isl.leader_rank,
+                    internal_transport: isl.internal_transport,
+                    member_count: isl.members.len() as u32,
+                };
+                unsafe { out_header.write(header) };
+            }
+
+            let count = (isl.members.len() as u32).min(cap);
+            if !out_ranks.is_null() && count > 0 {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(isl.members.as_ptr(), out_ranks, count as usize);
+                }
+            }
+            written = count as i32;
+            Ok(())
+        })
+    });
+    if status == error::HC4J_SUCCESS {
+        written
+    } else {
+        status
+    }
 }

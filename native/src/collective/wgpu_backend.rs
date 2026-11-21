@@ -4,7 +4,8 @@ use std::time::Instant;
 
 use crate::error::{Hc4jError, Hc4jResult};
 
-use super::backend::{is_peer_class, CollectiveBackend, LinkInfo, Transport};
+use super::backend::{is_peer_class, CollectiveBackend, DeviceProfileC, LinkInfo, Transport};
+use super::planner::{detect_islands, solve_optimal_ring, IslandInfo};
 
 /// Elements each invocation of the reduction kernel handles.
 const WORKGROUP_SIZE: u32 = 256;
@@ -240,6 +241,9 @@ struct Buf {
 pub struct WgpuStagedBackend {
     nodes: Vec<Node>,
     links: OnceLock<Vec<LinkInfo>>,
+    profiles: Vec<DeviceProfileC>,
+    ring_order: OnceLock<Vec<u32>>,
+    islands: OnceLock<Vec<IslandInfo>>,
     buffers: Mutex<HashMap<u64, Buf>>,
     next_buffer: Mutex<u64>,
 }
@@ -314,16 +318,42 @@ impl WgpuStagedBackend {
                 physical.len()
             );
         }
+        let mut profiles = Vec::with_capacity(ranks);
         for node in &nodes {
             eprintln!(
                 "[HC4J] collective rank {}: {} | {:?} | {:?}",
                 node.rank, node.info.name, node.info.device_type, node.info.backend
             );
+            let dev_type = match node.info.device_type {
+                wgpu::DeviceType::IntegratedGpu => 1,
+                wgpu::DeviceType::DiscreteGpu => 2,
+                wgpu::DeviceType::VirtualGpu => 3,
+                wgpu::DeviceType::Cpu => 4,
+                _ => 0,
+            };
+            let vram_bytes = node.device.limits().max_storage_buffer_binding_size;
+            let compute_gflops = match dev_type {
+                2 => 1000.0,
+                1 => 100.0,
+                4 => 20.0,
+                _ => 50.0,
+            };
+            profiles.push(DeviceProfileC {
+                rank: node.rank as u32,
+                vendor_id: node.info.vendor,
+                device_id: node.info.device,
+                device_type: dev_type,
+                vram_bytes,
+                compute_gflops,
+            });
         }
 
         Ok(Self {
             nodes,
             links: OnceLock::new(),
+            profiles,
+            ring_order: OnceLock::new(),
+            islands: OnceLock::new(),
             buffers: Mutex::new(HashMap::new()),
             next_buffer: Mutex::new(1),
         })
@@ -521,6 +551,20 @@ impl CollectiveBackend for WgpuStagedBackend {
 
     fn allreduce_sum(&self, buffers: &[u64]) -> Hc4jResult<()> {
         self.all_reduce_sum(buffers)
+    }
+
+    fn device_profiles(&self) -> &[DeviceProfileC] {
+        &self.profiles
+    }
+
+    fn ring_order(&self) -> &[u32] {
+        self.ring_order
+            .get_or_init(|| solve_optimal_ring(self.ranks(), self.links()))
+    }
+
+    fn islands(&self) -> &[IslandInfo] {
+        self.islands
+            .get_or_init(|| detect_islands(self.ranks(), &self.profiles, self.links()))
     }
 }
 
