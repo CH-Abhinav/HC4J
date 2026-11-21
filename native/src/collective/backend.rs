@@ -24,6 +24,14 @@ impl Transport {
             Transport::HostSharedDma => TRANSPORT_HOST_SHARED_DMA,
         }
     }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Transport::HostStaged => "HOST_STAGED",
+            Transport::PeerToPeer => "PEER_TO_PEER",
+            Transport::HostSharedDma => "HOST_SHARED_DMA",
+        }
+    }
 }
 
 // ============================================================================

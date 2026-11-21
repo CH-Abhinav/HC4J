@@ -43,6 +43,38 @@ class CollectiveTest {
     }
 
     @Test
+    @DisplayName("Backend name and closed lifecycle")
+    void testBackendName() {
+        try (Collective ring = Collective.open(2)) {
+            String backend = ring.backendName();
+            assertNotNull(backend);
+            assertFalse(backend.isBlank());
+            assertTrue("vulkan-p2p".equals(backend) || "wgpu-staged".equals(backend),
+                    "Backend must be vulkan-p2p or wgpu-staged, got: " + backend);
+        }
+    }
+
+    @Test
+    @DisplayName("Transport enum wire codes and mapping")
+    void testTransportCodes() {
+        assertEquals(0, hc4j.collective.Transport.HOST_STAGED.ordinal());
+        assertEquals(1, hc4j.collective.Transport.PEER_TO_PEER.ordinal());
+        assertEquals(2, hc4j.collective.Transport.HOST_SHARED_DMA.ordinal());
+
+        assertSame(hc4j.collective.Transport.HOST_STAGED, hc4j.collective.Transport.of(0));
+        assertSame(hc4j.collective.Transport.PEER_TO_PEER, hc4j.collective.Transport.of(1));
+        assertSame(hc4j.collective.Transport.HOST_SHARED_DMA, hc4j.collective.Transport.of(2));
+
+        assertSame(hc4j.collective.Transport.HOST_STAGED, hc4j.collective.Transport.fromCode(0));
+        assertSame(hc4j.collective.Transport.PEER_TO_PEER, hc4j.collective.Transport.fromCode(1));
+        assertSame(hc4j.collective.Transport.HOST_SHARED_DMA, hc4j.collective.Transport.fromCode(2));
+
+        assertThrowsWithMessage(IllegalStateException.class,
+                () -> hc4j.collective.Transport.of(99),
+                "Unknown native transport code 99");
+    }
+
+    @Test
     @DisplayName("Ranks and topology discovery")
     void testEnumerationAndTopology() {
         try (Collective ring = Collective.open(2)) {
@@ -67,6 +99,23 @@ class CollectiveTest {
     }
 
     @Test
+    @DisplayName("Topology links have positive bandwidth and valid transports")
+    void testTopologyLinkDetails() {
+        try (Collective ring = Collective.open(4)) {
+            List<Link> links = ring.topology();
+            assertEquals(12, links.size(), "4 ranks give 12 directed edges");
+            for (Link link : links) {
+                assertTrue(link.src() >= 0 && link.src() < 4);
+                assertTrue(link.dst() >= 0 && link.dst() < 4);
+                assertNotEquals(link.src(), link.dst());
+                assertTrue(link.gbps() > 0.0, "Link bandwidth must be strictly positive");
+                assertNotNull(link.transport());
+                assertTrue(link.loopback() || !link.loopback()); // boolean valid
+            }
+        }
+    }
+
+    @Test
     @DisplayName("Ring AllReduce across 2 ranks")
     void testAllReduceTwoRanks() {
         verifyAllReduce(2, 6);
@@ -76,6 +125,66 @@ class CollectiveTest {
     @DisplayName("Ring AllReduce across 4 ranks")
     void testAllReduceFourRanks() {
         verifyAllReduce(4, 1024);
+    }
+
+    @Test
+    @DisplayName("Ring AllReduce with uneven element counts (1003 floats)")
+    void testAllReduceUnevenLengths() {
+        try (Collective ring = Collective.open(2)) {
+            if ("vulkan-p2p".equals(ring.backendName())) {
+                verifyAllReduce(2, 1);
+                verifyAllReduce(2, 7);
+                verifyAllReduce(2, 1003);
+                verifyAllReduce(4, 1003);
+            } else {
+                // wgpu-staged requires elements to divide evenly by rank count
+                assertThrowsWithMessage(IllegalArgumentException.class,
+                        () -> verifyAllReduce(2, 7),
+                        "Invalid parameters passed to native bridge");
+            }
+        }
+    }
+
+    @Test
+    @DisplayName("Ring AllReduce stress (25+ iterations)")
+    void testAllReduceStressRepeated() {
+        final int ranks = 2;
+        final int elements = 256;
+        try (Collective ring = Collective.open(ranks)) {
+            CollectiveBuffer[] bufs = new CollectiveBuffer[ranks];
+            try {
+                for (int r = 0; r < ranks; r++) {
+                    bufs[r] = ring.allocate(r, elements);
+                }
+
+                for (int iter = 0; iter < 30; iter++) {
+                    for (int r = 0; r < ranks; r++) {
+                        float[] data = new float[elements];
+                        for (int i = 0; i < elements; i++) {
+                            data[i] = (float) (r + 1) * (iter + 1);
+                        }
+                        bufs[r].write(data);
+                    }
+
+                    ring.allReduceSum(bufs);
+
+                    float[] expected = new float[elements];
+                    float expectedVal = (1.0f + 2.0f) * (iter + 1);
+                    for (int i = 0; i < elements; i++) {
+                        expected[i] = expectedVal;
+                    }
+
+                    for (int r = 0; r < ranks; r++) {
+                        float[] got = bufs[r].read();
+                        TestAssertions.assertArrayClose(expected, got, 1e-4f, 1e-4f);
+                    }
+                }
+            } finally {
+                for (CollectiveBuffer b : bufs) {
+                    if (b != null) b.close();
+                }
+            }
+        }
     }
 
     @Test

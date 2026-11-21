@@ -33,6 +33,10 @@ hs_err_pid*
 # The wrapper jar MUST be committed:
 !gradle/wrapper/gradle-wrapper.jar
 
+# --- Local Tools & Mesa Lavapipe ---
+tools/
+/tools/
+
 # --- Audit & Local Docs ---
 HC4J_AUDIT.md
 

@@ -23,6 +23,7 @@ use stream::CommandStream;
 // ============================================================================
 
 pub use adapter::{hc4j_adapter_info, pick_adapter, AdapterInfoC};
+pub use collective::*;
 pub use memory::{
     hc4j_gpu_alloc, hc4j_gpu_alloc_uninit, hc4j_gpu_download, hc4j_gpu_free, hc4j_gpu_write, hc4j_mem_configure,
     hc4j_mem_evict, hc4j_mem_residency, hc4j_mem_stats,

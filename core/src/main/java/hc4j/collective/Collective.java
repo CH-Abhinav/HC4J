@@ -123,6 +123,23 @@ public final class Collective implements AutoCloseable {
         }
     }
 
+    /**
+     * Returns the name of the active collective communication backend
+     * ("vulkan-p2p" or "wgpu-staged").
+     *
+     * @return the backend name
+     * @throws IllegalStateException if the collective has been closed
+     */
+    public String backendName() {
+        ensureOpen();
+        try (Arena arena = Arena.ofConfined()) {
+            MemorySegment buf = arena.allocate(NAME_CAPACITY);
+            int len = NativeEngine.collectiveBackendName(handle, buf, NAME_CAPACITY);
+            byte[] bytes = buf.asSlice(0, len).toArray(ValueLayout.JAVA_BYTE);
+            return new String(bytes, StandardCharsets.UTF_8);
+        }
+    }
+
     public List<Link> topology() {
         ensureOpen();
         if (topology != null) {

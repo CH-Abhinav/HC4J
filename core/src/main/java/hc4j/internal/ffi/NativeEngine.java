@@ -76,6 +76,7 @@ public final class NativeEngine {
     private static MethodHandle collLinkCountHandle;
     private static MethodHandle collLinkHandle;
     private static MethodHandle collDeviceNameHandle;
+    private static MethodHandle collBackendNameHandle;
     private static MethodHandle collAllocHandle;
     private static MethodHandle collFreeHandle;
     private static MethodHandle collWriteHandle;
@@ -214,6 +215,9 @@ public final class NativeEngine {
 
         collDeviceNameHandle = linker.downcallHandle(lookup.find("hc4j_collective_device_name").orElseThrow(),
                 FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.JAVA_LONG, ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.JAVA_INT));
+
+        collBackendNameHandle = linker.downcallHandle(lookup.find("hc4j_collective_backend_name").orElseThrow(),
+                FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.JAVA_LONG, ValueLayout.ADDRESS, ValueLayout.JAVA_INT));
 
         collAllocHandle = linker.downcallHandle(lookup.find("hc4j_collective_alloc").orElseThrow(),
                 FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.JAVA_LONG, ValueLayout.JAVA_INT, ValueLayout.JAVA_LONG, ValueLayout.ADDRESS));
@@ -528,6 +532,18 @@ public final class NativeEngine {
         } catch (Throwable t) {
             if (t instanceof RuntimeException re) throw re;
             throw new RuntimeException("HC4J collective device name query failed", t);
+        }
+    }
+
+    public static int collectiveBackendName(long handle, MemorySegment buf, int cap) {
+        ensureInitialized();
+        try {
+            int len = (int) collBackendNameHandle.invokeExact(handle, buf, cap);
+            if (len < 0) checkStatus(len, "Collective.backendName");
+            return len;
+        } catch (Throwable t) {
+            if (t instanceof RuntimeException re) throw re;
+            throw new RuntimeException("HC4J collective backend name query failed", t);
         }
     }
 

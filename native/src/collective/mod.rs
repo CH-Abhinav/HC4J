@@ -1,3 +1,6 @@
+#[cfg(all(feature = "vulkan-p2p", any(target_os = "windows", target_os = "linux")))]
+pub mod vulkan;
+
 pub mod abi;
 pub mod backend;
 pub mod wgpu_backend;
@@ -5,6 +8,9 @@ pub mod wgpu_backend;
 pub use abi::*;
 pub use backend::*;
 pub use wgpu_backend::*;
+
+#[cfg(all(feature = "vulkan-p2p", any(target_os = "windows", target_os = "linux")))]
+pub(crate) use vulkan::VulkanP2pBackend;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -48,13 +54,47 @@ pub(crate) fn create_backend(ranks: u32) -> Hc4jResult<Arc<dyn CollectiveBackend
     let backend_var = std::env::var("HC4J_COLLECTIVE_BACKEND")
         .map(|v| v.to_ascii_lowercase())
         .unwrap_or_else(|_| "auto".to_string());
+    let force_tier_active = std::env::var("HC4J_COLLECTIVE_FORCE_TIER")
+        .map(|v| {
+            let t = v.trim().to_ascii_lowercase();
+            !t.is_empty() && t != "auto"
+        })
+        .unwrap_or(false);
+
     match backend_var.as_str() {
-        "auto" | "wgpu" | "" => {
+        "auto" | "" => {
+            #[cfg(all(feature = "vulkan-p2p", any(target_os = "windows", target_os = "linux")))]
+            {
+                match VulkanP2pBackend::new(ranks) {
+                    Ok(backend) => return Ok(Arc::new(backend)),
+                    Err(e) => {
+                        if force_tier_active {
+                            return Err(e);
+                        }
+                        eprintln!("[HC4J] vulkan-p2p backend unavailable ({e}); falling back to wgpu-staged");
+                    }
+                }
+            }
             let backend = WgpuStagedBackend::create(ranks as usize)?;
-            crate::hc4j_trace!("created collective backend: {}", backend.backend_name());
+            eprintln!("[HC4J] collective backend: {}", backend.backend_name());
             Ok(Arc::new(backend))
         }
-        "vulkan" => Err(Hc4jError::Unsupported("vulkan-p2p backend not yet enabled")),
+        "vulkan" => {
+            #[cfg(all(feature = "vulkan-p2p", any(target_os = "windows", target_os = "linux")))]
+            {
+                let backend = VulkanP2pBackend::new(ranks)?;
+                Ok(Arc::new(backend))
+            }
+            #[cfg(not(all(feature = "vulkan-p2p", any(target_os = "windows", target_os = "linux"))))]
+            {
+                Err(Hc4jError::Unsupported("vulkan-p2p collective backend is not supported on this platform"))
+            }
+        }
+        "wgpu" => {
+            let backend = WgpuStagedBackend::create(ranks as usize)?;
+            eprintln!("[HC4J] collective backend: {}", backend.backend_name());
+            Ok(Arc::new(backend))
+        }
         other => {
             eprintln!("[HC4J] unknown collective backend '{other}'");
             Err(Hc4jError::InvalidParam("unknown collective backend"))

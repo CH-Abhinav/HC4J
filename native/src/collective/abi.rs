@@ -96,6 +96,30 @@ pub unsafe extern "C" fn hc4j_collective_device_name(handle: u64, rank: u32, buf
     if status == error::HC4J_SUCCESS { len } else { status }
 }
 
+/// Writes the collective backend's name ("vulkan-p2p" or "wgpu-staged") into `buf` as UTF-8,
+/// truncating to `cap`. Returns the number of bytes written, or a negative status code.
+///
+/// # Safety
+/// `buf` must point to `cap` writable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn hc4j_collective_backend_name(handle: u64, buf: *mut u8, cap: u32) -> i32 {
+    let mut len = 0;
+    let status = error::ffi_guard("hc4j_collective_backend_name", || {
+        super::with_backend(handle, |b| {
+            let name = b.backend_name();
+            if buf.is_null() || cap == 0 {
+                return Err(Hc4jError::InvalidParam("null or empty name buffer"));
+            }
+            let bytes = name.as_bytes();
+            let n = bytes.len().min(cap as usize);
+            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf, n) };
+            len = n as i32;
+            Ok(())
+        })
+    });
+    if status == error::HC4J_SUCCESS { len } else { status }
+}
+
 /// Allocates `elements` f32 on `rank`, writing the buffer handle to `out`.
 ///
 /// # Safety
@@ -114,53 +138,55 @@ pub unsafe extern "C" fn hc4j_collective_alloc(handle: u64, rank: u32, elements:
     })
 }
 
-/// Frees a collective buffer.
+/// Releases a collective buffer.
 #[unsafe(no_mangle)]
-pub extern "C" fn hc4j_collective_free(handle: u64, buffer: u64) -> i32 {
-    error::ffi_guard("hc4j_collective_free", || super::with_backend(handle, |b| b.free(buffer)))
+pub extern "C" fn hc4j_collective_free(handle: u64, buffer_id: u64) -> i32 {
+    error::ffi_guard("hc4j_collective_free", || {
+        super::with_backend(handle, |b| b.free(buffer_id))
+    })
 }
 
-/// Uploads `len` f32 from `data` into the whole buffer.
+/// Writes `data` into `buffer_id`.
 ///
 /// # Safety
-/// `data` must point to `len` readable f32 values.
+/// `ptr` must point to `elements` readable `f32`.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn hc4j_collective_write(handle: u64, buffer: u64, data: *const f32, len: u64) -> i32 {
+pub unsafe extern "C" fn hc4j_collective_write(handle: u64, buffer_id: u64, ptr: *const f32, elements: u64) -> i32 {
     error::ffi_guard("hc4j_collective_write", || {
-        if data.is_null() {
+        if ptr.is_null() && elements > 0 {
             return Err(Hc4jError::InvalidParam("null data pointer"));
         }
-        let slice = unsafe { std::slice::from_raw_parts(data, len as usize) };
-        super::with_backend(handle, |b| b.write(buffer, slice))
+        let slice = unsafe { std::slice::from_raw_parts(ptr, elements as usize) };
+        super::with_backend(handle, |b| b.write(buffer_id, slice))
     })
 }
 
-/// Reads the whole buffer into `out`.
+/// Reads `buffer_id` into `out`.
 ///
 /// # Safety
-/// `out` must point to `len` writable f32 values.
+/// `out` must point to `elements` writable `f32`.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn hc4j_collective_read(handle: u64, buffer: u64, out: *mut f32, len: u64) -> i32 {
+pub unsafe extern "C" fn hc4j_collective_read(handle: u64, buffer_id: u64, out: *mut f32, elements: u64) -> i32 {
     error::ffi_guard("hc4j_collective_read", || {
-        if out.is_null() {
+        if out.is_null() && elements > 0 {
             return Err(Hc4jError::InvalidParam("null out pointer"));
         }
-        let slice = unsafe { std::slice::from_raw_parts_mut(out, len as usize) };
-        super::with_backend(handle, |b| b.read(buffer, slice))
+        let slice = unsafe { std::slice::from_raw_parts_mut(out, elements as usize) };
+        super::with_backend(handle, |b| b.read(buffer_id, slice))
     })
 }
 
-/// Ring AllReduce (sum) in place over one buffer per rank.
+/// Reduces `buffers` in place by element-wise sum across the ring.
 ///
 /// # Safety
-/// `buffers` must point to `n` readable `u64` handles.
+/// `ptr_buffers` must point to `count` readable `u64` buffer IDs.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn hc4j_collective_allreduce_sum(handle: u64, buffers: *const u64, n: u32) -> i32 {
+pub unsafe extern "C" fn hc4j_collective_allreduce_sum(handle: u64, ptr_buffers: *const u64, count: u32) -> i32 {
     error::ffi_guard("hc4j_collective_allreduce_sum", || {
-        if buffers.is_null() {
-            return Err(Hc4jError::InvalidParam("null buffer list"));
+        if ptr_buffers.is_null() && count > 0 {
+            return Err(Hc4jError::InvalidParam("null buffers pointer"));
         }
-        let ids = unsafe { std::slice::from_raw_parts(buffers, n as usize) };
-        super::with_backend(handle, |b| b.allreduce_sum(ids))
+        let slice = unsafe { std::slice::from_raw_parts(ptr_buffers, count as usize) };
+        super::with_backend(handle, |b| b.allreduce_sum(slice))
     })
 }

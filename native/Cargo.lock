@@ -300,11 +300,14 @@ dependencies = [
 name = "hc4j"
 version = "0.1.0"
 dependencies = [
+ "ash",
  "bytemuck",
+ "libc",
  "naga",
  "pollster",
  "rayon",
  "wgpu",
+ "windows-sys",
 ]
 
 [[package]]

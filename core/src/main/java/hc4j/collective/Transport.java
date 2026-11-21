@@ -30,7 +30,13 @@ public enum Transport {
     /**
      * True peer-to-peer device memory transfer.
      */
-    PEER_TO_PEER;
+    PEER_TO_PEER,
+
+    /**
+     * Unified host-shared DMA: pinned host memory mapped into both GPUs' address spaces
+     * with zero CPU memcpy.
+     */
+    HOST_SHARED_DMA;
 
     public static Transport of(int code) {
         Transport[] values = values();
@@ -38,5 +44,9 @@ public enum Transport {
             throw new IllegalStateException("Unknown native transport code " + code);
         }
         return values[code];
+    }
+
+    public static Transport fromCode(int code) {
+        return of(code);
     }
 }
