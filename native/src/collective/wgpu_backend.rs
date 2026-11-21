@@ -1,49 +1,10 @@
-//! Multi-device collective communication: topology discovery and Ring
-//! AllReduce across every GPU on the node.
-//!
-//! # Shape
-//!
-//! A [`Collective`] owns one [`Node`] per rank, each with its own `wgpu::Device`
-//! and queue. When the machine exposes fewer adapters than ranks, the extra
-//! ranks open additional logical devices on an adapter already in use —
-//! **loopback mode** — so the ring, the transport and the reduction are
-//! exercised end to end on a single-GPU box. Loopback measures intra-GPU
-//! bandwidth, not PCIe, and the topology report says so.
-//!
-//! Ranks are deliberately independent of the process-wide [`crate::GpuEngine`]:
-//! a collective owns its devices and its buffers outright. That keeps the
-//! single-device engine (and every op built on it) untouched, at the cost of
-//! needing [`Collective::write`] / [`Collective::read`] to move data in and
-//! out. A zero-copy bridge for rank 0 is a separate piece of work.
-//!
-//! # Transport
-//!
-//! Every hop is **host-staged**: the source rank copies its chunk into a
-//! persistent `MAP_READ` buffer, the host reads it, and the destination rank
-//! uploads it. wgpu exposes no external-memory export/import, so true
-//! peer-to-peer (`dma_buf` on Linux, an `OPAQUE_WIN32` handle on Windows)
-//! cannot be expressed here — reaching it needs raw Vulkan through
-//! `wgpu-hal`, which is why [`Transport`] already carries the distinction the
-//! Java side reports. Staging buffers are allocated once per AllReduce, not
-//! once per hop.
-//!
-//! # Algorithm
-//!
-//! Textbook ring AllReduce over `n` ranks and `n` chunks: `n - 1` rounds of
-//! scatter-reduce, in which rank `i` sends chunk `(i - round) mod n` to
-//! `i + 1`, which adds it into its own copy; then `n - 1` rounds of allgather
-//! circulating the finished chunks. Each rank moves `2(n-1)/n` of the buffer
-//! instead of the `n-1` copies a naive all-to-all would.
-//!
-//! Hops are synchronous: a transfer completes before its reduction is
-//! recorded. The ring is therefore correct but not overlapped; pipelining the
-//! rounds is the obvious next optimisation.
-
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
 use crate::error::{Hc4jError, Hc4jResult};
+
+use super::backend::{is_peer_class, CollectiveBackend, LinkInfo, Transport};
 
 /// Elements each invocation of the reduction kernel handles.
 const WORKGROUP_SIZE: u32 = 256;
@@ -52,48 +13,6 @@ const WORKGROUP_SIZE: u32 = 256;
 const PROBE_BYTES: u64 = 16 << 20;
 /// Averaging iterations in the probe.
 const PROBE_ITERATIONS: u32 = 8;
-/// Above this, a link is reported as fast enough to treat as peer-class.
-/// Host-staged hops on consumer hardware land far below it.
-const PEER_CLASS_GBPS: f64 = 8.0;
-
-// ============================================================================
-// Transport classification
-// ============================================================================
-
-/// How a directed rank-to-rank hop moves its bytes.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum Transport {
-    /// Pinned host staging. What the wgpu backend always uses.
-    HostStaged,
-    /// A true device-to-device path (exported OS memory handle). Reserved for
-    /// a raw-Vulkan transport; the wgpu backend never reports it.
-    PeerToPeer,
-}
-
-impl Transport {
-    /// Code shared with `hc4j.collective.Transport`.
-    pub fn code(self) -> u32 {
-        match self {
-            Transport::HostStaged => 0,
-            Transport::PeerToPeer => 1,
-        }
-    }
-}
-
-/// One directed edge of the topology graph.
-#[repr(C)]
-#[derive(Copy, Clone, Debug)]
-pub struct Link {
-    pub src: u32,
-    pub dst: u32,
-    /// Measured throughput of the hop, in GB/s.
-    pub gbps: f64,
-    /// [`Transport::code`].
-    pub transport: u32,
-    /// 1 when both ranks sit on the same physical adapter (loopback), so the
-    /// figure is an intra-GPU copy rather than a link between two devices.
-    pub loopback: u32,
-}
 
 // ============================================================================
 // A rank
@@ -308,18 +227,8 @@ impl Node {
 }
 
 // ============================================================================
-// Collective
+// WgpuStagedBackend (safe wgpu host-staged collective)
 // ============================================================================
-
-/// A ring of ranks, with its topology measured on demand.
-pub struct Collective {
-    nodes: Vec<Node>,
-    /// Probed on first request, not at creation: the measurement moves
-    /// hundreds of MiB per rank pair, and AllReduce does not depend on it.
-    links: OnceLock<Vec<Link>>,
-    buffers: Mutex<HashMap<u64, Buf>>,
-    next_buffer: Mutex<u64>,
-}
 
 struct Buf {
     rank: usize,
@@ -327,7 +236,17 @@ struct Buf {
     elements: u64,
 }
 
-impl Collective {
+/// Safe wgpu host-staged collective backend.
+pub struct WgpuStagedBackend {
+    nodes: Vec<Node>,
+    links: OnceLock<Vec<LinkInfo>>,
+    buffers: Mutex<HashMap<u64, Buf>>,
+    next_buffer: Mutex<u64>,
+}
+
+pub type Collective = WgpuStagedBackend;
+
+impl WgpuStagedBackend {
     /// Opens `ranks` devices, spreading them over the available adapters and
     /// reusing adapters (loopback) when there are fewer adapters than ranks.
     pub fn create(ranks: usize) -> Hc4jResult<Self> {
@@ -349,14 +268,7 @@ impl Collective {
             return Err("no GPU adapter available for a collective".to_string());
         }
 
-        // One physical GPU is enumerated once per backend, so with DX12 and
-        // Vulkan both enabled the same card shows up twice. Spreading a ring
-        // across those would not be two devices — it would be one device
-        // addressed two ways, with the hop measuring a cross-backend host
-        // round trip. Deduplicate by physical identity and keep the
-        // best-ranked backend for each.
         let mut physical: Vec<usize> = Vec::new();
-        // (sorted and filtered below)
         for (i, adapter) in all.iter().enumerate() {
             let info = adapter.get_info();
             let same = physical.iter().position(|&j| {
@@ -374,10 +286,6 @@ impl Collective {
             }
         }
 
-        // Drop software adapters. Windows enumerates "Microsoft Basic Render
-        // Driver" (WARP) alongside the real GPU, and spreading a ring onto a
-        // CPU rasterizer would measure a hop into software — the probe showed
-        // 0.01 GB/s. Keep them only if there is nothing else at all.
         let real: Vec<usize> = physical
             .iter()
             .copied()
@@ -389,15 +297,11 @@ impl Collective {
             physical = real;
         }
 
-        // Best device first, so a 2-rank ring on a mixed machine takes the
-        // discrete GPU before the integrated one.
         physical.sort_by_key(|&i| {
             let info = all[i].get_info();
             std::cmp::Reverse((crate::device_rank(info.device_type), crate::backend_rank(info.backend)))
         });
 
-        // Prefer distinct physical devices; once they run out, open extra
-        // logical devices on the ones already in use (loopback).
         let mut nodes = Vec::with_capacity(ranks);
         for rank in 0..ranks {
             let slot = rank % physical.len();
@@ -429,10 +333,7 @@ impl Collective {
         self.nodes.len()
     }
 
-    /// The topology graph, probing every directed rank pair on first call.
-    /// A failed probe yields an empty graph rather than failing the
-    /// collective: the bandwidth figures are diagnostic.
-    pub fn links(&self) -> &[Link] {
+    pub fn links(&self) -> &[LinkInfo] {
         self.links.get_or_init(|| {
             probe_topology(&self.nodes).unwrap_or_else(|e| {
                 eprintln!("[HC4J] collective topology probe failed: {e}");
@@ -448,7 +349,6 @@ impl Collective {
             .ok_or(Hc4jError::InvalidParam("rank out of range"))
     }
 
-    /// Allocates `elements` f32 on `rank` and returns its handle.
     pub fn alloc(&self, rank: usize, elements: u64) -> Hc4jResult<u64> {
         let node = self.nodes.get(rank).ok_or(Hc4jError::InvalidParam("rank out of range"))?;
         if elements == 0 {
@@ -481,7 +381,6 @@ impl Collective {
         f(buf, node)
     }
 
-    /// Uploads `data` into the whole of buffer `id`.
     pub fn write(&self, id: u64, data: &[f32]) -> Hc4jResult<()> {
         self.with_buf(id, |buf, node| {
             if data.len() as u64 != buf.elements {
@@ -491,7 +390,6 @@ impl Collective {
         })
     }
 
-    /// Reads the whole of buffer `id` back to the host.
     pub fn read(&self, id: u64, out: &mut [f32]) -> Hc4jResult<()> {
         self.with_buf(id, |buf, node| {
             if out.len() as u64 != buf.elements {
@@ -503,10 +401,6 @@ impl Collective {
         })
     }
 
-    /// Ring AllReduce (sum) over one buffer per rank, in place.
-    ///
-    /// `ids[r]` must live on rank `r`, all buffers must hold the same number of
-    /// elements, and that count must be divisible by the rank count.
     pub fn all_reduce_sum(&self, ids: &[u64]) -> Hc4jResult<()> {
         let n = self.nodes.len();
         if ids.len() != n {
@@ -532,8 +426,6 @@ impl Collective {
         let chunk = total / n as u64;
         let chunk_bytes = chunk * 4;
 
-        // Per-rank scratch, allocated once for the whole operation: a receive
-        // buffer, a mappable staging buffer, and a host hop buffer.
         let recv: Vec<wgpu::Buffer> = self
             .nodes
             .iter()
@@ -542,8 +434,7 @@ impl Collective {
         let staging: Vec<wgpu::Buffer> = self.nodes.iter().map(|node| node.readback(chunk_bytes)).collect();
         let mut hop = vec![0u8; chunk_bytes as usize];
 
-        // Scatter-reduce: after n-1 rounds, rank r holds the finished sum of
-        // chunk (r + 1) mod n.
+        // Scatter-reduce
         for round in 0..n - 1 {
             for i in 0..n {
                 let next = (i + 1) % n;
@@ -553,7 +444,7 @@ impl Collective {
             }
         }
 
-        // Allgather: circulate the finished chunks without reducing.
+        // Allgather
         for round in 0..n - 1 {
             for i in 0..n {
                 let next = (i + 1) % n;
@@ -572,8 +463,6 @@ impl Collective {
         Ok(())
     }
 
-    /// One host-staged hop: rank `src`'s chunk at `offset` into rank `dst`'s
-    /// receive buffer.
     #[allow(clippy::too_many_arguments)]
     fn hop(
         &self,
@@ -597,12 +486,49 @@ impl Collective {
     }
 }
 
+impl CollectiveBackend for WgpuStagedBackend {
+    fn backend_name(&self) -> &'static str {
+        "wgpu-staged"
+    }
+
+    fn ranks(&self) -> usize {
+        self.ranks()
+    }
+
+    fn device_name(&self, rank: usize) -> Hc4jResult<String> {
+        self.device_name(rank).map(|s| s.to_string())
+    }
+
+    fn links(&self) -> &[LinkInfo] {
+        self.links()
+    }
+
+    fn alloc(&self, rank: usize, elements: u64) -> Hc4jResult<u64> {
+        self.alloc(rank, elements)
+    }
+
+    fn free(&self, buffer_id: u64) -> Hc4jResult<()> {
+        self.free(buffer_id)
+    }
+
+    fn write(&self, buffer_id: u64, data: &[f32]) -> Hc4jResult<()> {
+        self.write(buffer_id, data)
+    }
+
+    fn read(&self, buffer_id: u64, out: &mut [f32]) -> Hc4jResult<()> {
+        self.read(buffer_id, out)
+    }
+
+    fn allreduce_sum(&self, buffers: &[u64]) -> Hc4jResult<()> {
+        self.all_reduce_sum(buffers)
+    }
+}
+
 // ============================================================================
 // Topology probe
 // ============================================================================
 
-/// Times a host-staged hop between every ordered pair of ranks.
-fn probe_topology(nodes: &[Node]) -> Result<Vec<Link>, String> {
+fn probe_topology(nodes: &[Node]) -> Result<Vec<LinkInfo>, String> {
     let elements = PROBE_BYTES / 4;
     let mut links = Vec::new();
 
@@ -621,7 +547,6 @@ fn probe_topology(nodes: &[Node]) -> Result<Vec<Link>, String> {
                 nodes[dst].upload(&recv, 0, hop)
             };
 
-            // Warm-up, then measure.
             run(&mut hop).map_err(|e| format!("topology probe {src}->{dst} failed: {e}"))?;
             let t0 = Instant::now();
             for _ in 0..PROBE_ITERATIONS {
@@ -636,13 +561,10 @@ fn probe_topology(nodes: &[Node]) -> Result<Vec<Link>, String> {
                 if is_peer_class(gbps) { "at" } else { "below" },
                 if loopback { " (loopback, same adapter)" } else { "" }
             );
-            links.push(Link {
-                src: src as u32,
-                dst: dst as u32,
-                gbps,
-                // Honest: this backend has no device-to-device path. The
-                // threshold is reported so a caller can see how far a staged
-                // hop is from peer-class bandwidth.
+            links.push(LinkInfo {
+                src_rank: src as u32,
+                dst_rank: dst as u32,
+                bandwidth_gbps: gbps,
                 transport: Transport::HostStaged.code(),
                 loopback: u32::from(loopback),
             });
@@ -651,213 +573,14 @@ fn probe_topology(nodes: &[Node]) -> Result<Vec<Link>, String> {
     Ok(links)
 }
 
-/// Whether a measured hop reaches peer-class bandwidth.
-pub fn is_peer_class(gbps: f64) -> bool {
-    gbps >= PEER_CLASS_GBPS
-}
-
-// ============================================================================
-// Registry + C ABI
-// ============================================================================
-
-static CONTEXTS: OnceLock<Mutex<HashMap<u64, Collective>>> = OnceLock::new();
-static NEXT_CONTEXT: Mutex<u64> = Mutex::new(1);
-
-fn contexts() -> &'static Mutex<HashMap<u64, Collective>> {
-    CONTEXTS.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-fn with_context<R>(handle: u64, f: impl FnOnce(&Collective) -> Hc4jResult<R>) -> Hc4jResult<R> {
-    let guard = contexts().lock().unwrap_or_else(|p| p.into_inner());
-    let coll = guard.get(&handle).ok_or(Hc4jError::NotFound)?;
-    f(coll)
-}
-
-/// Opens a collective over `ranks` devices and writes its handle to `out`.
-///
-/// # Safety
-/// `out` must point to one writable `u64`.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn hc4j_collective_create(ranks: u32, out: *mut u64) -> i32 {
-    crate::error::ffi_guard("hc4j_collective_create", || {
-        if out.is_null() {
-            return Err(Hc4jError::InvalidParam("null out pointer"));
-        }
-        let coll = Collective::create(ranks as usize)?;
-        let mut ids = NEXT_CONTEXT.lock().unwrap_or_else(|p| p.into_inner());
-        let handle = *ids;
-        *ids += 1;
-        contexts().lock().unwrap_or_else(|p| p.into_inner()).insert(handle, coll);
-        unsafe { out.write(handle) };
-        Ok(())
-    })
-}
-
-/// Releases a collective and every buffer it owns.
-#[unsafe(no_mangle)]
-pub extern "C" fn hc4j_collective_destroy(handle: u64) -> i32 {
-    crate::error::ffi_guard("hc4j_collective_destroy", || {
-        contexts()
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .remove(&handle)
-            .map(|_| ())
-            .ok_or(Hc4jError::NotFound)
-    })
-}
-
-/// Number of ranks, or a negative status code.
-#[unsafe(no_mangle)]
-pub extern "C" fn hc4j_collective_ranks(handle: u64) -> i32 {
-    let mut ranks = 0;
-    let status = crate::error::ffi_guard("hc4j_collective_ranks", || {
-        with_context(handle, |c| {
-            ranks = c.ranks() as i32;
-            Ok(())
-        })
-    });
-    if status == crate::error::HC4J_SUCCESS { ranks } else { status }
-}
-
-/// Number of directed links in the topology, or a negative status code.
-#[unsafe(no_mangle)]
-pub extern "C" fn hc4j_collective_link_count(handle: u64) -> i32 {
-    let mut count = 0;
-    let status = crate::error::ffi_guard("hc4j_collective_link_count", || {
-        with_context(handle, |c| {
-            count = c.links().len() as i32;
-            Ok(())
-        })
-    });
-    if status == crate::error::HC4J_SUCCESS { count } else { status }
-}
-
-/// Copies link `index` into `out`.
-///
-/// # Safety
-/// `out` must point to writable memory for one [`Link`].
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn hc4j_collective_link(handle: u64, index: u32, out: *mut Link) -> i32 {
-    crate::error::ffi_guard("hc4j_collective_link", || {
-        if out.is_null() {
-            return Err(Hc4jError::InvalidParam("null out pointer"));
-        }
-        with_context(handle, |c| {
-            let link = *c
-                .links()
-                .get(index as usize)
-                .ok_or(Hc4jError::InvalidParam("link index out of range"))?;
-            unsafe { out.write(link) };
-            Ok(())
-        })
-    })
-}
-
-/// Writes rank `rank`'s adapter name into `buf` as UTF-8, truncating to `cap`.
-/// Returns the number of bytes written, or a negative status code.
-///
-/// # Safety
-/// `buf` must point to `cap` writable bytes.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn hc4j_collective_device_name(handle: u64, rank: u32, buf: *mut u8, cap: u32) -> i32 {
-    let mut len = 0;
-    let status = crate::error::ffi_guard("hc4j_collective_device_name", || {
-        with_context(handle, |c| {
-            let name = c.device_name(rank as usize)?;
-            if buf.is_null() || cap == 0 {
-                return Err(Hc4jError::InvalidParam("null or empty name buffer"));
-            }
-            let bytes = name.as_bytes();
-            let n = bytes.len().min(cap as usize);
-            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf, n) };
-            len = n as i32;
-            Ok(())
-        })
-    });
-    if status == crate::error::HC4J_SUCCESS { len } else { status }
-}
-
-/// Allocates `elements` f32 on `rank`, writing the buffer handle to `out`.
-///
-/// # Safety
-/// `out` must point to one writable `u64`.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn hc4j_collective_alloc(handle: u64, rank: u32, elements: u64, out: *mut u64) -> i32 {
-    crate::error::ffi_guard("hc4j_collective_alloc", || {
-        if out.is_null() {
-            return Err(Hc4jError::InvalidParam("null out pointer"));
-        }
-        with_context(handle, |c| {
-            let id = c.alloc(rank as usize, elements)?;
-            unsafe { out.write(id) };
-            Ok(())
-        })
-    })
-}
-
-/// Frees a collective buffer.
-#[unsafe(no_mangle)]
-pub extern "C" fn hc4j_collective_free(handle: u64, buffer: u64) -> i32 {
-    crate::error::ffi_guard("hc4j_collective_free", || with_context(handle, |c| c.free(buffer)))
-}
-
-/// Uploads `len` f32 from `data` into the whole buffer.
-///
-/// # Safety
-/// `data` must point to `len` readable f32 values.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn hc4j_collective_write(handle: u64, buffer: u64, data: *const f32, len: u64) -> i32 {
-    crate::error::ffi_guard("hc4j_collective_write", || {
-        if data.is_null() {
-            return Err(Hc4jError::InvalidParam("null data pointer"));
-        }
-        let slice = unsafe { std::slice::from_raw_parts(data, len as usize) };
-        with_context(handle, |c| c.write(buffer, slice))
-    })
-}
-
-/// Reads the whole buffer into `out`.
-///
-/// # Safety
-/// `out` must point to `len` writable f32 values.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn hc4j_collective_read(handle: u64, buffer: u64, out: *mut f32, len: u64) -> i32 {
-    crate::error::ffi_guard("hc4j_collective_read", || {
-        if out.is_null() {
-            return Err(Hc4jError::InvalidParam("null out pointer"));
-        }
-        let slice = unsafe { std::slice::from_raw_parts_mut(out, len as usize) };
-        with_context(handle, |c| c.read(buffer, slice))
-    })
-}
-
-/// Ring AllReduce (sum) in place over one buffer per rank.
-///
-/// # Safety
-/// `buffers` must point to `n` readable `u64` handles.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn hc4j_collective_allreduce_sum(handle: u64, buffers: *const u64, n: u32) -> i32 {
-    crate::error::ffi_guard("hc4j_collective_allreduce_sum", || {
-        if buffers.is_null() {
-            return Err(Hc4jError::InvalidParam("null buffer list"));
-        }
-        let ids = unsafe { std::slice::from_raw_parts(buffers, n as usize) };
-        with_context(handle, |c| c.all_reduce_sum(ids))
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-
-    /// Only skip when the machine has no GPU at all; a real failure must fail.
     fn gpu_available() -> bool {
         crate::get_engine().is_ok()
     }
 
-    /// Rank `r` contributes `r * n + i + 1`, so the expected sum per element
-    /// is known in closed form — the same shape as the reference PoC.
     fn ramp(rank: usize, elements: usize) -> Vec<f32> {
         (0..elements).map(|i| (rank * elements + i + 1) as f32).collect()
     }
@@ -903,8 +626,6 @@ mod tests {
         if !gpu_available() {
             return;
         }
-        // Six elements over two ranks: one scatter-reduce round and one
-        // allgather round, three elements per chunk.
         run_allreduce(2, 6);
     }
 
@@ -913,8 +634,6 @@ mod tests {
         if !gpu_available() {
             return;
         }
-        // Four ranks means three rounds each way, and 4096 elements per rank
-        // puts several workgroups behind every reduction.
         run_allreduce(4, 4096);
     }
 
@@ -928,7 +647,6 @@ mod tests {
         let b = coll.alloc(1, 8).expect("alloc");
         let odd = coll.alloc(1, 4).expect("alloc");
 
-        // Element count must divide by the rank count.
         let seven_a = coll.alloc(0, 7).expect("alloc");
         let seven_b = coll.alloc(1, 7).expect("alloc");
         assert!(matches!(
@@ -936,12 +654,9 @@ mod tests {
             Err(Hc4jError::InvalidParam(_))
         ));
 
-        // Every rank must contribute the same length.
         assert!(matches!(coll.all_reduce_sum(&[a, odd]), Err(Hc4jError::InvalidParam(_))));
-        // One buffer per rank, in rank order.
         assert!(matches!(coll.all_reduce_sum(&[a]), Err(Hc4jError::InvalidParam(_))));
         assert!(matches!(coll.all_reduce_sum(&[b, a]), Err(Hc4jError::InvalidParam(_))));
-        // Unknown handles are reported, not ignored.
         assert!(matches!(coll.all_reduce_sum(&[a, 99_999]), Err(Hc4jError::NotFound)));
     }
 
@@ -954,17 +669,16 @@ mod tests {
         let links = coll.links();
         assert_eq!(links.len(), 2, "two ranks have two directed edges");
         for link in links {
-            assert_ne!(link.src, link.dst);
-            assert!(link.gbps > 0.0, "a measured hop should report throughput");
+            assert_ne!(link.src_rank, link.dst_rank);
+            assert!(link.bandwidth_gbps > 0.0, "a measured hop should report throughput");
             assert_eq!(link.transport, Transport::HostStaged.code());
         }
-        // On a single-adapter machine both ranks share it, which the report
-        // has to admit so the number is not read as a PCIe measurement.
         let names: Vec<&str> = (0..2).map(|r| coll.device_name(r).expect("name")).collect();
         if names[0] == names[1] {
             assert!(links.iter().all(|l| l.loopback == 1));
         }
     }
+
     #[test]
     fn a_collective_needs_at_least_two_ranks() {
         assert!(matches!(Collective::create(0), Err(Hc4jError::InvalidParam(_))));
@@ -979,33 +693,20 @@ mod tests {
 
     #[test]
     fn peer_class_threshold_rejects_staged_bandwidth() {
-        // A host-staged hop on consumer hardware does not reach PCIe P2P
-        // speeds; the threshold exists so the report can say by how much.
         assert!(!is_peer_class(3.9));
         assert!(is_peer_class(25.0));
     }
 
     #[test]
     fn the_add_kernel_binds_both_operands_read_write() {
-        // Slab-style sharing and in-place accumulation both need it, and wgpu
-        // rejects a buffer bound read-only and read-write in one dispatch.
         assert_eq!(ADD_WGSL.matches("storage, read_write").count(), 2);
         assert!(!ADD_WGSL.contains("storage, read>"));
     }
 
-    /// The ring index arithmetic, checked without a GPU.
-    ///
-    /// Scatter-reduce gives each rank exactly one incoming add per chunk, for
-    /// every chunk but its own — a chunk accumulates across ranks as it
-    /// travels, rather than piling up on one of them. The chunk a rank
-    /// receives in the *last* round is the one that has now seen every rank's
-    /// contribution, and that is the chunk the allgather starts from.
     #[test]
     fn ring_schedule_reduces_each_chunk_exactly_once() {
         for n in 2..=8usize {
-            // adds[r][c]: how many times rank r added into chunk c.
             let mut adds = vec![vec![0u32; n]; n];
-            // last[r]: the chunk rank r received in the final round.
             let mut last = vec![usize::MAX; n];
             for round in 0..n - 1 {
                 for i in 0..n {
@@ -1025,8 +726,6 @@ mod tests {
                     }
                 }
             }
-            // The fully reduced chunk on rank r is r + 1, which is where the
-            // allgather model below begins.
             for (r, &chunk) in last.iter().enumerate() {
                 assert_eq!(chunk, (r + 1) % n, "n={n}: rank {r} should finish chunk {}", (r + 1) % n);
             }
@@ -1037,7 +736,6 @@ mod tests {
     fn ring_allgather_visits_every_rank_and_chunk() {
         for n in 2..=8usize {
             let mut seen = vec![vec![false; n]; n];
-            // Each rank starts holding its own reduced chunk.
             for (i, row) in seen.iter_mut().enumerate() {
                 row[(i + 1) % n] = true;
             }

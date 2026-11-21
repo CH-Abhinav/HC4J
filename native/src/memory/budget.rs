@@ -60,6 +60,7 @@ impl Budget {
         }
     }
 
+    #[allow(clippy::incompatible_msrv)]
     fn release(&self, bytes: u64) {
         // Saturating so a bookkeeping bug can never wrap `used` to ~u64::MAX
         // and wedge every future allocation.
