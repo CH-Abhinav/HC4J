@@ -12,6 +12,15 @@ dependencies {
     testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
 }
 
+def hostOsName = System.getProperty("os.name").toLowerCase()
+def hostArchName = System.getProperty("os.arch").toLowerCase()
+
+def hostOs = hostOsName.contains("win") ? "windows" : (hostOsName.contains("mac") || hostOsName.contains("darwin") ? "macos" : "linux")
+def hostArch = (hostArchName == "aarch64" || hostArchName == "arm64") ? "aarch64" : "x86_64"
+def currentClassifier = "${hostOs}-${hostArch}"
+def libName = hostOs == "windows" ? "hc4j.dll" : (hostOs == "macos" ? "libhc4j.dylib" : "libhc4j.so")
+def nativeReleaseBinary = file("${rootDir}/native/target/release/${libName}")
+
 def skipRust = project.hasProperty('skipRustBuild') && project.property('skipRustBuild') == 'true'
 
 tasks.register('buildRust', Exec) {
@@ -28,9 +37,92 @@ tasks.register('buildRust', Exec) {
     }
 }
 
+// Version properties generation
+def versionPropsDir = layout.buildDirectory.dir("generated/resources/version")
+def generateVersionProperties = tasks.register('generateVersionProperties') {
+    def outFile = versionPropsDir.map { it.file("META-INF/hc4j/version.properties") }
+    outputs.file(outFile)
+    doLast {
+        def f = outFile.get().asFile
+        f.parentFile.mkdirs()
+        f.text = "version=${project.version}\n"
+    }
+}
+
+sourceSets.main.resources.srcDir(versionPropsDir)
+tasks.named('processResources') {
+    dependsOn generateVersionProperties
+}
+
+tasks.named('jar') {
+    manifest {
+        attributes(
+            'Implementation-Title': 'HC4J Core',
+            'Implementation-Version': project.version
+        )
+    }
+}
+
+// Stage native library for packaging
+def stagedNativesDir = layout.buildDirectory.dir("staged-natives")
+def stageNativeLib = tasks.register('stageNativeLib') {
+    description = 'Stages the compiled native library into META-INF/hc4j/natives/<classifier>/ and writes its SHA-256'
+    group = 'build'
+    if (!skipRust) {
+        dependsOn 'buildRust'
+    }
+    inputs.file(nativeReleaseBinary).optional()
+    outputs.dir(stagedNativesDir)
+
+    doLast {
+        if (!nativeReleaseBinary.exists()) {
+            throw new GradleException("Native release binary not found at " + nativeReleaseBinary.absolutePath + ". Run buildRust first or provide native binary.")
+        }
+        def targetDir = stagedNativesDir.get().dir("META-INF/hc4j/natives/${currentClassifier}").asFile
+        targetDir.mkdirs()
+        def targetFile = new File(targetDir, libName)
+        java.nio.file.Files.copy(nativeReleaseBinary.toPath(), targetFile.toPath(), java.nio.file.StandardCopyOption.REPLACE_EXISTING)
+
+        def digest = java.security.MessageDigest.getInstance("SHA-256")
+        def bytes = targetFile.bytes
+        def hashBytes = digest.digest(bytes)
+        def sha256Hex = hashBytes.collect { String.format("%02x", it) }.join("")
+        new File(targetDir, "${libName}.sha256").text = sha256Hex + "\n"
+    }
+}
+
+tasks.register('nativeJar', Jar) {
+    description = 'Packages platform-specific classifier JAR containing only the staged native binary and checksum.'
+    group = 'build'
+    dependsOn stageNativeLib
+    archiveBaseName = 'hc4j'
+    archiveClassifier = currentClassifier
+    from(stagedNativesDir)
+}
+
+tasks.register('bundleAllJar', Jar) {
+    description = 'Packages all-in-one fat bundle containing compiled classes, resources, and native binaries.'
+    group = 'build'
+    dependsOn stageNativeLib
+    archiveBaseName = 'hc4j'
+    archiveClassifier = 'all'
+
+    from sourceSets.main.output
+    def nativesDir = project.hasProperty('nativesBundleDir') ? file(project.property('nativesBundleDir')) : stagedNativesDir
+    from(nativesDir)
+
+    manifest {
+        attributes(
+            'Implementation-Title': 'HC4J All-in-One Fat Bundle',
+            'Implementation-Version': project.version
+        )
+    }
+}
+
 tasks.named('test') {
     if (!skipRust) {
         dependsOn 'buildRust'
+        inputs.file(nativeReleaseBinary).optional()
     }
     useJUnitPlatform()
     modularity.inferModulePath = false

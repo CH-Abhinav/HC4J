@@ -184,8 +184,7 @@ class EngineOpsTest {
     @DisplayName("Matmul validation errors")
     void testMatmulValidation() {
         try (Tensor a = Tensor.empty(DType.f32, 2, 3);
-             Tensor b = Tensor.empty(DType.f32, 4, 5);
-             Tensor res = Tensor.empty(DType.f32, 2, 5)) {
+             Tensor b = Tensor.empty(DType.f32, 4, 5)) {
             assertThrowsWithMessage(IllegalArgumentException.class,
                     () -> Linalg.matmul(a, b),
                     "Matmul shape mismatch: left shape [2, 3] and right shape [4, 5] are incompatible because 3 != 4");
@@ -246,7 +245,7 @@ class EngineOpsTest {
         int n = 256;
         float[] data = TestArrayFactory.ramp(n, -1f, 1f);
         try (Tensor a = Tensor.fromArray(data, n)) {
-            try (GpuBatch batch = Engine.openBatch()) {
+            try (GpuBatch _ = Engine.openBatch()) {
                 for (int i = 0; i < 10; i++) {
                     a.sin(a);
                 }

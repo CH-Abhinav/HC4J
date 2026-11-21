@@ -120,7 +120,7 @@ public class NnBenchmark {
      */
     @Benchmark
     public void geluChainUnfused() {
-        try (Tensor g = x.gelu(); Tensor s = g.add(x); Tensor r = s.mul(x)) {
+        try (Tensor g = x.gelu(); Tensor s = g.add(x); Tensor _ = s.mul(x)) {
             Engine.synchronize();
         }
     }
@@ -128,7 +128,7 @@ public class NnBenchmark {
     /** The same expression as one fused kernel. */
     @Benchmark
     public void geluChainFused() {
-        try (Tensor r = x.lazy().gelu().add(x).mul(x).eval()) {
+        try (Tensor _ = x.lazy().gelu().add(x).mul(x).eval()) {
             Engine.synchronize();
         }
     }
@@ -177,7 +177,7 @@ public class NnBenchmark {
     /** gelu(x . W + b): a GEMM, a bias pass and an activation, one submission. */
     @Benchmark
     public void feedForwardLayer() {
-        try (GpuBatch ignored = GpuBatch.open()) {
+        try (GpuBatch _ = GpuBatch.open()) {
             x.linear(weights, bias, hidden);
             hidden.gelu(hidden);
         }

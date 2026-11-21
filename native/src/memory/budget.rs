@@ -63,7 +63,7 @@ impl Budget {
     fn release(&self, bytes: u64) {
         // Saturating so a bookkeeping bug can never wrap `used` to ~u64::MAX
         // and wedge every future allocation.
-        let _ = self.used.fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+        let _ = self.used.try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
             Some(used.saturating_sub(bytes))
         });
     }

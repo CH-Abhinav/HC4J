@@ -512,6 +512,71 @@ pub unsafe extern "C" fn hc4j_engine_stats(out: *mut EngineStats) -> i32 {
     })
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct AdapterInfoC {
+    pub vendor_id: u32,
+    pub device_id: u32,
+    pub device_type: u32,
+    pub backend: u32,
+    pub name_len: u32,
+    pub driver_len: u32,
+    pub driver_info_len: u32,
+    pub name: [u8; 256],
+    pub driver: [u8; 128],
+    pub driver_info: [u8; 256],
+}
+
+fn copy_to_fixed<const N: usize>(src: &str, dst: &mut [u8; N]) -> u32 {
+    let bytes = src.as_bytes();
+    let len = bytes.len().min(N);
+    dst[..len].copy_from_slice(&bytes[..len]);
+    len as u32
+}
+
+/// # Safety
+/// `out` must be non-null and point to writable memory for one `AdapterInfoC`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn hc4j_adapter_info(out: *mut AdapterInfoC) -> i32 {
+    error::ffi_guard("hc4j_adapter_info", || {
+        if out.is_null() {
+            return Err(Hc4jError::InvalidParam("null adapter info pointer"));
+        }
+        let engine = get_engine()?;
+        let info = &engine.adapter_info;
+        let mut c_info = AdapterInfoC {
+            vendor_id: info.vendor,
+            device_id: info.device,
+            device_type: match info.device_type {
+                wgpu::DeviceType::Other => 0,
+                wgpu::DeviceType::IntegratedGpu => 1,
+                wgpu::DeviceType::DiscreteGpu => 2,
+                wgpu::DeviceType::VirtualGpu => 3,
+                wgpu::DeviceType::Cpu => 4,
+            },
+            backend: match info.backend {
+                wgpu::Backend::Vulkan => 1,
+                wgpu::Backend::Metal => 2,
+                wgpu::Backend::Dx12 => 3,
+                wgpu::Backend::Gl => 4,
+                wgpu::Backend::BrowserWebGpu => 5,
+                _ => 0,
+            },
+            name_len: 0,
+            driver_len: 0,
+            driver_info_len: 0,
+            name: [0u8; 256],
+            driver: [0u8; 128],
+            driver_info: [0u8; 256],
+        };
+        c_info.name_len = copy_to_fixed(&info.name, &mut c_info.name);
+        c_info.driver_len = copy_to_fixed(&info.driver, &mut c_info.driver);
+        c_info.driver_info_len = copy_to_fixed(&info.driver_info, &mut c_info.driver_info);
+        unsafe { out.write_unaligned(c_info) };
+        Ok(())
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::pick_adapter;

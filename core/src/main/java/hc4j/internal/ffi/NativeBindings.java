@@ -22,14 +22,41 @@ import static java.lang.foreign.ValueLayout.JAVA_LONG;
 
 import java.lang.foreign.FunctionDescriptor;
 import java.lang.foreign.Linker;
+import java.lang.foreign.MemoryLayout;
 import java.lang.foreign.MemorySegment;
+import java.lang.foreign.StructLayout;
 import java.lang.foreign.SymbolLookup;
+import java.lang.foreign.ValueLayout;
 import java.lang.invoke.MethodHandle;
 
 /**
  * Lazy-initialized registry of Panama FFM downcall MethodHandles for all GPU kernels.
  */
 public final class NativeBindings {
+
+    public static final StructLayout ADAPTER_INFO_LAYOUT = MemoryLayout.structLayout(
+            JAVA_INT.withName("vendorId"),
+            JAVA_INT.withName("deviceId"),
+            JAVA_INT.withName("deviceType"),
+            JAVA_INT.withName("backend"),
+            JAVA_INT.withName("nameLen"),
+            JAVA_INT.withName("driverLen"),
+            JAVA_INT.withName("driverInfoLen"),
+            MemoryLayout.sequenceLayout(256, ValueLayout.JAVA_BYTE).withName("name"),
+            MemoryLayout.sequenceLayout(128, ValueLayout.JAVA_BYTE).withName("driver"),
+            MemoryLayout.sequenceLayout(256, ValueLayout.JAVA_BYTE).withName("driverInfo")
+    );
+
+    public static final long ADAPTER_INFO_VENDOR_ID_OFFSET = ADAPTER_INFO_LAYOUT.byteOffset(MemoryLayout.PathElement.groupElement("vendorId"));
+    public static final long ADAPTER_INFO_DEVICE_ID_OFFSET = ADAPTER_INFO_LAYOUT.byteOffset(MemoryLayout.PathElement.groupElement("deviceId"));
+    public static final long ADAPTER_INFO_DEVICE_TYPE_OFFSET = ADAPTER_INFO_LAYOUT.byteOffset(MemoryLayout.PathElement.groupElement("deviceType"));
+    public static final long ADAPTER_INFO_BACKEND_OFFSET = ADAPTER_INFO_LAYOUT.byteOffset(MemoryLayout.PathElement.groupElement("backend"));
+    public static final long ADAPTER_INFO_NAME_LEN_OFFSET = ADAPTER_INFO_LAYOUT.byteOffset(MemoryLayout.PathElement.groupElement("nameLen"));
+    public static final long ADAPTER_INFO_DRIVER_LEN_OFFSET = ADAPTER_INFO_LAYOUT.byteOffset(MemoryLayout.PathElement.groupElement("driverLen"));
+    public static final long ADAPTER_INFO_DRIVER_INFO_LEN_OFFSET = ADAPTER_INFO_LAYOUT.byteOffset(MemoryLayout.PathElement.groupElement("driverInfoLen"));
+    public static final long ADAPTER_INFO_NAME_OFFSET = ADAPTER_INFO_LAYOUT.byteOffset(MemoryLayout.PathElement.groupElement("name"));
+    public static final long ADAPTER_INFO_DRIVER_OFFSET = ADAPTER_INFO_LAYOUT.byteOffset(MemoryLayout.PathElement.groupElement("driver"));
+    public static final long ADAPTER_INFO_DRIVER_INFO_OFFSET = ADAPTER_INFO_LAYOUT.byteOffset(MemoryLayout.PathElement.groupElement("driverInfo"));
 
     private static final class Holder {
         static final Linker LINKER = Linker.nativeLinker();
@@ -120,6 +147,7 @@ public final class NativeBindings {
         static final MethodHandle FUSED_DISPATCH = bind("hc4j_fused_dispatch",
                 FunctionDescriptor.of(JAVA_INT, ADDRESS, JAVA_INT, ADDRESS, JAVA_INT, JAVA_LONG));
 
+        @SuppressWarnings("restricted")
         private static MethodHandle bind(String name, FunctionDescriptor desc) {
             MemorySegment addr = SYMBOLS.find(name).orElseThrow(() -> new UnsatisfiedLinkError(
                     "HC4J native symbol '" + name + "' not found; the native library may be outdated."));

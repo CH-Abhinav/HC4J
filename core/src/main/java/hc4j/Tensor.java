@@ -82,7 +82,7 @@ public class Tensor implements AutoCloseable {
 
         @Override
         public void run() {
-            if (closed.compareAndSet(false, true)) {
+            if (closed.compareAndSet(false, true) && vramId != 0L) {
                 try {
                     NativeEngine.freeVram(vramId);
                 } catch (Throwable ignored) {

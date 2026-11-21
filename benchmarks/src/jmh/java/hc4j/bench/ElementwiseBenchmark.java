@@ -89,7 +89,7 @@ public class ElementwiseBenchmark {
     /** sin(a) + b) * c as three kernels and two intermediate tensors. */
     @Benchmark
     public void chainUnfused() {
-        try (Tensor s = a.sin(); Tensor t = s.add(b); Tensor r = t.mul(c)) {
+        try (Tensor s = a.sin(); Tensor t = s.add(b); Tensor _ = t.mul(c)) {
             Engine.synchronize();
         }
     }
@@ -97,7 +97,7 @@ public class ElementwiseBenchmark {
     /** The same expression as one fused kernel and no intermediates. */
     @Benchmark
     public void chainFused() {
-        try (Tensor r = a.lazy().sin().add(b).mul(c).eval()) {
+        try (Tensor _ = a.lazy().sin().add(b).mul(c).eval()) {
             Engine.synchronize();
         }
     }
@@ -114,7 +114,7 @@ public class ElementwiseBenchmark {
     /** The same 64 ops in a single command buffer. */
     @Benchmark
     public void manyOpsBatched() {
-        try (GpuBatch batch = GpuBatch.open()) {
+        try (GpuBatch _ = GpuBatch.open()) {
             for (int i = 0; i < 64; i++) {
                 out.sin(out);
             }

@@ -45,7 +45,7 @@ class TensorLifecycleTest {
     @Test
     @DisplayName("getShape returns a defensive copy")
     void testGetShapeDefensiveCopy() {
-        Tensor t = TensorAccess.getInstance().create(DType.f32, new int[] {2, 3}, new int[] {3, 1}, 1L);
+        Tensor t = TensorAccess.getInstance().create(DType.f32, new int[] {2, 3}, new int[] {3, 1}, 0L);
         int[] s1 = t.getShape();
         int[] s2 = t.getShape();
         assertNotSame(s1, s2);
@@ -58,7 +58,7 @@ class TensorLifecycleTest {
     @Test
     @DisplayName("Idempotent double close and use-after-free guards on unbacked Tensor")
     void testTensorCloseAndUseAfterFree() {
-        Tensor t = TensorAccess.getInstance().create(DType.f32, new int[] {2, 3}, new int[] {3, 1}, 1L);
+        Tensor t = TensorAccess.getInstance().create(DType.f32, new int[] {2, 3}, new int[] {3, 1}, 0L);
         assertFalse(t.isClosed());
 
         t.close();
@@ -69,7 +69,7 @@ class TensorLifecycleTest {
         assertTrue(t.isClosed());
 
         // Calling operations on closed tensor throws IllegalStateException
-        Tensor dummy = TensorAccess.getInstance().create(DType.f32, new int[] {2, 3}, new int[] {3, 1}, 2L);
+        Tensor dummy = TensorAccess.getInstance().create(DType.f32, new int[] {2, 3}, new int[] {3, 1}, 0L);
 
         assertThrowsWithMessage(IllegalStateException.class, () -> t.add(dummy), "Tensor has already been closed");
         assertThrowsWithMessage(IllegalStateException.class, () -> t.sub(dummy), "Tensor has already been closed");
@@ -107,7 +107,8 @@ class TensorLifecycleTest {
     void testCollectiveLifecycle() {
         GpuTestSupport.assumeGpuAvailable();
 
-        try (Collective ring = Collective.open(2)) {
+        Collective ring = Collective.open(2);
+        try {
             CollectiveBuffer buf = ring.allocate(0, 10);
             assertFalse(buf.isClosed());
 
@@ -130,6 +131,10 @@ class TensorLifecycleTest {
 
             // Buffer operations throw
             assertThrowsWithMessage(IllegalStateException.class, () -> buf.write(new float[10]), "CollectiveBuffer has already been closed");
+        } finally {
+            if (!ring.isClosed()) {
+                ring.close();
+            }
         }
     }
 }

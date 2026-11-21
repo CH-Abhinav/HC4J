@@ -65,4 +65,14 @@ public final class Engine {
     public static GpuBatch openBatch() {
         return GpuBatch.open();
     }
+
+    /** Returns information about the active GPU adapter and driver. */
+    public static AdapterInfo adapterInfo() {
+        return NativeEngine.adapterInfo();
+    }
+
+    /** Returns the canonical platform identifier string (e.g. "windows-x86_64"). */
+    public static String nativePlatform() {
+        return NativeEngine.platform().classifier();
+    }
 }

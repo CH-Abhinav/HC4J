@@ -31,8 +31,8 @@ class FusedExprTest {
     @Test
     @DisplayName("FusedExpr construction and chaining without GPU dispatch")
     void testExpressionTreeConstruction() {
-        Tensor dummyA = TensorAccess.getInstance().create(DType.f32, new int[] {4, 4}, new int[] {4, 1}, 1L);
-        Tensor dummyB = TensorAccess.getInstance().create(DType.f32, new int[] {4, 4}, new int[] {4, 1}, 2L);
+        Tensor dummyA = TensorAccess.getInstance().create(DType.f32, new int[] {4, 4}, new int[] {4, 1}, 0L);
+        Tensor dummyB = TensorAccess.getInstance().create(DType.f32, new int[] {4, 4}, new int[] {4, 1}, 0L);
 
         FusedExpr expr = dummyA.lazy()
                 .sin()
@@ -47,8 +47,8 @@ class FusedExprTest {
     @Test
     @DisplayName("FusedExpr detects shape mismatches on binary nodes")
     void testShapeMismatch() {
-        Tensor a = TensorAccess.getInstance().create(DType.f32, new int[] {2, 3}, new int[] {3, 1}, 1L);
-        Tensor b = TensorAccess.getInstance().create(DType.f32, new int[] {2, 4}, new int[] {4, 1}, 2L);
+        Tensor a = TensorAccess.getInstance().create(DType.f32, new int[] {2, 3}, new int[] {3, 1}, 0L);
+        Tensor b = TensorAccess.getInstance().create(DType.f32, new int[] {2, 4}, new int[] {4, 1}, 0L);
 
         assertThrowsWithMessage(IllegalArgumentException.class,
                 () -> a.lazy().add(b),
@@ -58,7 +58,7 @@ class FusedExprTest {
     @Test
     @DisplayName("FusedExpr rejects non-finite scalar constants")
     void testNonFiniteConstants() {
-        Tensor a = TensorAccess.getInstance().create(DType.f32, new int[] {2, 2}, new int[] {2, 1}, 1L);
+        Tensor a = TensorAccess.getInstance().create(DType.f32, new int[] {2, 2}, new int[] {2, 1}, 0L);
 
         assertThrowsWithMessage(IllegalArgumentException.class,
                 () -> a.lazy().add(Float.NaN),
@@ -72,7 +72,7 @@ class FusedExprTest {
     @Test
     @DisplayName("FusedExpr rejects non-f32 tensors")
     void testNonF32Rejection() {
-        Tensor i32Tensor = TensorAccess.getInstance().create(DType.i32, new int[] {2, 2}, new int[] {2, 1}, 1L);
+        Tensor i32Tensor = TensorAccess.getInstance().create(DType.i32, new int[] {2, 2}, new int[] {2, 1}, 0L);
         assertThrowsWithMessage(IllegalArgumentException.class,
                 i32Tensor::lazy,
                 "fusion is only defined for f32 tensors, got i32");
@@ -89,7 +89,7 @@ class FusedExprTest {
              Tensor r = a.lazy().sin().add(b).eval()) {
             float[] got = r.toFloatArray();
             for (int i = 0; i < data.length; i++) {
-                TestAssertions.assertClose((float) Math.sin(data[i]) + data[i], got[i]);
+                TestAssertions.assertClose((float) Math.sin(data[i]) + data[i], got[i], 1e-4f, 1e-4f);
             }
         }
     }

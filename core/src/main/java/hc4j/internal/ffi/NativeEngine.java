@@ -16,6 +16,7 @@
 
 package hc4j.internal.ffi;
 
+import hc4j.engine.AdapterInfo;
 import hc4j.engine.EngineStats;
 import hc4j.engine.GpuOutOfMemoryException;
 import hc4j.engine.MemoryStats;
@@ -27,6 +28,7 @@ import java.lang.foreign.MemorySegment;
 import java.lang.foreign.SymbolLookup;
 import java.lang.foreign.ValueLayout;
 import java.lang.invoke.MethodHandle;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
@@ -49,6 +51,7 @@ public final class NativeEngine {
 
     private static volatile boolean initialized = false;
     private static volatile Throwable initFailure = null;
+    private static volatile NativeLoadResult loadResult = null;
 
     private static MethodHandle initGpuHandle;
     private static MethodHandle gpuAllocHandle;
@@ -64,6 +67,7 @@ public final class NativeEngine {
     private static MethodHandle batchEndHandle;
     private static MethodHandle engineStatsHandle;
     private static MethodHandle synchronizeHandle;
+    private static MethodHandle adapterInfoHandle;
 
     // Collective handles
     private static MethodHandle collCreateHandle;
@@ -97,7 +101,22 @@ public final class NativeEngine {
 
     public static SymbolLookup nativeSymbols() {
         ensureInitialized();
-        return SymbolLookup.loaderLookup();
+        return loadResult.lookup();
+    }
+
+    public static Path loadedLibraryPath() {
+        ensureInitialized();
+        return loadResult.libraryPath();
+    }
+
+    public static String loadSource() {
+        ensureInitialized();
+        return loadResult.source();
+    }
+
+    public static Platform platform() {
+        ensureInitialized();
+        return loadResult.platform();
     }
 
     public static synchronized void ensureInitialized() {
@@ -124,54 +143,13 @@ public final class NativeEngine {
     }
 
     private static void loadLibrary() {
-        String os = System.getProperty("os.name").toLowerCase();
-        String extension = os.contains("win") ? ".dll" : (os.contains("mac") ? ".dylib" : ".so");
-        String libName = (os.contains("mac") || os.contains("linux"))
-                ? "libhc4j" + extension
-                : "hc4j" + extension;
-
-        Path libPath = findNativeLibrary(libName);
-        System.load(libPath.toString());
+        loadResult = NativeLoader.load();
     }
 
-    private static Path findNativeLibrary(String libName) {
-        String customPath = System.getProperty("hc4j.native.path");
-        if (customPath != null && !customPath.isBlank()) {
-            Path p = Paths.get(customPath).toAbsolutePath();
-            if (Files.isDirectory(p)) {
-                Path candidate = p.resolve(libName);
-                if (Files.exists(candidate)) {
-                    return candidate;
-                }
-            } else if (Files.exists(p)) {
-                return p;
-            }
-        }
-
-        Path current = Paths.get("").toAbsolutePath();
-        while (current != null) {
-            Path releasePath = current.resolve(Paths.get("native", "target", "release", libName));
-            if (Files.exists(releasePath)) {
-                return releasePath;
-            }
-            Path debugPath = current.resolve(Paths.get("native", "target", "debug", libName));
-            if (Files.exists(debugPath)) {
-                return debugPath;
-            }
-            Path rootPath = current.resolve(libName);
-            if (Files.exists(rootPath)) {
-                return rootPath;
-            }
-            current = current.getParent();
-        }
-
-        throw new UnsatisfiedLinkError("Could not find " + libName
-                + " anywhere in the project tree. Did you run 'cargo build --release' in the native folder?");
-    }
-
+    @SuppressWarnings("restricted")
     private static void bindCoreHandles() {
         Linker linker = Linker.nativeLinker();
-        SymbolLookup lookup = SymbolLookup.loaderLookup();
+        SymbolLookup lookup = loadResult.lookup();
 
         initGpuHandle = linker.downcallHandle(lookup.find("hc4j_init_gpu").orElseThrow(),
                 FunctionDescriptor.of(ValueLayout.JAVA_INT));
@@ -214,6 +192,9 @@ public final class NativeEngine {
 
         synchronizeHandle = linker.downcallHandle(lookup.find("hc4j_synchronize").orElseThrow(),
                 FunctionDescriptor.of(ValueLayout.JAVA_INT));
+
+        adapterInfoHandle = linker.downcallHandle(lookup.find("hc4j_adapter_info").orElseThrow(),
+                FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS));
 
         // Collective handles
         collCreateHandle = linker.downcallHandle(lookup.find("hc4j_collective_create").orElseThrow(),
@@ -411,6 +392,59 @@ public final class NativeEngine {
             }
             checkStatus(status, "engineStats");
             return EngineStats.read(out);
+        }
+    }
+
+    public static AdapterInfo adapterInfo() {
+        ensureInitialized();
+        try (Arena arena = Arena.ofConfined()) {
+            MemorySegment seg = arena.allocate(NativeBindings.ADAPTER_INFO_LAYOUT);
+            int status;
+            try {
+                status = (int) adapterInfoHandle.invokeExact(seg);
+            } catch (Throwable t) {
+                throw new RuntimeException("HC4J adapter info query failed", t);
+            }
+            checkStatus(status, "adapterInfo");
+
+            int vendorId = seg.get(ValueLayout.JAVA_INT, NativeBindings.ADAPTER_INFO_VENDOR_ID_OFFSET);
+            int deviceId = seg.get(ValueLayout.JAVA_INT, NativeBindings.ADAPTER_INFO_DEVICE_ID_OFFSET);
+            int deviceTypeCode = seg.get(ValueLayout.JAVA_INT, NativeBindings.ADAPTER_INFO_DEVICE_TYPE_OFFSET);
+            int backendCode = seg.get(ValueLayout.JAVA_INT, NativeBindings.ADAPTER_INFO_BACKEND_OFFSET);
+            int nameLen = seg.get(ValueLayout.JAVA_INT, NativeBindings.ADAPTER_INFO_NAME_LEN_OFFSET);
+            int driverLen = seg.get(ValueLayout.JAVA_INT, NativeBindings.ADAPTER_INFO_DRIVER_LEN_OFFSET);
+            int driverInfoLen = seg.get(ValueLayout.JAVA_INT, NativeBindings.ADAPTER_INFO_DRIVER_INFO_LEN_OFFSET);
+
+            byte[] nameBytes = new byte[nameLen];
+            MemorySegment.copy(seg, ValueLayout.JAVA_BYTE, NativeBindings.ADAPTER_INFO_NAME_OFFSET, nameBytes, 0, nameLen);
+            String name = new String(nameBytes, StandardCharsets.UTF_8);
+
+            byte[] driverBytes = new byte[driverLen];
+            MemorySegment.copy(seg, ValueLayout.JAVA_BYTE, NativeBindings.ADAPTER_INFO_DRIVER_OFFSET, driverBytes, 0, driverLen);
+            String driver = new String(driverBytes, StandardCharsets.UTF_8);
+
+            byte[] driverInfoBytes = new byte[driverInfoLen];
+            MemorySegment.copy(seg, ValueLayout.JAVA_BYTE, NativeBindings.ADAPTER_INFO_DRIVER_INFO_OFFSET, driverInfoBytes, 0, driverInfoLen);
+            String driverInfo = new String(driverInfoBytes, StandardCharsets.UTF_8);
+
+            String deviceType = switch (deviceTypeCode) {
+                case 1 -> "IntegratedGpu";
+                case 2 -> "DiscreteGpu";
+                case 3 -> "VirtualGpu";
+                case 4 -> "Cpu";
+                default -> "Other";
+            };
+
+            String backend = switch (backendCode) {
+                case 1 -> "Vulkan";
+                case 2 -> "Metal";
+                case 3 -> "Dx12";
+                case 4 -> "Gl";
+                case 5 -> "BrowserWebGpu";
+                default -> "Empty";
+            };
+
+            return new AdapterInfo(name, vendorId, deviceId, deviceType, backend, driver, driverInfo);
         }
     }
 
