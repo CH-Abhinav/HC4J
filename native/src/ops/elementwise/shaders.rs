@@ -121,12 +121,14 @@ pub struct UnaryKernel<'a> {
     pub op1: &'a str,
     /// Raw bits of the f32 op parameter exposed as `dims.params.z`.
     pub alpha_bits: u32,
+    /// Raw bits of secondary parameter exposed as `dims.params.w`.
+    pub param_w_bits: u32,
 }
 
 impl<'a> UnaryKernel<'a> {
     /// An op whose callable is width-generic (a WGSL built-in).
     pub fn builtin(family: &'a str, op_name: &'a str, wgsl_op: &'a str) -> Self {
-        Self { family, op_name, prelude: "", op4: wgsl_op, op1: wgsl_op, alpha_bits: 0 }
+        Self { family, op_name, prelude: "", op4: wgsl_op, op1: wgsl_op, alpha_bits: 0, param_w_bits: 0 }
     }
 
     pub fn pipeline(&self) -> Hc4jResult<wgpu::ComputePipeline> {

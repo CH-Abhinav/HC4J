@@ -24,6 +24,7 @@ build/
 /build/
 **/build/
 .gradle/
+.gradle_home/
 *.class
 *.jar
 *.war

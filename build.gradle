@@ -18,4 +18,9 @@ subprojects {
         options.encoding = 'UTF-8'
         options.compilerArgs += ['-Xlint:all,-serial']
     }
+
+    tasks.withType(Javadoc).configureEach {
+        options.encoding = 'UTF-8'
+        options.addStringOption('Xdoclint:all,-missing', '-quiet')
+    }
 }

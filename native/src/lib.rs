@@ -35,7 +35,16 @@ pub use ops::arithmetic::{
 pub use ops::elementwise::dispatch_copy_strided;
 pub use ops::exponential::{dispatch_exp_f32, dispatch_ln_f32, dispatch_log2_f32, dispatch_log10_f32, dispatch_sqrt_f32};
 pub use ops::fusion::hc4j_fused_dispatch;
-pub use ops::matmul::{dispatch_matmul_f32, dispatch_matmul_f32_ex, dispatch_transpose_f32, hc4j_matmul_plan};
+pub use ops::math::{
+    dispatch_abs_f32, dispatch_cast, dispatch_ceil_f32, dispatch_clamp_f32, dispatch_compare, dispatch_floor_f32,
+    dispatch_maximum, dispatch_minimum, dispatch_neg_f32, dispatch_pow_f32, dispatch_round_f32, dispatch_rsqrt_f32,
+    dispatch_sign_f32, dispatch_unary_i32, dispatch_where,
+};
+pub use ops::matmul::{
+    dispatch_batched_matmul_f32, dispatch_matmul_f32, dispatch_matmul_f32_ex, dispatch_transpose_f32, hc4j_matmul_plan,
+};
+pub use ops::nn::abi::*;
+pub use ops::reduce::abi::*;
 pub use ops::trigno::{
     dispatch_acos_f32, dispatch_acosh_f32, dispatch_asin_f32, dispatch_asinh_f32, dispatch_atan_f32,
     dispatch_atanh_f32, dispatch_cos_f32, dispatch_cosh_f32, dispatch_sin_f32, dispatch_sinh_f32, dispatch_tan_f32,

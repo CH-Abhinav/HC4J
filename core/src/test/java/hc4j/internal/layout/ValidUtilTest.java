@@ -306,4 +306,67 @@ class ValidUtilTest {
                 () -> ValidUtil.validatePermutation(new int[] {1, 1}, 2),
                 "Duplicate axis in permutation: 1");
     }
+
+    @Test
+    @DisplayName("Axis normalization: positive, negative, and out of bounds")
+    void testNormalizeAxis() {
+        assertEquals(0, ValidUtil.normalizeAxis(0, 3));
+        assertEquals(1, ValidUtil.normalizeAxis(1, 3));
+        assertEquals(2, ValidUtil.normalizeAxis(2, 3));
+        assertEquals(2, ValidUtil.normalizeAxis(-1, 3));
+        assertEquals(1, ValidUtil.normalizeAxis(-2, 3));
+        assertEquals(0, ValidUtil.normalizeAxis(-3, 3));
+
+        assertThrowsWithMessage(IllegalArgumentException.class,
+                () -> ValidUtil.normalizeAxis(3, 3),
+                "Axis 3 is out of bounds for rank 3");
+        assertThrowsWithMessage(IllegalArgumentException.class,
+                () -> ValidUtil.normalizeAxis(-4, 3),
+                "Axis -4 is out of bounds for rank 3");
+    }
+
+    @Test
+    @DisplayName("Batched matmul plan: 3D and 4D broadcasting and dimension checks")
+    void testBatchedMatmulPlan() {
+        // [2, 3, 4] @ [2, 4, 5] -> [2, 3, 5]
+        int[] shapeA = {2, 3, 4};
+        int[] stridesA = {12, 4, 1};
+        int[] shapeB = {2, 4, 5};
+        int[] stridesB = {20, 5, 1};
+        ValidUtil.BatchedMatmulPlan plan = ValidUtil.batchedMatmulPlan(shapeA, stridesA, shapeB, stridesB);
+        assertEquals(3, plan.m());
+        assertEquals(5, plan.n());
+        assertEquals(4, plan.k());
+        assertArrayEquals(new int[]{2}, plan.batchShape());
+        assertArrayEquals(new int[]{12}, plan.aBatchStrides());
+        assertArrayEquals(new int[]{20}, plan.bBatchStrides());
+        assertArrayEquals(new int[]{2, 3, 5}, plan.outputShape());
+
+        // Batch broadcast: [2, 1, 3, 4] @ [1, 5, 4, 2] -> [2, 5, 3, 2]
+        int[] shape4dA = {2, 1, 3, 4};
+        int[] strides4dA = {12, 12, 4, 1};
+        int[] shape4dB = {1, 5, 4, 2};
+        int[] strides4dB = {40, 8, 2, 1};
+        ValidUtil.BatchedMatmulPlan plan4d = ValidUtil.batchedMatmulPlan(shape4dA, strides4dA, shape4dB, strides4dB);
+        assertArrayEquals(new int[]{2, 5}, plan4d.batchShape());
+        assertArrayEquals(new int[]{12, 0}, plan4d.aBatchStrides());
+        assertArrayEquals(new int[]{0, 8}, plan4d.bBatchStrides());
+        assertArrayEquals(new int[]{2, 5, 3, 2}, plan4d.outputShape());
+
+        // 2D B broadcast with 3D A: [4, 8, 12] @ [12, 6] -> [4, 8, 6]
+        int[] shape3dA = {4, 8, 12};
+        int[] strides3dA = {96, 12, 1};
+        int[] shape2dB = {12, 6};
+        int[] strides2dB = {6, 1};
+        ValidUtil.BatchedMatmulPlan planB2d = ValidUtil.batchedMatmulPlan(shape3dA, strides3dA, shape2dB, strides2dB);
+        assertArrayEquals(new int[]{4}, planB2d.batchShape());
+        assertArrayEquals(new int[]{96}, planB2d.aBatchStrides());
+        assertArrayEquals(new int[]{0}, planB2d.bBatchStrides());
+        assertArrayEquals(new int[]{4, 8, 6}, planB2d.outputShape());
+
+        // Inner dimension mismatch
+        assertThrowsWithMessage(IllegalArgumentException.class,
+                () -> ValidUtil.batchedMatmulPlan(new int[]{2, 3, 5}, new int[]{15, 5, 1}, new int[]{2, 4, 2}, new int[]{8, 2, 1}),
+                "Matmul shape mismatch: inner dimensions 5 and 4 do not match");
+    }
 }

@@ -196,11 +196,12 @@ pub unsafe fn dispatch_unary_kernel(
     ffi_guard(kernel.op_name, || {
         let pipeline = kernel.pipeline()?;
         let alpha = kernel.alpha_bits;
+        let param_w = kernel.param_w_bits;
         if is_contiguous != 0 {
             check_contiguous_length(id_out, length)?;
             return run_contiguous(
                 &pipeline,
-                &|len| bytemuck::bytes_of(&UnaryElemDims::contiguous_with(len, alpha)).to_vec(),
+                &|len| bytemuck::bytes_of(&UnaryElemDims::contiguous_with_params(len, alpha, param_w)).to_vec(),
                 &[id_a],
                 id_out,
             );
@@ -208,7 +209,7 @@ pub unsafe fn dispatch_unary_kernel(
         let length = u32::try_from(length).map_err(|_| Hc4jError::InvalidParam("strided length exceeds u32"))?;
         let (shape, strides) = unsafe { pruned_layout(rank, ptr_shape, &[ptr_strides_a, ptr_strides_c])? };
         let dims = UnaryElemDims {
-            params: [length, 0, alpha, 0],
+            params: [length, 0, alpha, param_w],
             shape,
             strides_a: strides[0],
             strides_c: strides[1],

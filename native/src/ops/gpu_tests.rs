@@ -9,14 +9,15 @@ use crate::ops::arithmetic::{dispatch_add_f32, dispatch_mul};
 use crate::ops::elementwise::dispatch_copy_strided;
 use crate::ops::exponential::dispatch_exp_f32;
 use crate::ops::fusion::{hc4j_fused_dispatch, op};
-use crate::ops::matmul::{FLAG_TRANS_A, FLAG_TRANS_B, dispatch_matmul_f32_ex};
+use crate::ops::matmul::{FLAG_TRANS_A, FLAG_TRANS_B, dispatch_batched_matmul_f32, dispatch_matmul_f32_ex};
+use crate::ops::math::*;
 use crate::ops::nn::{
     Activation, dispatch_activation_f32, dispatch_add_row_bias_f32, dispatch_cross_entropy_rows,
     dispatch_layernorm_rows_f32, dispatch_rmsnorm_rows_f32, dispatch_softmax_rows_f32,
 };
 use crate::ops::reduce::{
-    dispatch_argmax_rows, dispatch_reduce_diff2_f32, dispatch_reduce_f32, dispatch_reduce_rows_f32,
-    dispatch_reduce_square_f32,
+    dispatch_argmax_axis, dispatch_argmax_rows, dispatch_reduce_axis_f32, dispatch_reduce_diff2_f32,
+    dispatch_reduce_f32, dispatch_reduce_rows_f32, dispatch_reduce_square_f32,
 };
 use crate::ops::trigno::{dispatch_cos_f32, dispatch_sin_f32};
 use crate::{get_engine, hc4j_batch_begin, hc4j_batch_end};
@@ -1073,5 +1074,410 @@ fn in_place_self_aliasing_and_mutations() {
     }
 
     free(a);
+}
+
+#[test]
+fn batched_matmul_gpu_test() {
+    let Some(_gpu) = gpu() else { return };
+    // [2, 3, 4] @ [2, 4, 2] -> [2, 3, 2]
+    let (m, k, n) = (3usize, 4usize, 2usize);
+    let batch_count = 2usize;
+    let a_batch_len = m * k;
+    let b_batch_len = k * n;
+    let c_batch_len = m * n;
+
+    let a_data: Vec<f32> = (0..batch_count * a_batch_len).map(|i| (i as f32) * 0.5).collect();
+    let b_data: Vec<f32> = (0..batch_count * b_batch_len).map(|i| (i as f32) * 0.25).collect();
+
+    let id_a = upload(&a_data);
+    let id_b = upload(&b_data);
+    let id_c = hc4j_gpu_alloc(batch_count * c_batch_len);
+
+    let batch_shape = [batch_count as u32];
+    let a_batch_strides = [a_batch_len as u32];
+    let b_batch_strides = [b_batch_len as u32];
+
+    let status = unsafe {
+        dispatch_batched_matmul_f32(
+            id_a, id_b, id_c,
+            m as u32, n as u32, k as u32,
+            1,
+            batch_shape.as_ptr(),
+            a_batch_strides.as_ptr(),
+            b_batch_strides.as_ptr(),
+            0,
+        )
+    };
+    assert_eq!(status, 0);
+
+    let got_c = download(id_c, batch_count * c_batch_len);
+    for b in 0..batch_count {
+        for row in 0..m {
+            for col in 0..n {
+                let mut expected = 0.0f32;
+                for p in 0..k {
+                    let a_val = a_data[b * a_batch_len + row * k + p];
+                    let b_val = b_data[b * b_batch_len + p * n + col];
+                    expected += a_val * b_val;
+                }
+                let actual = got_c[b * c_batch_len + row * n + col];
+                assert!((actual - expected).abs() < 1e-4, "at ({b}, {row}, {col}): got {actual}, expected {expected}");
+            }
+        }
+    }
+
+    // Now test broadcasting B: [2, 3, 4] @ [1, 4, 2] -> [2, 3, 2] with b_batch_strides = [0]
+    let id_b_broadcast = upload(&b_data[..b_batch_len]);
+    let b_bcast_strides = [0u32];
+    let status_bcast = unsafe {
+        dispatch_batched_matmul_f32(
+            id_a, id_b_broadcast, id_c,
+            m as u32, n as u32, k as u32,
+            1,
+            batch_shape.as_ptr(),
+            a_batch_strides.as_ptr(),
+            b_bcast_strides.as_ptr(),
+            0,
+        )
+    };
+    assert_eq!(status_bcast, 0);
+
+    let got_bcast = download(id_c, batch_count * c_batch_len);
+    for b in 0..batch_count {
+        for row in 0..m {
+            for col in 0..n {
+                let mut expected = 0.0f32;
+                for p in 0..k {
+                    let a_val = a_data[b * a_batch_len + row * k + p];
+                    let b_val = b_data[p * n + col];
+                    expected += a_val * b_val;
+                }
+                let actual = got_bcast[b * c_batch_len + row * n + col];
+                assert!((actual - expected).abs() < 1e-4, "bcast at ({b}, {row}, {col}): got {actual}, expected {expected}");
+            }
+        }
+    }
+
+    free(id_a);
+    free(id_b);
+    free(id_b_broadcast);
+    free(id_c);
+}
+
+#[test]
+fn math_unary_ops_gpu_test() {
+    let Some(_gpu) = gpu() else { return };
+    let input_f32 = vec![-4.5f32, -1.2, 0.0, 1.8, 9.0];
+    let n = input_f32.len();
+    let id_in = upload(&input_f32);
+    let id_out = hc4j_gpu_alloc(n);
+
+    // abs
+    assert_eq!(contiguous_unary(dispatch_abs_f32, id_in, id_out, n), 0);
+    let out = download(id_out, n);
+    for i in 0..n {
+        assert!((out[i] - input_f32[i].abs()).abs() < 1e-5);
+    }
+
+    // neg
+    assert_eq!(contiguous_unary(dispatch_neg_f32, id_in, id_out, n), 0);
+    let out = download(id_out, n);
+    for i in 0..n {
+        assert!((out[i] - (-input_f32[i])).abs() < 1e-5);
+    }
+
+    // floor
+    assert_eq!(contiguous_unary(dispatch_floor_f32, id_in, id_out, n), 0);
+    let out = download(id_out, n);
+    for i in 0..n {
+        assert_eq!(out[i], input_f32[i].floor());
+    }
+
+    // ceil
+    assert_eq!(contiguous_unary(dispatch_ceil_f32, id_in, id_out, n), 0);
+    let out = download(id_out, n);
+    for i in 0..n {
+        assert_eq!(out[i], input_f32[i].ceil());
+    }
+
+    // clamp between -1.0 and 2.0
+    let status_clamp = unsafe {
+        dispatch_clamp_f32(
+            id_in, id_out, 0,
+            std::ptr::null(), std::ptr::null(), std::ptr::null(),
+            n, 1, -1.0f32, 2.0f32,
+        )
+    };
+    assert_eq!(status_clamp, 0);
+    let out = download(id_out, n);
+    for i in 0..n {
+        let expected = input_f32[i].clamp(-1.0, 2.0);
+        assert!((out[i] - expected).abs() < 1e-5);
+    }
+
+    // sign f32
+    assert_eq!(contiguous_unary(dispatch_sign_f32, id_in, id_out, n), 0);
+    let out = download(id_out, n);
+    for i in 0..n {
+        let expected = if input_f32[i] > 0.0 { 1.0 } else if input_f32[i] < 0.0 { -1.0 } else { 0.0 };
+        assert!((out[i] - expected).abs() < 1e-5);
+    }
+
+    // sign f32 in-place
+    assert_eq!(contiguous_unary(dispatch_sign_f32, id_out, id_out, n), 0);
+    let out_inplace = download(id_out, n);
+    for i in 0..n {
+        let expected = if input_f32[i] > 0.0 { 1.0 } else if input_f32[i] < 0.0 { -1.0 } else { 0.0 };
+        assert!((out_inplace[i] - expected).abs() < 1e-5);
+    }
+
+    free(id_in);
+    free(id_out);
+
+    // i32 unary: abs, neg, sign, clamp
+    let input_i32 = vec![-10i32, -5, 0, 3, 15];
+    let ni = input_i32.len();
+    let id_in_i = upload_i32(&input_i32);
+    let id_out_i = hc4j_gpu_alloc(ni);
+
+    // abs (op_code 0)
+    let s = unsafe { dispatch_unary_i32(id_in_i, id_out_i, 0, std::ptr::null(), std::ptr::null(), std::ptr::null(), ni, 1, 0, 0, 0) };
+    assert_eq!(s, 0);
+    let out_i = download_i32(id_out_i, ni);
+    for i in 0..ni {
+        assert_eq!(out_i[i], input_i32[i].abs());
+    }
+
+    // neg (op_code 1)
+    let s = unsafe { dispatch_unary_i32(id_in_i, id_out_i, 0, std::ptr::null(), std::ptr::null(), std::ptr::null(), ni, 1, 1, 0, 0) };
+    assert_eq!(s, 0);
+    let out_i = download_i32(id_out_i, ni);
+    for i in 0..ni {
+        assert_eq!(out_i[i], -input_i32[i]);
+    }
+
+    // sign (op_code 2)
+    let s = unsafe { dispatch_unary_i32(id_in_i, id_out_i, 0, std::ptr::null(), std::ptr::null(), std::ptr::null(), ni, 1, 2, 0, 0) };
+    assert_eq!(s, 0);
+    let out_i = download_i32(id_out_i, ni);
+    for i in 0..ni {
+        assert_eq!(out_i[i], input_i32[i].signum());
+    }
+
+    // clamp (op_code 3) between -2 and 8
+    let s = unsafe { dispatch_unary_i32(id_in_i, id_out_i, 0, std::ptr::null(), std::ptr::null(), std::ptr::null(), ni, 1, 3, (-2i32) as u32, 8u32) };
+    assert_eq!(s, 0);
+    let out_i = download_i32(id_out_i, ni);
+    for i in 0..ni {
+        assert_eq!(out_i[i], input_i32[i].clamp(-2, 8));
+    }
+
+    free(id_in_i);
+    free(id_out_i);
+}
+
+#[test]
+fn functional_binary_gpu_test() {
+    let Some(_gpu) = gpu() else { return };
+    let a = vec![2.0f32, 3.0, 4.0, 5.0];
+    let b = vec![3.0f32, 2.0, 0.5, 1.0];
+    let n = a.len();
+    let id_a = upload(&a);
+    let id_b = upload(&b);
+    let id_out = hc4j_gpu_alloc(n);
+
+    // pow
+    let s = unsafe {
+        dispatch_pow_f32(
+            id_a, id_b, id_out, 0,
+            std::ptr::null(), std::ptr::null(), std::ptr::null(), std::ptr::null(),
+            n, 1,
+        )
+    };
+    assert_eq!(s, 0);
+    let out = download(id_out, n);
+    for i in 0..n {
+        assert!((out[i] - a[i].powf(b[i])).abs() < 1e-4);
+    }
+
+    // maximum f32 (dtype 1)
+    let s = unsafe {
+        dispatch_maximum(
+            id_a, id_b, id_out, 0,
+            std::ptr::null(), std::ptr::null(), std::ptr::null(), std::ptr::null(),
+            n, 1, 1,
+        )
+    };
+    assert_eq!(s, 0);
+    let out = download(id_out, n);
+    for i in 0..n {
+        assert_eq!(out[i], a[i].max(b[i]));
+    }
+
+    // minimum f32 (dtype 1)
+    let s = unsafe {
+        dispatch_minimum(
+            id_a, id_b, id_out, 0,
+            std::ptr::null(), std::ptr::null(), std::ptr::null(), std::ptr::null(),
+            n, 1, 1,
+        )
+    };
+    assert_eq!(s, 0);
+    let out = download(id_out, n);
+    for i in 0..n {
+        assert_eq!(out[i], a[i].min(b[i]));
+    }
+
+    free(id_a);
+    free(id_b);
+    free(id_out);
+}
+
+#[test]
+fn compare_and_where_gpu_test() {
+    let Some(_gpu) = gpu() else { return };
+    let a = vec![1.0f32, 5.0, 3.0, 7.0];
+    let b = vec![2.0f32, 5.0, 1.0, 9.0];
+    let n = a.len();
+    let id_a = upload(&a);
+    let id_b = upload(&b);
+    let id_mask = hc4j_gpu_alloc(n);
+
+    // eq (cmp_op 0)
+    let s = unsafe {
+        dispatch_compare(
+            id_a, id_b, id_mask, 0,
+            std::ptr::null(), std::ptr::null(), std::ptr::null(), std::ptr::null(),
+            n, 1, 1, 0,
+        )
+    };
+    assert_eq!(s, 0);
+    let mask = download_i32(id_mask, n);
+    assert_eq!(mask, vec![0, 1, 0, 0]);
+
+    // gt (cmp_op 2)
+    let s = unsafe {
+        dispatch_compare(
+            id_a, id_b, id_mask, 0,
+            std::ptr::null(), std::ptr::null(), std::ptr::null(), std::ptr::null(),
+            n, 1, 1, 2,
+        )
+    };
+    assert_eq!(s, 0);
+    let mask = download_i32(id_mask, n);
+    assert_eq!(mask, vec![0, 0, 1, 0]);
+
+    // where: cond_mask ? x : y
+    let x = vec![10.0f32, 20.0, 30.0, 40.0];
+    let y = vec![-10.0f32, -20.0, -30.0, -40.0];
+    let id_x = upload(&x);
+    let id_y = upload(&y);
+    let id_res = hc4j_gpu_alloc(n);
+
+    // cond_dtype = 0 (i32), val_dtype = 1 (f32)
+    let s = unsafe {
+        dispatch_where(
+            id_mask, id_x, id_y, id_res, 0,
+            std::ptr::null(), std::ptr::null(), std::ptr::null(), std::ptr::null(), std::ptr::null(),
+            n, 1, 0, 1,
+        )
+    };
+    assert_eq!(s, 0);
+    let res = download(id_res, n);
+    // mask is [0, 0, 1, 0] from gt: index 2 should have x[2]=30.0, others y[i]
+    assert_eq!(res, vec![-10.0f32, -20.0, 30.0, -40.0]);
+
+    free(id_a);
+    free(id_b);
+    free(id_mask);
+    free(id_x);
+    free(id_y);
+    free(id_res);
+}
+
+#[test]
+fn cast_gpu_test() {
+    let Some(_gpu) = gpu() else { return };
+    let f_data = vec![-2.9f32, -0.1, 0.0, 3.4, 7.8];
+    let n = f_data.len();
+    let id_f = upload(&f_data);
+    let id_i = hc4j_gpu_alloc(n);
+
+    // cast f32 (dtype 1) -> i32 (dtype 0)
+    let s = unsafe { dispatch_cast(id_f, id_i, n as u64, 1, 0) };
+    assert_eq!(s, 0);
+    let got_i = download_i32(id_i, n);
+    for i in 0..n {
+        assert_eq!(got_i[i], f_data[i] as i32);
+    }
+
+    // cast back i32 -> f32
+    let id_f_back = hc4j_gpu_alloc(n);
+    let s2 = unsafe { dispatch_cast(id_i, id_f_back, n as u64, 0, 1) };
+    assert_eq!(s2, 0);
+    let got_f = download(id_f_back, n);
+    for i in 0..n {
+        assert_eq!(got_f[i], got_i[i] as f32);
+    }
+
+    free(id_f);
+    free(id_i);
+    free(id_f_back);
+}
+
+#[test]
+fn axis_reduce_and_argmax_gpu_test() {
+    let Some(_gpu) = gpu() else { return };
+    // Tensor shape [2, 3, 4], total 24
+    let data: Vec<f32> = (0..24).map(|x| (x + 1) as f32).collect();
+    let id_in = upload(&data);
+
+    // Reduce along axis 1: outer = 2, axis_dim = 3, inner = 4.
+    // out shape is [2, 4], length 8.
+    let id_out = hc4j_gpu_alloc(8);
+
+    // Sum (op 0)
+    let s = unsafe { dispatch_reduce_axis_f32(id_in, id_out, 2, 3, 4, 0) };
+    assert_eq!(s, 0);
+    let out = download(id_out, 8);
+    for o in 0..2 {
+        for inn in 0..4 {
+            let mut sum = 0.0f32;
+            for a in 0..3 {
+                sum += data[o * 12 + a * 4 + inn];
+            }
+            assert_eq!(out[o * 4 + inn], sum);
+        }
+    }
+
+    // Prod (op 4) along axis 1 for smaller numbers:
+    let small_data = vec![
+        1.0f32, 2.0, 3.0, 4.0,
+        2.0,    1.0, 2.0, 1.0,
+        3.0,    2.0, 1.0, 2.0,
+    ]; // shape [1, 3, 4] -> reduce axis 1 -> [1, 4]
+    let id_small = upload(&small_data);
+    let id_prod_out = hc4j_gpu_alloc(4);
+    let s = unsafe { dispatch_reduce_axis_f32(id_small, id_prod_out, 1, 3, 4, 4) };
+    assert_eq!(s, 0);
+    let prod_res = download(id_prod_out, 4);
+    assert_eq!(prod_res, vec![6.0f32, 4.0, 6.0, 8.0]);
+
+    // Argmax along axis 1 on small_data:
+    // col 0: values are [1, 2, 3] -> argmax = 2
+    // col 1: values are [2, 1, 2] -> argmax = 0 (first max)
+    // col 2: values are [3, 2, 1] -> argmax = 0
+    // col 3: values are [4, 1, 2] -> argmax = 0
+    let id_argmax_out = hc4j_gpu_alloc(4);
+    let s = unsafe { dispatch_argmax_axis(id_small, id_argmax_out, 1, 3, 4, 1) };
+    assert_eq!(s, 0);
+    let argmax_res = download_i32(id_argmax_out, 4);
+    assert_eq!(argmax_res, vec![2, 0, 0, 0]);
+
+    free(id_in);
+    free(id_out);
+    free(id_small);
+    free(id_prod_out);
+    free(id_argmax_out);
 }
 

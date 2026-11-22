@@ -49,12 +49,14 @@
 //! aliasing an input is rejected, since tiles of C would race with reads of A/B.
 
 pub mod abi;
+pub mod batched;
 pub mod dispatch;
 pub mod plan;
 pub mod shaders;
 pub mod streaming;
 
 pub use abi::*;
+pub use batched::*;
 pub use dispatch::*;
 pub use plan::*;
 pub use shaders::*;

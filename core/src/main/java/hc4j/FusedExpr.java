@@ -122,6 +122,31 @@ public final class FusedExpr {
     public FusedExpr mul(float c) { return scalar(MUL, c); }
     public FusedExpr div(float c) { return scalar(DIV, c); }
     public FusedExpr pow(float c) { return scalar(POW, c); }
+    public FusedExpr max(float c) { return scalar(MAX, c); }
+    public FusedExpr min(float c) { return scalar(MIN, c); }
+
+    /**
+     * Clamps values to the range {@code [min, max]}.
+     *
+     * @param min minimum threshold
+     * @param max maximum threshold
+     * @return clamped expression
+     */
+    public FusedExpr clamp(float min, float max) {
+        if (min > max) {
+            throw new IllegalArgumentException("min must be <= max, got " + min + " > " + max);
+        }
+        return this.max(min).min(max);
+    }
+
+    /**
+     * Reciprocal square root {@code 1 / sqrt(x)}.
+     *
+     * @return reciprocal square root expression
+     */
+    public FusedExpr rsqrt() {
+        return this.sqrt().rdiv(1.0f);
+    }
 
     private FusedExpr unary(int op) {
         return new FusedExpr(new Unary(op, root), shape, words + 1);

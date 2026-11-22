@@ -20,8 +20,14 @@ package hc4j.nn;
  * Reduction operations for tensors.
  */
 public enum Reduction {
+    /** Elementwise summation. */
     SUM,
+    /** Elementwise arithmetic mean. */
     MEAN,
+    /** Elementwise maximum value. */
     MAX,
-    MIN
+    /** Elementwise minimum value. */
+    MIN,
+    /** Elementwise product. */
+    PROD
 }

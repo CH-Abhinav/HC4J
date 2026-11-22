@@ -229,4 +229,136 @@ public final class ValidUtil {
             seen[axis] = true;
         }
     }
+
+    /**
+     * Normalizes a potentially negative axis index into the range {@code [0, rank - 1]}.
+     *
+     * @param axis axis index (can be negative)
+     * @param rank rank of the tensor
+     * @return non-negative normalized axis index
+     * @throws IllegalArgumentException if axis is out of range
+     */
+    public static int normalizeAxis(int axis, int rank) {
+        if (rank <= 0) {
+            throw new IllegalArgumentException("Rank must be positive, got " + rank);
+        }
+        int norm = axis < 0 ? axis + rank : axis;
+        if (norm < 0 || norm >= rank) {
+            throw new IllegalArgumentException("Axis " + axis + " is out of bounds for rank " + rank);
+        }
+        return norm;
+    }
+
+    /**
+     * Execution plan for a batched matrix multiplication.
+     *
+     * @param m row count of matrices in A
+     * @param n column count of matrices in B
+     * @param k common dimension
+     * @param batchShape broadcast batch shape
+     * @param aBatchStrides batch strides for operand A
+     * @param bBatchStrides batch strides for operand B
+     * @param outputShape output tensor shape
+     * @param flags flags for transposition (bit 0 = transA, bit 1 = transB)
+     */
+    public record BatchedMatmulPlan(
+            int m,
+            int n,
+            int k,
+            int[] batchShape,
+            int[] aBatchStrides,
+            int[] bBatchStrides,
+            int[] outputShape,
+            int flags
+    ) {}
+
+    /**
+     * Computes the batched matrix multiplication plan and validates dimensions and broadcasting.
+     *
+     * @param shapeA shape of left operand
+     * @param stridesA strides of left operand
+     * @param shapeB shape of right operand
+     * @param stridesB strides of right operand
+     * @return computed {@link BatchedMatmulPlan}
+     * @throws IllegalArgumentException if shapes are incompatible
+     */
+    public static BatchedMatmulPlan batchedMatmulPlan(int[] shapeA, int[] stridesA, int[] shapeB, int[] stridesB) {
+        if (shapeA == null || shapeB == null || shapeA.length < 2 || shapeB.length < 2) {
+            throw new IllegalArgumentException("Batched matmul requires operands with rank >= 2");
+        }
+        int rankA = shapeA.length;
+        int rankB = shapeB.length;
+        int m = shapeA[rankA - 2];
+        int ka = shapeA[rankA - 1];
+        int kb = shapeB[rankB - 2];
+        int n = shapeB[rankB - 1];
+        if (ka != kb) {
+            throw new IllegalArgumentException("Matmul shape mismatch: inner dimensions " + ka + " and " + kb + " do not match");
+        }
+        int k = ka;
+
+        int batchRankA = rankA - 2;
+        int batchRankB = rankB - 2;
+        int batchRank = Math.max(batchRankA, batchRankB);
+        if (batchRank < 1 || batchRank > 4) {
+            throw new IllegalArgumentException("Batch rank must be between 1 and 4, got " + batchRank);
+        }
+
+        int[] batchShapeA = new int[batchRankA];
+        System.arraycopy(shapeA, 0, batchShapeA, 0, batchRankA);
+        int[] batchShapeB = new int[batchRankB];
+        System.arraycopy(shapeB, 0, batchShapeB, 0, batchRankB);
+
+        int[] batchShape = broadcastShape(batchShapeA, batchShapeB);
+        int[] outputShape = new int[batchRank + 2];
+        System.arraycopy(batchShape, 0, outputShape, 0, batchRank);
+        outputShape[batchRank] = m;
+        outputShape[batchRank + 1] = n;
+
+        int[] aBatchStrides = new int[batchRank];
+        int offsetA = batchRank - batchRankA;
+        for (int i = 0; i < batchRank; i++) {
+            if (i < offsetA) {
+                aBatchStrides[i] = 0;
+            } else {
+                int srcDim = batchShapeA[i - offsetA];
+                int targetDim = batchShape[i];
+                if (srcDim == 1 && targetDim > 1) {
+                    aBatchStrides[i] = 0;
+                } else if (srcDim == targetDim) {
+                    aBatchStrides[i] = stridesA[i - offsetA];
+                } else {
+                    throw new IllegalArgumentException("Cannot broadcast dimension " + srcDim + " to " + targetDim);
+                }
+            }
+        }
+
+        int[] bBatchStrides = new int[batchRank];
+        int offsetB = batchRank - batchRankB;
+        for (int i = 0; i < batchRank; i++) {
+            if (i < offsetB) {
+                bBatchStrides[i] = 0;
+            } else {
+                int srcDim = batchShapeB[i - offsetB];
+                int targetDim = batchShape[i];
+                if (srcDim == 1 && targetDim > 1) {
+                    bBatchStrides[i] = 0;
+                } else if (srcDim == targetDim) {
+                    bBatchStrides[i] = stridesB[i - offsetB];
+                } else {
+                    throw new IllegalArgumentException("Cannot broadcast dimension " + srcDim + " to " + targetDim);
+                }
+            }
+        }
+
+        int flags = 0;
+        if (stridesA[rankA - 2] == 1 && stridesA[rankA - 1] == m && (m != 1 || k != 1)) {
+            flags |= 1;
+        }
+        if (stridesB[rankB - 2] == 1 && stridesB[rankB - 1] == k && (k != 1 || n != 1)) {
+            flags |= 2;
+        }
+
+        return new BatchedMatmulPlan(m, n, k, batchShape, aBatchStrides, bBatchStrides, outputShape, flags);
+    }
 }

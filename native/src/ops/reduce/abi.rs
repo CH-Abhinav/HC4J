@@ -43,3 +43,41 @@ pub extern "C" fn dispatch_argmax_rows(id_a: u64, id_out: u64, rows: u32, cols: 
         run_row_argmax(id_a, id_out, rows, cols, largest != 0)
     })
 }
+
+/// Reduces `id_a` along an arbitrary axis, where `outer = prod(shape[..axis])`,
+/// `axis_size = shape[axis]`, and `inner = prod(shape[axis+1..])`.
+///
+/// # Safety
+/// No pointer parameters; `unsafe` matches the published C ABI signature.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn dispatch_reduce_axis_f32(
+    id_a: u64,
+    id_out: u64,
+    outer: u32,
+    axis_size: u32,
+    inner: u32,
+    op: u32,
+) -> i32 {
+    ffi_guard("dispatch_reduce_axis_f32", || {
+        let reduce_op = ReduceOp::from_code(op)?;
+        super::dispatch::run_axis_reduce_f32(reduce_op, id_a, id_out, outer, axis_size, inner)
+    })
+}
+
+/// Computes argmax or argmin along an arbitrary axis.
+///
+/// # Safety
+/// No pointer parameters; `unsafe` matches the published C ABI signature.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn dispatch_argmax_axis(
+    id_a: u64,
+    id_out: u64,
+    outer: u32,
+    axis_size: u32,
+    inner: u32,
+    largest: u32,
+) -> i32 {
+    ffi_guard("dispatch_argmax_axis", || {
+        super::dispatch::run_axis_argmax(id_a, id_out, outer, axis_size, inner, largest != 0)
+    })
+}

@@ -121,6 +121,7 @@ impl Activation {
             op4: "hc4j_act4",
             op1: "hc4j_act1",
             alpha_bits: if self.takes_alpha() { alpha.to_bits() } else { 0 },
+            param_w_bits: 0,
         }
     }
 }

@@ -11,6 +11,7 @@ pub enum ReduceOp {
     Mean,
     Max,
     Min,
+    Prod,
 }
 
 impl ReduceOp {
@@ -20,6 +21,7 @@ impl ReduceOp {
             ReduceOp::Sum | ReduceOp::Mean => "0.0",
             ReduceOp::Max => "-3.4028235e38",
             ReduceOp::Min => "3.4028235e38",
+            ReduceOp::Prod => "1.0",
         }
     }
 
@@ -29,6 +31,7 @@ impl ReduceOp {
             ReduceOp::Sum | ReduceOp::Mean => "a + b",
             ReduceOp::Max => "max(a, b)",
             ReduceOp::Min => "min(a, b)",
+            ReduceOp::Prod => "a * b",
         }
     }
 
@@ -46,6 +49,7 @@ impl ReduceOp {
             ReduceOp::Mean => "mean",
             ReduceOp::Max => "max",
             ReduceOp::Min => "min",
+            ReduceOp::Prod => "prod",
         }
     }
 
@@ -56,6 +60,7 @@ impl ReduceOp {
             1 => Ok(ReduceOp::Mean),
             2 => Ok(ReduceOp::Max),
             3 => Ok(ReduceOp::Min),
+            4 => Ok(ReduceOp::Prod),
             _ => Err(Hc4jError::InvalidParam("unknown reduction op")),
         }
     }
@@ -103,7 +108,7 @@ mod tests {
 
     #[test]
     fn identities_are_finite_so_pairwise_combines_cannot_produce_nan() {
-        for op in [ReduceOp::Sum, ReduceOp::Mean, ReduceOp::Max, ReduceOp::Min] {
+        for op in [ReduceOp::Sum, ReduceOp::Mean, ReduceOp::Max, ReduceOp::Min, ReduceOp::Prod] {
             let ident: f32 = op.identity().parse().expect("identity parses as f32");
             assert!(ident.is_finite(), "{} identity must be finite", op.name());
         }
@@ -111,10 +116,16 @@ mod tests {
 
     #[test]
     fn op_codes_round_trip_and_reject_garbage() {
-        for (code, expected) in [(0, ReduceOp::Sum), (1, ReduceOp::Mean), (2, ReduceOp::Max), (3, ReduceOp::Min)] {
+        for (code, expected) in [
+            (0, ReduceOp::Sum),
+            (1, ReduceOp::Mean),
+            (2, ReduceOp::Max),
+            (3, ReduceOp::Min),
+            (4, ReduceOp::Prod),
+        ] {
             assert_eq!(ReduceOp::from_code(code).expect("valid code"), expected);
         }
-        assert!(ReduceOp::from_code(4).is_err());
+        assert!(ReduceOp::from_code(5).is_err());
     }
 
     #[test]

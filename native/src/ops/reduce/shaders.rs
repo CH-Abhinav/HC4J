@@ -148,6 +148,93 @@ fn main(
     )
 }
 
+/// General-axis reduction for inner > 1: one invocation per output element,
+/// coalesced reads along inner dimension.
+pub fn axis_kernel_wgsl(op: ReduceOp) -> String {
+    let (ident, combine) = (op.identity(), op.combine());
+    let is_mean = op == ReduceOp::Mean;
+    format!(
+        "struct Params {{
+    params: vec4<u32>,
+}}
+
+@group(0) @binding(0) var<storage, read_write> A: array<f32>;
+@group(0) @binding(1) var<storage, read_write> OUT: array<f32>;
+@group(0) @binding(2) var<uniform> p: Params;
+
+@compute @workgroup_size(256)
+fn main(
+    @builtin(global_invocation_id) gid: vec3<u32>,
+    @builtin(num_workgroups) nwg: vec3<u32>,
+) {{
+    let idx = gid.x + gid.y * (nwg.x * 256u);
+    let total_outputs = p.params.w;
+    if (idx >= total_outputs) {{ return; }}
+
+    let inner = p.params.z;
+    let axis_size = p.params.y;
+    let o = idx / inner;
+    let i = idx % inner;
+    let base = o * (axis_size * inner) + i;
+
+    var acc = {ident};
+    for (var k = 0u; k < axis_size; k = k + 1u) {{
+        let b = A[base + k * inner];
+        let a = acc;
+        acc = {combine};
+    }}
+    if ({is_mean}) {{
+        acc = acc / f32(axis_size);
+    }}
+    OUT[idx] = acc;
+}}
+"
+    )
+}
+
+/// General-axis argmax / argmin for inner > 1: one invocation per output element,
+/// ties resolve to lowest index.
+pub fn axis_argmax_wgsl(largest: bool) -> String {
+    let better = if largest { "v > best_val" } else { "v < best_val" };
+    format!(
+        "struct Params {{
+    params: vec4<u32>,
+}}
+
+@group(0) @binding(0) var<storage, read_write> A: array<f32>;
+@group(0) @binding(1) var<storage, read_write> OUT: array<i32>;
+@group(0) @binding(2) var<uniform> p: Params;
+
+@compute @workgroup_size(256)
+fn main(
+    @builtin(global_invocation_id) gid: vec3<u32>,
+    @builtin(num_workgroups) nwg: vec3<u32>,
+) {{
+    let idx = gid.x + gid.y * (nwg.x * 256u);
+    let total_outputs = p.params.w;
+    if (idx >= total_outputs) {{ return; }}
+
+    let inner = p.params.z;
+    let axis_size = p.params.y;
+    let o = idx / inner;
+    let i = idx % inner;
+    let base = o * (axis_size * inner) + i;
+
+    var best_val = A[base];
+    var best_k = 0u;
+    for (var k = 1u; k < axis_size; k = k + 1u) {{
+        let v = A[base + k * inner];
+        if ({better}) {{
+            best_val = v;
+            best_k = k;
+        }}
+    }}
+    OUT[idx] = i32(best_k);
+}}
+"
+    )
+}
+
 /// Row-wise argmax / argmin, writing i32 indices. Ties resolve to the lowest
 /// index, matching NumPy and PyTorch.
 pub fn row_argmax_wgsl(largest: bool) -> String {

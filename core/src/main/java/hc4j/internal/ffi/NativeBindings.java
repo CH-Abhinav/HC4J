@@ -113,6 +113,56 @@ public final class NativeBindings {
         static final MethodHandle MATMUL_PLAN = bind("hc4j_matmul_plan",
                 FunctionDescriptor.of(JAVA_INT, JAVA_INT, JAVA_INT, JAVA_INT, JAVA_INT));
 
+        static final FunctionDescriptor BATCHED_MATMUL_DESC = FunctionDescriptor.of(
+                JAVA_INT, JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_INT, JAVA_INT, JAVA_INT, JAVA_INT, ADDRESS, ADDRESS, ADDRESS, JAVA_INT);
+        static final MethodHandle DISPATCH_BATCHED_MATMUL = bind("dispatch_batched_matmul_f32", BATCHED_MATMUL_DESC);
+
+        // Extra math ops
+        static final MethodHandle DISPATCH_ABS_F32 = bind("dispatch_abs_f32", UNARY_DESC);
+        static final MethodHandle DISPATCH_NEG_F32 = bind("dispatch_neg_f32", UNARY_DESC);
+        static final MethodHandle DISPATCH_RSQRT_F32 = bind("dispatch_rsqrt_f32", UNARY_DESC);
+        static final MethodHandle DISPATCH_FLOOR_F32 = bind("dispatch_floor_f32", UNARY_DESC);
+        static final MethodHandle DISPATCH_CEIL_F32 = bind("dispatch_ceil_f32", UNARY_DESC);
+        static final MethodHandle DISPATCH_ROUND_F32 = bind("dispatch_round_f32", UNARY_DESC);
+        static final MethodHandle DISPATCH_SIGN_F32 = bind("dispatch_sign_f32", UNARY_DESC);
+
+        static final FunctionDescriptor CLAMP_F32_DESC = FunctionDescriptor.of(
+                JAVA_INT, JAVA_LONG, JAVA_LONG, JAVA_INT, ADDRESS, ADDRESS, ADDRESS, JAVA_LONG, JAVA_INT, ValueLayout.JAVA_FLOAT, ValueLayout.JAVA_FLOAT);
+        static final MethodHandle DISPATCH_CLAMP_F32 = bind("dispatch_clamp_f32", CLAMP_F32_DESC);
+
+        static final FunctionDescriptor UNARY_I32_DESC = FunctionDescriptor.of(
+                JAVA_INT, JAVA_LONG, JAVA_LONG, JAVA_INT, ADDRESS, ADDRESS, ADDRESS, JAVA_LONG, JAVA_INT, JAVA_INT, JAVA_INT, JAVA_INT);
+        static final MethodHandle DISPATCH_UNARY_I32 = bind("dispatch_unary_i32", UNARY_I32_DESC);
+
+        static final FunctionDescriptor POW_F32_DESC = FunctionDescriptor.of(
+                JAVA_INT, JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_INT, ADDRESS, ADDRESS, ADDRESS, ADDRESS, JAVA_LONG, JAVA_INT);
+        static final MethodHandle DISPATCH_POW_F32 = bind("dispatch_pow_f32", POW_F32_DESC);
+
+        static final FunctionDescriptor MAX_MIN_DESC = FunctionDescriptor.of(
+                JAVA_INT, JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_INT, ADDRESS, ADDRESS, ADDRESS, ADDRESS, JAVA_LONG, JAVA_INT, JAVA_INT);
+        static final MethodHandle DISPATCH_MAXIMUM = bind("dispatch_maximum", MAX_MIN_DESC);
+        static final MethodHandle DISPATCH_MINIMUM = bind("dispatch_minimum", MAX_MIN_DESC);
+
+        static final FunctionDescriptor COMPARE_DESC = FunctionDescriptor.of(
+                JAVA_INT, JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_INT, ADDRESS, ADDRESS, ADDRESS, ADDRESS, JAVA_LONG, JAVA_INT, JAVA_INT, JAVA_INT);
+        static final MethodHandle DISPATCH_COMPARE = bind("dispatch_compare", COMPARE_DESC);
+
+        static final FunctionDescriptor WHERE_DESC = FunctionDescriptor.of(
+                JAVA_INT, JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_INT, ADDRESS, ADDRESS, ADDRESS, ADDRESS, ADDRESS, JAVA_LONG, JAVA_INT, JAVA_INT, JAVA_INT);
+        static final MethodHandle DISPATCH_WHERE = bind("dispatch_where", WHERE_DESC);
+
+        static final FunctionDescriptor CAST_DESC = FunctionDescriptor.of(
+                JAVA_INT, JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_INT, JAVA_INT);
+        static final MethodHandle DISPATCH_CAST = bind("dispatch_cast", CAST_DESC);
+
+        static final FunctionDescriptor REDUCE_AXIS_DESC = FunctionDescriptor.of(
+                JAVA_INT, JAVA_LONG, JAVA_LONG, JAVA_INT, JAVA_INT, JAVA_INT, JAVA_INT);
+        static final MethodHandle DISPATCH_REDUCE_AXIS = bind("dispatch_reduce_axis_f32", REDUCE_AXIS_DESC);
+
+        static final FunctionDescriptor ARGMAX_AXIS_DESC = FunctionDescriptor.of(
+                JAVA_INT, JAVA_LONG, JAVA_LONG, JAVA_INT, JAVA_INT, JAVA_INT, JAVA_INT);
+        static final MethodHandle DISPATCH_ARGMAX_AXIS = bind("dispatch_argmax_axis", ARGMAX_AXIS_DESC);
+
         // Neural network ops
         static final MethodHandle ACTIVATION = bind("dispatch_activation_f32",
                 FunctionDescriptor.of(JAVA_INT, JAVA_LONG, JAVA_LONG, JAVA_INT, ADDRESS, ADDRESS, ADDRESS,
@@ -281,5 +331,80 @@ public final class NativeBindings {
     public static int dispatchCopyStrided(long src, long out, long srcOffset, int rank,
             MemorySegment shape, MemorySegment srcStrides, long len) throws Throwable {
         return (int) Holder.DISPATCH_COPY_STRIDED.invokeExact(src, out, srcOffset, rank, shape, srcStrides, len);
+    }
+
+    public static int dispatchMathUnary(int opIndex, long a, long out, int rank,
+                                        MemorySegment shape, MemorySegment stridesA, MemorySegment stridesC,
+                                        long length, int isContiguous) throws Throwable {
+        MethodHandle mh = switch (opIndex) {
+            case 0 -> Holder.DISPATCH_ABS_F32;
+            case 1 -> Holder.DISPATCH_NEG_F32;
+            case 2 -> Holder.DISPATCH_RSQRT_F32;
+            case 3 -> Holder.DISPATCH_FLOOR_F32;
+            case 4 -> Holder.DISPATCH_CEIL_F32;
+            case 5 -> Holder.DISPATCH_ROUND_F32;
+            case 6 -> Holder.DISPATCH_SIGN_F32;
+            default -> throw new IllegalArgumentException("Unknown math unary op index: " + opIndex);
+        };
+        return (int) mh.invokeExact(a, out, rank, shape, stridesA, stridesC, length, isContiguous);
+    }
+
+    public static int dispatchClampF32(long a, long out, int rank,
+                                       MemorySegment shape, MemorySegment stridesA, MemorySegment stridesC,
+                                       long length, int isContiguous, float lo, float hi) throws Throwable {
+        return (int) Holder.DISPATCH_CLAMP_F32.invokeExact(a, out, rank, shape, stridesA, stridesC, length, isContiguous, lo, hi);
+    }
+
+    public static int dispatchUnaryI32(long a, long out, int rank,
+                                       MemorySegment shape, MemorySegment stridesA, MemorySegment stridesC,
+                                       long length, int isContiguous, int opCode, int pZ, int pW) throws Throwable {
+        return (int) Holder.DISPATCH_UNARY_I32.invokeExact(a, out, rank, shape, stridesA, stridesC, length, isContiguous, opCode, pZ, pW);
+    }
+
+    public static int dispatchPowF32(long a, long b, long out, int rank,
+                                     MemorySegment shape, MemorySegment stridesA, MemorySegment stridesB, MemorySegment stridesC,
+                                     long length, int isContiguous) throws Throwable {
+        return (int) Holder.DISPATCH_POW_F32.invokeExact(a, b, out, rank, shape, stridesA, stridesB, stridesC, length, isContiguous);
+    }
+
+    public static int dispatchMaximum(long a, long b, long out, int rank,
+                                      MemorySegment shape, MemorySegment stridesA, MemorySegment stridesB, MemorySegment stridesC,
+                                      long length, int isContiguous, int dtypeCode) throws Throwable {
+        return (int) Holder.DISPATCH_MAXIMUM.invokeExact(a, b, out, rank, shape, stridesA, stridesB, stridesC, length, isContiguous, dtypeCode);
+    }
+
+    public static int dispatchMinimum(long a, long b, long out, int rank,
+                                      MemorySegment shape, MemorySegment stridesA, MemorySegment stridesB, MemorySegment stridesC,
+                                      long length, int isContiguous, int dtypeCode) throws Throwable {
+        return (int) Holder.DISPATCH_MINIMUM.invokeExact(a, b, out, rank, shape, stridesA, stridesB, stridesC, length, isContiguous, dtypeCode);
+    }
+
+    public static int dispatchCompare(long a, long b, long out, int rank,
+                                      MemorySegment shape, MemorySegment stridesA, MemorySegment stridesB, MemorySegment stridesC,
+                                      long length, int isContiguous, int dtypeCode, int cmpOp) throws Throwable {
+        return (int) Holder.DISPATCH_COMPARE.invokeExact(a, b, out, rank, shape, stridesA, stridesB, stridesC, length, isContiguous, dtypeCode, cmpOp);
+    }
+
+    public static int dispatchWhere(long cond, long x, long y, long out, int rank,
+                                    MemorySegment shape, MemorySegment stridesCond, MemorySegment stridesX, MemorySegment stridesY, MemorySegment stridesOut,
+                                    long length, int isContiguous, int condDtype, int valDtype) throws Throwable {
+        return (int) Holder.DISPATCH_WHERE.invokeExact(cond, x, y, out, rank, shape, stridesCond, stridesX, stridesY, stridesOut, length, isContiguous, condDtype, valDtype);
+    }
+
+    public static int dispatchCast(long src, long out, long length, int srcDtype, int dstDtype) throws Throwable {
+        return (int) Holder.DISPATCH_CAST.invokeExact(src, out, length, srcDtype, dstDtype);
+    }
+
+    public static int dispatchReduceAxis(long in, long out, int outer, int axisDim, int inner, int reduceOp) throws Throwable {
+        return (int) Holder.DISPATCH_REDUCE_AXIS.invokeExact(in, out, outer, axisDim, inner, reduceOp);
+    }
+
+    public static int dispatchArgmaxAxis(long in, long out, int outer, int axisDim, int inner, int largest) throws Throwable {
+        return (int) Holder.DISPATCH_ARGMAX_AXIS.invokeExact(in, out, outer, axisDim, inner, largest);
+    }
+
+    public static int dispatchBatchedMatmul(long a, long b, long out, int m, int n, int k, int batchRank,
+                                           MemorySegment batchShape, MemorySegment aBatchStrides, MemorySegment bBatchStrides, int flags) throws Throwable {
+        return (int) Holder.DISPATCH_BATCHED_MATMUL.invokeExact(a, b, out, m, n, k, batchRank, batchShape, aBatchStrides, bBatchStrides, flags);
     }
 }

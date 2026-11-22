@@ -239,3 +239,87 @@ pub(crate) fn row_bind_group(
 pub(crate) fn uniform_bytes(p: [u32; 4]) -> Vec<u8> {
     params_bytes(p)
 }
+
+/// Reduces along an arbitrary axis where `inner > 1` (or delegates to `run_rows` if `inner == 1`).
+pub fn run_axis_reduce_f32(
+    op: ReduceOp,
+    id_a: TensorId,
+    id_out: TensorId,
+    outer: u32,
+    axis_size: u32,
+    inner: u32,
+) -> Hc4jResult<()> {
+    if outer == 0 || axis_size == 0 || inner == 0 {
+        return Err(Hc4jError::InvalidParam("outer, axis_size, and inner must be non-zero"));
+    }
+    if inner == 1 {
+        return run_rows(op, Load::Value, id_a, 0, id_out, outer, axis_size);
+    }
+
+    let mgr = manager()?;
+    let engine = mgr.engine();
+    let total_elements = u64::from(outer) * u64::from(axis_size) * u64::from(inner);
+    check_elements(id_a, total_elements)?;
+    let total_outputs = u64::from(outer) * u64::from(inner);
+    check_elements(id_out, total_outputs)?;
+
+    let resident = mgr.acquire_resident(&[id_a, id_out])?;
+    let (a, out) = (&resident.spans[0], &resident.spans[1]);
+
+    let name = format!("reduce_axis_{}", op.name());
+    let pipeline = pipeline_for(engine, &name, &super::shaders::axis_kernel_wgsl(op))?;
+    let total_outputs_u32 = u32::try_from(total_outputs).map_err(|_| Hc4jError::Unsupported("total outputs exceeds u32"))?;
+    let grid = crate::ops::elementwise::grid_for_threads(engine, total_outputs)?;
+
+    let trap = ErrorTrap::push(&engine.device);
+    let recorded = engine.stream.record(1, "reduce (axis)", |rec| {
+        let uniform = rec.uniform(&params_bytes([outer, axis_size, inner, total_outputs_u32]))?;
+        let bg = bind_group(engine, &pipeline, vec![a.binding(), out.binding(), uniform]);
+        rec.dispatch(&pipeline, &bg, grid, total_elements * 4 + total_outputs * 4);
+        Ok(())
+    });
+    let trapped = trap.finish();
+    recorded.and(trapped)
+}
+
+/// Computes argmax or argmin along an arbitrary axis where `inner > 1` (or delegates to `run_row_argmax` if `inner == 1`).
+pub fn run_axis_argmax(
+    id_a: TensorId,
+    id_out: TensorId,
+    outer: u32,
+    axis_size: u32,
+    inner: u32,
+    largest: bool,
+) -> Hc4jResult<()> {
+    if outer == 0 || axis_size == 0 || inner == 0 {
+        return Err(Hc4jError::InvalidParam("outer, axis_size, and inner must be non-zero"));
+    }
+    if inner == 1 {
+        return run_row_argmax(id_a, id_out, outer, axis_size, largest);
+    }
+
+    let mgr = manager()?;
+    let engine = mgr.engine();
+    let total_elements = u64::from(outer) * u64::from(axis_size) * u64::from(inner);
+    check_elements(id_a, total_elements)?;
+    let total_outputs = u64::from(outer) * u64::from(inner);
+    check_elements(id_out, total_outputs)?;
+
+    let resident = mgr.acquire_resident(&[id_a, id_out])?;
+    let (a, out) = (&resident.spans[0], &resident.spans[1]);
+
+    let name = if largest { "reduce_axis_argmax" } else { "reduce_axis_argmin" };
+    let pipeline = pipeline_for(engine, name, &super::shaders::axis_argmax_wgsl(largest))?;
+    let total_outputs_u32 = u32::try_from(total_outputs).map_err(|_| Hc4jError::Unsupported("total outputs exceeds u32"))?;
+    let grid = crate::ops::elementwise::grid_for_threads(engine, total_outputs)?;
+
+    let trap = ErrorTrap::push(&engine.device);
+    let recorded = engine.stream.record(1, "reduce (axis argmax)", |rec| {
+        let uniform = rec.uniform(&params_bytes([outer, axis_size, inner, total_outputs_u32]))?;
+        let bg = bind_group(engine, &pipeline, vec![a.binding(), out.binding(), uniform]);
+        rec.dispatch(&pipeline, &bg, grid, total_elements * 4 + total_outputs * 4);
+        Ok(())
+    });
+    let trapped = trap.finish();
+    recorded.and(trapped)
+}

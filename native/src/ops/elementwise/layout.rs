@@ -28,6 +28,26 @@ impl UnaryElemDims {
             strides_c: [0; 8],
         }
     }
+
+    pub fn contiguous_with_params(length: u32, param_z: u32, param_w: u32) -> Self {
+        Self {
+            params: [length, 1, param_z, param_w],
+            shape: [1; 8],
+            strides_a: [0; 8],
+            strides_c: [0; 8],
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct TernaryElemDims {
+    pub params: [u32; 4],
+    pub shape: [u32; 8],
+    pub strides_cond: [u32; 8],
+    pub strides_x: [u32; 8],
+    pub strides_y: [u32; 8],
+    pub strides_out: [u32; 8],
 }
 
 #[repr(C)]

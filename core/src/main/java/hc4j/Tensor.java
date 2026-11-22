@@ -26,6 +26,7 @@ import hc4j.internal.layout.Rows;
 import hc4j.internal.layout.ValidUtil;
 import hc4j.internal.ops.ArithmeticOps;
 import hc4j.internal.ops.ExponentialOps;
+import hc4j.internal.ops.MathOps;
 import hc4j.internal.ops.MatmulOps;
 import hc4j.internal.ops.NnOps;
 import hc4j.internal.ops.TrigOps;
@@ -1417,25 +1418,961 @@ public class Tensor implements AutoCloseable {
     }
 
     // ------------------------------------------------------------------------------------------
-    // Matmul & Transpose
+    // Extra Math & Clamping Operations
     // ------------------------------------------------------------------------------------------
 
-    public Tensor matmul(Tensor other) {
+    /**
+     * Computes the elementwise absolute value.
+     *
+     * @return absolute value tensor
+     */
+    public Tensor abs() {
         ensureOpen();
-        ValidUtil.requireOperandF32("matmul", dtype);
-        Dims d = ValidUtil.matmulDims(shape, other.getShape(), false, false);
-        Tensor res = empty(DType.f32, d.resultShape());
+        Tensor res = empty(dtype, shape);
         try {
-            return MatmulOps.matmul(this, other, res, false, false);
+            return abs(res);
         } catch (RuntimeException | Error e) {
             res.close();
             throw e;
         }
     }
 
+    /**
+     * Computes the elementwise absolute value into {@code res}.
+     *
+     * @param res destination tensor
+     * @return {@code res}
+     */
+    public Tensor abs(Tensor res) {
+        ensureOpen();
+        return dtype == DType.f32
+                ? MathOps.applyUnaryF32(0, "abs", this, res)
+                : MathOps.applyUnaryI32(0, "abs", this, res, 0, 0);
+    }
+
+    /**
+     * In-place elementwise absolute value.
+     *
+     * @return {@code this}
+     */
+    public Tensor absi() {
+        ensureOpen();
+        validateInPlaceTarget(this);
+        return abs(this);
+    }
+
+    /**
+     * Computes the elementwise negation.
+     *
+     * @return negated tensor
+     */
+    public Tensor neg() {
+        ensureOpen();
+        Tensor res = empty(dtype, shape);
+        try {
+            return neg(res);
+        } catch (RuntimeException | Error e) {
+            res.close();
+            throw e;
+        }
+    }
+
+    /**
+     * Computes the elementwise negation into {@code res}.
+     *
+     * @param res destination tensor
+     * @return {@code res}
+     */
+    public Tensor neg(Tensor res) {
+        ensureOpen();
+        return dtype == DType.f32
+                ? MathOps.applyUnaryF32(1, "neg", this, res)
+                : MathOps.applyUnaryI32(1, "neg", this, res, 0, 0);
+    }
+
+    /**
+     * In-place elementwise negation.
+     *
+     * @return {@code this}
+     */
+    public Tensor negi() {
+        ensureOpen();
+        validateInPlaceTarget(this);
+        return neg(this);
+    }
+
+    /**
+     * Computes the elementwise reciprocal square root {@code 1 / sqrt(x)}.
+     *
+     * @return reciprocal square root tensor
+     */
+    public Tensor rsqrt() {
+        ensureOpen();
+        ValidUtil.requireOperandF32("rsqrt", dtype);
+        Tensor res = empty(dtype, shape);
+        try {
+            return rsqrt(res);
+        } catch (RuntimeException | Error e) {
+            res.close();
+            throw e;
+        }
+    }
+
+    /**
+     * Computes the elementwise reciprocal square root into {@code res}.
+     *
+     * @param res destination tensor
+     * @return {@code res}
+     */
+    public Tensor rsqrt(Tensor res) {
+        ensureOpen();
+        ValidUtil.requireOperandF32("rsqrt", dtype);
+        return MathOps.applyUnaryF32(2, "rsqrt", this, res);
+    }
+
+    /**
+     * Computes the elementwise floor function.
+     *
+     * @return floored tensor
+     */
+    public Tensor floor() {
+        ensureOpen();
+        ValidUtil.requireOperandF32("floor", dtype);
+        Tensor res = empty(dtype, shape);
+        try {
+            return floor(res);
+        } catch (RuntimeException | Error e) {
+            res.close();
+            throw e;
+        }
+    }
+
+    /**
+     * Computes the elementwise floor function into {@code res}.
+     *
+     * @param res destination tensor
+     * @return {@code res}
+     */
+    public Tensor floor(Tensor res) {
+        ensureOpen();
+        ValidUtil.requireOperandF32("floor", dtype);
+        return MathOps.applyUnaryF32(3, "floor", this, res);
+    }
+
+    /**
+     * Computes the elementwise ceiling function.
+     *
+     * @return ceiling tensor
+     */
+    public Tensor ceil() {
+        ensureOpen();
+        ValidUtil.requireOperandF32("ceil", dtype);
+        Tensor res = empty(dtype, shape);
+        try {
+            return ceil(res);
+        } catch (RuntimeException | Error e) {
+            res.close();
+            throw e;
+        }
+    }
+
+    /**
+     * Computes the elementwise ceiling function into {@code res}.
+     *
+     * @param res destination tensor
+     * @return {@code res}
+     */
+    public Tensor ceil(Tensor res) {
+        ensureOpen();
+        ValidUtil.requireOperandF32("ceil", dtype);
+        return MathOps.applyUnaryF32(4, "ceil", this, res);
+    }
+
+    /**
+     * Computes elementwise rounding to the nearest integer.
+     *
+     * @return rounded tensor
+     */
+    public Tensor round() {
+        ensureOpen();
+        ValidUtil.requireOperandF32("round", dtype);
+        Tensor res = empty(dtype, shape);
+        try {
+            return round(res);
+        } catch (RuntimeException | Error e) {
+            res.close();
+            throw e;
+        }
+    }
+
+    /**
+     * Computes elementwise rounding to the nearest integer into {@code res}.
+     *
+     * @param res destination tensor
+     * @return {@code res}
+     */
+    public Tensor round(Tensor res) {
+        ensureOpen();
+        ValidUtil.requireOperandF32("round", dtype);
+        return MathOps.applyUnaryF32(5, "round", this, res);
+    }
+
+    /**
+     * Computes the elementwise signum (-1, 0, or 1).
+     *
+     * @return signum tensor
+     */
+    public Tensor sign() {
+        ensureOpen();
+        Tensor res = empty(dtype, shape);
+        try {
+            return sign(res);
+        } catch (RuntimeException | Error e) {
+            res.close();
+            throw e;
+        }
+    }
+
+    /**
+     * Computes the elementwise signum into {@code res}.
+     *
+     * @param res destination tensor
+     * @return {@code res}
+     */
+    public Tensor sign(Tensor res) {
+        ensureOpen();
+        return dtype == DType.f32
+                ? MathOps.applyUnaryF32(6, "sign", this, res)
+                : MathOps.applyUnaryI32(2, "sign", this, res, 0, 0);
+    }
+
+    /**
+     * In-place elementwise signum.
+     *
+     * @return {@code this}
+     */
+    public Tensor signi() {
+        ensureOpen();
+        validateInPlaceTarget(this);
+        return sign(this);
+    }
+
+    /**
+     * Clamps values to the range {@code [min, max]}.
+     *
+     * @param min minimum value
+     * @param max maximum value
+     * @return clamped tensor
+     */
+    public Tensor clamp(float min, float max) {
+        ensureOpen();
+        ValidUtil.requireOperandF32("clamp", dtype);
+        Tensor res = empty(dtype, shape);
+        try {
+            return clamp(min, max, res);
+        } catch (RuntimeException | Error e) {
+            res.close();
+            throw e;
+        }
+    }
+
+    /**
+     * Clamps values to the range {@code [min, max]} into {@code res}.
+     *
+     * @param min minimum value
+     * @param max maximum value
+     * @param res destination tensor
+     * @return {@code res}
+     */
+    public Tensor clamp(float min, float max, Tensor res) {
+        ensureOpen();
+        ValidUtil.requireOperandF32("clamp", dtype);
+        return MathOps.clampF32(this, min, max, res);
+    }
+
+    /**
+     * In-place clamping to the range {@code [min, max]}.
+     *
+     * @param min minimum value
+     * @param max maximum value
+     * @return {@code this}
+     */
+    public Tensor clampi(float min, float max) {
+        ensureOpen();
+        validateInPlaceTarget(this);
+        return clamp(min, max, this);
+    }
+
+    /**
+     * Clamps values to the integer range {@code [min, max]}.
+     *
+     * @param min minimum value
+     * @param max maximum value
+     * @return clamped tensor
+     */
+    public Tensor clamp(int min, int max) {
+        ensureOpen();
+        if (dtype != DType.i32) {
+            throw new IllegalArgumentException("clamp(int, int) requires an i32 tensor, got " + dtype);
+        }
+        Tensor res = empty(dtype, shape);
+        try {
+            return clamp(min, max, res);
+        } catch (RuntimeException | Error e) {
+            res.close();
+            throw e;
+        }
+    }
+
+    /**
+     * Clamps values to the integer range {@code [min, max]} into {@code res}.
+     *
+     * @param min minimum value
+     * @param max maximum value
+     * @param res destination tensor
+     * @return {@code res}
+     */
+    public Tensor clamp(int min, int max, Tensor res) {
+        ensureOpen();
+        if (dtype != DType.i32) {
+            throw new IllegalArgumentException("clamp(int, int) requires an i32 tensor, got " + dtype);
+        }
+        return MathOps.applyUnaryI32(3, "clamp", this, res, min, max);
+    }
+
+    /**
+     * In-place clamping to the integer range {@code [min, max]}.
+     *
+     * @param min minimum value
+     * @param max maximum value
+     * @return {@code this}
+     */
+    public Tensor clampi(int min, int max) {
+        ensureOpen();
+        validateInPlaceTarget(this);
+        return clamp(min, max, this);
+    }
+
+    /**
+     * Alias for {@link #clamp(float, float)}.
+     *
+     * @param min minimum value
+     * @param max maximum value
+     * @return clipped tensor
+     */
+    public Tensor clip(float min, float max) { return clamp(min, max); }
+
+    /**
+     * Alias for {@link #clamp(float, float, Tensor)}.
+     *
+     * @param min minimum value
+     * @param max maximum value
+     * @param res destination tensor
+     * @return {@code res}
+     */
+    public Tensor clip(float min, float max, Tensor res) { return clamp(min, max, res); }
+
+    /**
+     * Alias for {@link #clampi(float, float)}.
+     *
+     * @param min minimum value
+     * @param max maximum value
+     * @return {@code this}
+     */
+    public Tensor clipi(float min, float max) { return clampi(min, max); }
+
+    /**
+     * Alias for {@link #clamp(int, int)}.
+     *
+     * @param min minimum value
+     * @param max maximum value
+     * @return clipped tensor
+     */
+    public Tensor clip(int min, int max) { return clamp(min, max); }
+
+    /**
+     * Alias for {@link #clamp(int, int, Tensor)}.
+     *
+     * @param min minimum value
+     * @param max maximum value
+     * @param res destination tensor
+     * @return {@code res}
+     */
+    public Tensor clip(int min, int max, Tensor res) { return clamp(min, max, res); }
+
+    /**
+     * Alias for {@link #clampi(int, int)}.
+     *
+     * @param min minimum value
+     * @param max maximum value
+     * @return {@code this}
+     */
+    public Tensor clipi(int min, int max) { return clampi(min, max); }
+
+    // ------------------------------------------------------------------------------------------
+    // Functional Binary Math: pow, maximum, minimum
+    // ------------------------------------------------------------------------------------------
+
+    /**
+     * Computes the elementwise power {@code this ^ other} with broadcasting.
+     *
+     * @param other exponent tensor
+     * @return result tensor
+     */
+    public Tensor pow(Tensor other) {
+        ensureOpen();
+        ValidUtil.requireOperandF32("pow", dtype);
+        int[] outShape = ValidUtil.broadcastShape(shape, other.getShape());
+        Tensor res = empty(DType.f32, outShape);
+        try {
+            return pow(other, res);
+        } catch (RuntimeException | Error e) {
+            res.close();
+            throw e;
+        }
+    }
+
+    /**
+     * Computes the elementwise power {@code this ^ other} into {@code res}.
+     *
+     * @param other exponent tensor
+     * @param res destination tensor
+     * @return {@code res}
+     */
+    public Tensor pow(Tensor other, Tensor res) {
+        ensureOpen();
+        return MathOps.pow(this, other, res);
+    }
+
+    /**
+     * Computes the elementwise power with a scalar exponent.
+     *
+     * @param exponent scalar exponent
+     * @return result tensor
+     */
+    public Tensor pow(float exponent) {
+        try (Tensor s = fromArray(new float[]{exponent}, 1)) {
+            return pow(s);
+        }
+    }
+
+    /**
+     * Computes the elementwise maximum with {@code other} with broadcasting.
+     *
+     * @param other right operand
+     * @return result tensor
+     */
+    public Tensor maximum(Tensor other) {
+        ensureOpen();
+        int[] outShape = ValidUtil.broadcastShape(shape, other.getShape());
+        Tensor res = empty(dtype, outShape);
+        try {
+            return maximum(other, res);
+        } catch (RuntimeException | Error e) {
+            res.close();
+            throw e;
+        }
+    }
+
+    /**
+     * Computes the elementwise maximum with {@code other} into {@code res}.
+     *
+     * @param other right operand
+     * @param res destination tensor
+     * @return {@code res}
+     */
+    public Tensor maximum(Tensor other, Tensor res) {
+        ensureOpen();
+        return MathOps.maxMin(true, this, other, res);
+    }
+
+    /**
+     * Computes the elementwise maximum with a float scalar.
+     *
+     * @param scalar float scalar
+     * @return result tensor
+     */
+    public Tensor maximum(float scalar) {
+        try (Tensor s = fromArray(new float[]{scalar}, 1)) {
+            return maximum(s);
+        }
+    }
+
+    /**
+     * Computes the elementwise maximum with an int scalar.
+     *
+     * @param scalar int scalar
+     * @return result tensor
+     */
+    public Tensor maximum(int scalar) {
+        try (Tensor s = fromArray(new int[]{scalar}, 1)) {
+            return maximum(s);
+        }
+    }
+
+    /**
+     * Computes the elementwise minimum with {@code other} with broadcasting.
+     *
+     * @param other right operand
+     * @return result tensor
+     */
+    public Tensor minimum(Tensor other) {
+        ensureOpen();
+        int[] outShape = ValidUtil.broadcastShape(shape, other.getShape());
+        Tensor res = empty(dtype, outShape);
+        try {
+            return minimum(other, res);
+        } catch (RuntimeException | Error e) {
+            res.close();
+            throw e;
+        }
+    }
+
+    /**
+     * Computes the elementwise minimum with {@code other} into {@code res}.
+     *
+     * @param other right operand
+     * @param res destination tensor
+     * @return {@code res}
+     */
+    public Tensor minimum(Tensor other, Tensor res) {
+        ensureOpen();
+        return MathOps.maxMin(false, this, other, res);
+    }
+
+    /**
+     * Computes the elementwise minimum with a float scalar.
+     *
+     * @param scalar float scalar
+     * @return result tensor
+     */
+    public Tensor minimum(float scalar) {
+        try (Tensor s = fromArray(new float[]{scalar}, 1)) {
+            return minimum(s);
+        }
+    }
+
+    /**
+     * Computes the elementwise minimum with an int scalar.
+     *
+     * @param scalar int scalar
+     * @return result tensor
+     */
+    public Tensor minimum(int scalar) {
+        try (Tensor s = fromArray(new int[]{scalar}, 1)) {
+            return minimum(s);
+        }
+    }
+
+    // ------------------------------------------------------------------------------------------
+    // Comparison Operations (returning DType.i32 0/1 mask)
+    // ------------------------------------------------------------------------------------------
+
+    private Tensor compareFresh(int cmpOp, String opName, Tensor other) {
+        ensureOpen();
+        int[] outShape = ValidUtil.broadcastShape(shape, other.getShape());
+        Tensor res = empty(DType.i32, outShape);
+        try {
+            return MathOps.compare(cmpOp, opName, this, other, res);
+        } catch (RuntimeException | Error e) {
+            res.close();
+            throw e;
+        }
+    }
+
+    /**
+     * Elementwise equal-to comparison {@code this == other}.
+     *
+     * @param other right operand
+     * @return i32 mask tensor (1 if true, 0 if false)
+     */
+    public Tensor eq(Tensor other) { return compareFresh(0, "eq", other); }
+
+    /**
+     * Elementwise equal-to comparison into {@code res}.
+     *
+     * @param other right operand
+     * @param res destination i32 tensor
+     * @return {@code res}
+     */
+    public Tensor eq(Tensor other, Tensor res) { ensureOpen(); return MathOps.compare(0, "eq", this, other, res); }
+
+    /**
+     * Elementwise equal-to comparison with float scalar.
+     *
+     * @param scalar float scalar
+     * @return i32 mask tensor
+     */
+    public Tensor eq(float scalar) {
+        try (Tensor s = fromArray(new float[]{scalar}, 1)) { return eq(s); }
+    }
+
+    /**
+     * Elementwise equal-to comparison with int scalar.
+     *
+     * @param scalar int scalar
+     * @return i32 mask tensor
+     */
+    public Tensor eq(int scalar) {
+        try (Tensor s = fromArray(new int[]{scalar}, 1)) { return eq(s); }
+    }
+
+    /**
+     * Elementwise not-equal comparison {@code this != other}.
+     *
+     * @param other right operand
+     * @return i32 mask tensor
+     */
+    public Tensor ne(Tensor other) { return compareFresh(1, "ne", other); }
+
+    /**
+     * Elementwise not-equal comparison into {@code res}.
+     *
+     * @param other right operand
+     * @param res destination i32 tensor
+     * @return {@code res}
+     */
+    public Tensor ne(Tensor other, Tensor res) { ensureOpen(); return MathOps.compare(1, "ne", this, other, res); }
+
+    /**
+     * Elementwise not-equal comparison with float scalar.
+     *
+     * @param scalar float scalar
+     * @return i32 mask tensor
+     */
+    public Tensor ne(float scalar) {
+        try (Tensor s = fromArray(new float[]{scalar}, 1)) { return ne(s); }
+    }
+
+    /**
+     * Elementwise not-equal comparison with int scalar.
+     *
+     * @param scalar int scalar
+     * @return i32 mask tensor
+     */
+    public Tensor ne(int scalar) {
+        try (Tensor s = fromArray(new int[]{scalar}, 1)) { return ne(s); }
+    }
+
+    /**
+     * Elementwise greater-than comparison {@code this > other}.
+     *
+     * @param other right operand
+     * @return i32 mask tensor
+     */
+    public Tensor gt(Tensor other) { return compareFresh(2, "gt", other); }
+
+    /**
+     * Elementwise greater-than comparison into {@code res}.
+     *
+     * @param other right operand
+     * @param res destination i32 tensor
+     * @return {@code res}
+     */
+    public Tensor gt(Tensor other, Tensor res) { ensureOpen(); return MathOps.compare(2, "gt", this, other, res); }
+
+    /**
+     * Elementwise greater-than comparison with float scalar.
+     *
+     * @param scalar float scalar
+     * @return i32 mask tensor
+     */
+    public Tensor gt(float scalar) {
+        try (Tensor s = fromArray(new float[]{scalar}, 1)) { return gt(s); }
+    }
+
+    /**
+     * Elementwise greater-than comparison with int scalar.
+     *
+     * @param scalar int scalar
+     * @return i32 mask tensor
+     */
+    public Tensor gt(int scalar) {
+        try (Tensor s = fromArray(new int[]{scalar}, 1)) { return gt(s); }
+    }
+
+    /**
+     * Elementwise greater-or-equal comparison {@code this >= other}.
+     *
+     * @param other right operand
+     * @return i32 mask tensor
+     */
+    public Tensor ge(Tensor other) { return compareFresh(3, "ge", other); }
+
+    /**
+     * Elementwise greater-or-equal comparison into {@code res}.
+     *
+     * @param other right operand
+     * @param res destination i32 tensor
+     * @return {@code res}
+     */
+    public Tensor ge(Tensor other, Tensor res) { ensureOpen(); return MathOps.compare(3, "ge", this, other, res); }
+
+    /**
+     * Elementwise greater-or-equal comparison with float scalar.
+     *
+     * @param scalar float scalar
+     * @return i32 mask tensor
+     */
+    public Tensor ge(float scalar) {
+        try (Tensor s = fromArray(new float[]{scalar}, 1)) { return ge(s); }
+    }
+
+    /**
+     * Elementwise greater-or-equal comparison with int scalar.
+     *
+     * @param scalar int scalar
+     * @return i32 mask tensor
+     */
+    public Tensor ge(int scalar) {
+        try (Tensor s = fromArray(new int[]{scalar}, 1)) { return ge(s); }
+    }
+
+    /**
+     * Elementwise less-than comparison {@code this < other}.
+     *
+     * @param other right operand
+     * @return i32 mask tensor
+     */
+    public Tensor lt(Tensor other) { return compareFresh(4, "lt", other); }
+
+    /**
+     * Elementwise less-than comparison into {@code res}.
+     *
+     * @param other right operand
+     * @param res destination i32 tensor
+     * @return {@code res}
+     */
+    public Tensor lt(Tensor other, Tensor res) { ensureOpen(); return MathOps.compare(4, "lt", this, other, res); }
+
+    /**
+     * Elementwise less-than comparison with float scalar.
+     *
+     * @param scalar float scalar
+     * @return i32 mask tensor
+     */
+    public Tensor lt(float scalar) {
+        try (Tensor s = fromArray(new float[]{scalar}, 1)) { return lt(s); }
+    }
+
+    /**
+     * Elementwise less-than comparison with int scalar.
+     *
+     * @param scalar int scalar
+     * @return i32 mask tensor
+     */
+    public Tensor lt(int scalar) {
+        try (Tensor s = fromArray(new int[]{scalar}, 1)) { return lt(s); }
+    }
+
+    /**
+     * Elementwise less-or-equal comparison {@code this <= other}.
+     *
+     * @param other right operand
+     * @return i32 mask tensor
+     */
+    public Tensor le(Tensor other) { return compareFresh(5, "le", other); }
+
+    /**
+     * Elementwise less-or-equal comparison into {@code res}.
+     *
+     * @param other right operand
+     * @param res destination i32 tensor
+     * @return {@code res}
+     */
+    public Tensor le(Tensor other, Tensor res) { ensureOpen(); return MathOps.compare(5, "le", this, other, res); }
+
+    /**
+     * Elementwise less-or-equal comparison with float scalar.
+     *
+     * @param scalar float scalar
+     * @return i32 mask tensor
+     */
+    public Tensor le(float scalar) {
+        try (Tensor s = fromArray(new float[]{scalar}, 1)) { return le(s); }
+    }
+
+    /**
+     * Elementwise less-or-equal comparison with int scalar.
+     *
+     * @param scalar int scalar
+     * @return i32 mask tensor
+     */
+    public Tensor le(int scalar) {
+        try (Tensor s = fromArray(new int[]{scalar}, 1)) { return le(s); }
+    }
+
+    // ------------------------------------------------------------------------------------------
+    // Masked Where (Ternary Select)
+    // ------------------------------------------------------------------------------------------
+
+    /**
+     * Ternary where operation {@code this != 0 ? x : y} with 3-way broadcasting.
+     *
+     * @param x tensor chosen where condition is true (non-zero)
+     * @param y tensor chosen where condition is false (zero)
+     * @return result tensor with values selected from {@code x} or {@code y}
+     */
+    public Tensor where(Tensor x, Tensor y) {
+        ensureOpen();
+        int[] targetShape = ValidUtil.broadcastShape(ValidUtil.broadcastShape(shape, x.getShape()), y.getShape());
+        Tensor res = empty(x.getDType(), targetShape);
+        try {
+            return where(x, y, res);
+        } catch (RuntimeException | Error e) {
+            res.close();
+            throw e;
+        }
+    }
+
+    /**
+     * Ternary where operation {@code this != 0 ? x : y} into {@code res}.
+     *
+     * @param x tensor chosen where condition is true
+     * @param y tensor chosen where condition is false
+     * @param res destination tensor
+     * @return {@code res}
+     */
+    public Tensor where(Tensor x, Tensor y, Tensor res) {
+        ensureOpen();
+        return MathOps.where(this, x, y, res);
+    }
+
+    /**
+     * Ternary where with scalar {@code x} and tensor {@code y}.
+     *
+     * @param x scalar chosen where true
+     * @param y tensor chosen where false
+     * @return result tensor
+     */
+    public Tensor where(float x, Tensor y) {
+        try (Tensor tx = fromArray(new float[]{x}, 1)) { return where(tx, y); }
+    }
+
+    /**
+     * Ternary where with tensor {@code x} and scalar {@code y}.
+     *
+     * @param x tensor chosen where true
+     * @param y scalar chosen where false
+     * @return result tensor
+     */
+    public Tensor where(Tensor x, float y) {
+        try (Tensor ty = fromArray(new float[]{y}, 1)) { return where(x, ty); }
+    }
+
+    /**
+     * Ternary where with scalars {@code x} and {@code y}.
+     *
+     * @param x scalar chosen where true
+     * @param y scalar chosen where false
+     * @return result tensor
+     */
+    public Tensor where(float x, float y) {
+        try (Tensor tx = fromArray(new float[]{x}, 1); Tensor ty = fromArray(new float[]{y}, 1)) { return where(tx, ty); }
+    }
+
+    /**
+     * Ternary where with int scalar {@code x} and tensor {@code y}.
+     *
+     * @param x scalar chosen where true
+     * @param y tensor chosen where false
+     * @return result tensor
+     */
+    public Tensor where(int x, Tensor y) {
+        try (Tensor tx = fromArray(new int[]{x}, 1)) { return where(tx, y); }
+    }
+
+    /**
+     * Ternary where with tensor {@code x} and int scalar {@code y}.
+     *
+     * @param x tensor chosen where true
+     * @param y scalar chosen where false
+     * @return result tensor
+     */
+    public Tensor where(Tensor x, int y) {
+        try (Tensor ty = fromArray(new int[]{y}, 1)) { return where(x, ty); }
+    }
+
+    /**
+     * Ternary where with int scalars {@code x} and {@code y}.
+     *
+     * @param x scalar chosen where true
+     * @param y scalar chosen where false
+     * @return result tensor
+     */
+    public Tensor where(int x, int y) {
+        try (Tensor tx = fromArray(new int[]{x}, 1); Tensor ty = fromArray(new int[]{y}, 1)) { return where(tx, ty); }
+    }
+
+    // ------------------------------------------------------------------------------------------
+    // Type Casting
+    // ------------------------------------------------------------------------------------------
+
+    /**
+     * Casts elements of this tensor to {@code targetDType}.
+     *
+     * @param targetDType desired target data type
+     * @return cast tensor
+     */
+    public Tensor cast(DType targetDType) {
+        ensureOpen();
+        Objects.requireNonNull(targetDType, "targetDType");
+        if (this.dtype == targetDType) {
+            return copy();
+        }
+        Tensor res = empty(targetDType, shape.clone());
+        try {
+            return MathOps.cast(this, targetDType, res);
+        } catch (RuntimeException | Error e) {
+            res.close();
+            throw e;
+        }
+    }
+
+    // ------------------------------------------------------------------------------------------
+    // Matmul & Transpose
+    // ------------------------------------------------------------------------------------------
+
+    /**
+     * Matrix multiplication with {@code other}, supporting 1-D, 2-D, and batched 3-D/4-D+ tensors with broadcasting.
+     *
+     * @param other right operand
+     * @return result tensor
+     */
+    public Tensor matmul(Tensor other) {
+        ensureOpen();
+        ValidUtil.requireOperandF32("matmul", dtype);
+        int[] outShape;
+        if (this.dim() <= 2 && other.dim() <= 2) {
+            Dims d = ValidUtil.matmulDims(shape, other.getShape(), false, false);
+            outShape = d.resultShape();
+        } else {
+            ValidUtil.BatchedMatmulPlan plan = ValidUtil.batchedMatmulPlan(shape, strides, other.getShape(), other.getStrides());
+            outShape = plan.outputShape();
+        }
+        Tensor res = empty(DType.f32, outShape);
+        try {
+            return matmul(other, res);
+        } catch (RuntimeException | Error e) {
+            res.close();
+            throw e;
+        }
+    }
+
+    /**
+     * Matrix multiplication with {@code other} into pre-allocated {@code res}.
+     *
+     * @param other right operand
+     * @param res destination tensor
+     * @return {@code res}
+     */
     public Tensor matmul(Tensor other, Tensor res) {
         ensureOpen();
-        return MatmulOps.matmul(this, other, res, false, false);
+        if (this.dim() <= 2 && other.dim() <= 2) {
+            return MatmulOps.matmul(this, other, res, false, false);
+        } else {
+            return MatmulOps.batchedMatmul(this, other, res, false, false);
+        }
     }
 
     public Tensor transpose() {
@@ -1559,6 +2496,387 @@ public class Tensor implements AutoCloseable {
         } catch (RuntimeException | Error e) {
             res.close();
             throw e;
+        }
+    }
+
+    // ------------------------------------------------------------------------------------------
+    // General Axis Reductions & Statistics
+    // ------------------------------------------------------------------------------------------
+
+    private static int[] computeReducedShape(int[] shape, int normAxis, boolean keepDims) {
+        if (shape.length == 1) {
+            return new int[]{1};
+        }
+        if (keepDims) {
+            int[] out = shape.clone();
+            out[normAxis] = 1;
+            return out;
+        } else {
+            int[] out = new int[shape.length - 1];
+            int idx = 0;
+            for (int i = 0; i < shape.length; i++) {
+                if (i != normAxis) {
+                    out[idx++] = shape[i];
+                }
+            }
+            return out;
+        }
+    }
+
+    /**
+     * Reduces along {@code axis} using summation.
+     *
+     * @param axis reduction axis (can be negative)
+     * @param keepDims whether to retain reduced dimension with size 1
+     * @return reduced tensor
+     */
+    public Tensor sum(int axis, boolean keepDims) {
+        ensureOpen();
+        int normAxis = ValidUtil.normalizeAxis(axis, shape.length);
+        int[] outShape = computeReducedShape(shape, normAxis, keepDims);
+        Tensor res = empty(DType.f32, outShape);
+        try {
+            return MathOps.reduceAxis(this, normAxis, 0, res);
+        } catch (RuntimeException | Error e) {
+            res.close();
+            throw e;
+        }
+    }
+
+    /**
+     * Reduces along {@code axis} using summation with {@code keepDims = false}.
+     *
+     * @param axis reduction axis (can be negative)
+     * @return reduced tensor
+     */
+    public Tensor sum(int axis) { return sum(axis, false); }
+
+    /**
+     * Reduces along {@code axis} using arithmetic mean.
+     *
+     * @param axis reduction axis (can be negative)
+     * @param keepDims whether to retain reduced dimension with size 1
+     * @return reduced tensor
+     */
+    public Tensor mean(int axis, boolean keepDims) {
+        ensureOpen();
+        int normAxis = ValidUtil.normalizeAxis(axis, shape.length);
+        int[] outShape = computeReducedShape(shape, normAxis, keepDims);
+        Tensor res = empty(DType.f32, outShape);
+        try {
+            return MathOps.reduceAxis(this, normAxis, 1, res);
+        } catch (RuntimeException | Error e) {
+            res.close();
+            throw e;
+        }
+    }
+
+    /**
+     * Reduces along {@code axis} using arithmetic mean with {@code keepDims = false}.
+     *
+     * @param axis reduction axis (can be negative)
+     * @return reduced tensor
+     */
+    public Tensor mean(int axis) { return mean(axis, false); }
+
+    /**
+     * Reduces along {@code axis} using maximum value.
+     *
+     * @param axis reduction axis (can be negative)
+     * @param keepDims whether to retain reduced dimension with size 1
+     * @return reduced tensor
+     */
+    public Tensor max(int axis, boolean keepDims) {
+        ensureOpen();
+        int normAxis = ValidUtil.normalizeAxis(axis, shape.length);
+        int[] outShape = computeReducedShape(shape, normAxis, keepDims);
+        Tensor res = empty(DType.f32, outShape);
+        try {
+            return MathOps.reduceAxis(this, normAxis, 2, res);
+        } catch (RuntimeException | Error e) {
+            res.close();
+            throw e;
+        }
+    }
+
+    /**
+     * Reduces along {@code axis} using maximum value with {@code keepDims = false}.
+     *
+     * @param axis reduction axis (can be negative)
+     * @return reduced tensor
+     */
+    public Tensor max(int axis) { return max(axis, false); }
+
+    /**
+     * Reduces along {@code axis} using minimum value.
+     *
+     * @param axis reduction axis (can be negative)
+     * @param keepDims whether to retain reduced dimension with size 1
+     * @return reduced tensor
+     */
+    public Tensor min(int axis, boolean keepDims) {
+        ensureOpen();
+        int normAxis = ValidUtil.normalizeAxis(axis, shape.length);
+        int[] outShape = computeReducedShape(shape, normAxis, keepDims);
+        Tensor res = empty(DType.f32, outShape);
+        try {
+            return MathOps.reduceAxis(this, normAxis, 3, res);
+        } catch (RuntimeException | Error e) {
+            res.close();
+            throw e;
+        }
+    }
+
+    /**
+     * Reduces along {@code axis} using minimum value with {@code keepDims = false}.
+     *
+     * @param axis reduction axis (can be negative)
+     * @return reduced tensor
+     */
+    public Tensor min(int axis) { return min(axis, false); }
+
+    /**
+     * Reduces along {@code axis} using multiplication product.
+     *
+     * @param axis reduction axis (can be negative)
+     * @param keepDims whether to retain reduced dimension with size 1
+     * @return reduced tensor
+     */
+    public Tensor prod(int axis, boolean keepDims) {
+        ensureOpen();
+        int normAxis = ValidUtil.normalizeAxis(axis, shape.length);
+        int[] outShape = computeReducedShape(shape, normAxis, keepDims);
+        Tensor res = empty(DType.f32, outShape);
+        try {
+            return MathOps.reduceAxis(this, normAxis, 4, res);
+        } catch (RuntimeException | Error e) {
+            res.close();
+            throw e;
+        }
+    }
+
+    /**
+     * Reduces along {@code axis} using multiplication product with {@code keepDims = false}.
+     *
+     * @param axis reduction axis (can be negative)
+     * @return reduced tensor
+     */
+    public Tensor prod(int axis) { return prod(axis, false); }
+
+    /**
+     * Computes the index of the maximum value along {@code axis}.
+     *
+     * @param axis reduction axis (can be negative)
+     * @param keepDims whether to retain reduced dimension with size 1
+     * @return i32 indices tensor
+     */
+    public Tensor argmax(int axis, boolean keepDims) {
+        ensureOpen();
+        int normAxis = ValidUtil.normalizeAxis(axis, shape.length);
+        int[] outShape = computeReducedShape(shape, normAxis, keepDims);
+        Tensor res = empty(DType.i32, outShape);
+        try {
+            return MathOps.argmaxAxis(this, normAxis, true, res);
+        } catch (RuntimeException | Error e) {
+            res.close();
+            throw e;
+        }
+    }
+
+    /**
+     * Computes the index of the maximum value along {@code axis} with {@code keepDims = false}.
+     *
+     * @param axis reduction axis (can be negative)
+     * @return i32 indices tensor
+     */
+    public Tensor argmax(int axis) { return argmax(axis, false); }
+
+    /**
+     * Computes the index of the minimum value along {@code axis}.
+     *
+     * @param axis reduction axis (can be negative)
+     * @param keepDims whether to retain reduced dimension with size 1
+     * @return i32 indices tensor
+     */
+    public Tensor argmin(int axis, boolean keepDims) {
+        ensureOpen();
+        int normAxis = ValidUtil.normalizeAxis(axis, shape.length);
+        int[] outShape = computeReducedShape(shape, normAxis, keepDims);
+        Tensor res = empty(DType.i32, outShape);
+        try {
+            return MathOps.argmaxAxis(this, normAxis, false, res);
+        } catch (RuntimeException | Error e) {
+            res.close();
+            throw e;
+        }
+    }
+
+    /**
+     * Computes the index of the minimum value along {@code axis} with {@code keepDims = false}.
+     *
+     * @param axis reduction axis (can be negative)
+     * @return i32 indices tensor
+     */
+    public Tensor argmin(int axis) { return argmin(axis, false); }
+
+    /**
+     * Computes the global product of all elements.
+     *
+     * @return product scalar value
+     */
+    public float prod() { return reduceToScalar(Reduction.PROD); }
+
+    /**
+     * Computes the global product of all elements into {@code res}.
+     *
+     * @param res destination tensor of size 1
+     * @return {@code res}
+     */
+    public Tensor prod(Tensor res) { ensureOpen(); return NnOps.reduce(Reduction.PROD, this, res); }
+
+    /**
+     * Computes the product along the rows (axis 0 of a 2-D matrix).
+     *
+     * @return reduced tensor
+     */
+    public Tensor prodRows() { return reduceRowsFresh(Reduction.PROD); }
+
+    /**
+     * Computes the product along the rows into {@code res}.
+     *
+     * @param res destination tensor
+     * @return {@code res}
+     */
+    public Tensor prodRows(Tensor res) { ensureOpen(); return NnOps.reduceRows(Reduction.PROD, this, res); }
+
+    /**
+     * Computes the Frobenius (L2) Euclidean norm of this tensor.
+     *
+     * @return scalar norm as a 1-D tensor of shape {@code [1]}
+     */
+    public Tensor norm() {
+        ensureOpen();
+        ValidUtil.requireOperandF32("norm", dtype);
+        Tensor res = empty(DType.f32, 1);
+        try {
+            NnOps.reduceSquare(Reduction.SUM, this, res);
+            return res.sqrt();
+        } finally {
+            res.close();
+        }
+    }
+
+    /**
+     * Computes the variance of elements with delta degrees of freedom {@code ddof}.
+     *
+     * @param ddof delta degrees of freedom (0 for population variance, 1 for sample variance)
+     * @return scalar variance as a 1-D tensor of shape {@code [1]}
+     */
+    public Tensor var(int ddof) {
+        ensureOpen();
+        ValidUtil.requireOperandF32("var", dtype);
+        if (ddof < 0 || size <= ddof) {
+            throw new IllegalArgumentException("ddof must be non-negative and < total elements (" + size + "), got " + ddof);
+        }
+        float m = this.mean();
+        try (Tensor diff = this.sub(m);
+             Tensor sq = diff.mul(diff)) {
+            float sumSq = sq.sum();
+            float v = sumSq / (size - ddof);
+            return fromArray(new float[]{v}, 1);
+        }
+    }
+
+    /**
+     * Computes the population variance (ddof = 0).
+     *
+     * @return scalar variance as a 1-D tensor of shape {@code [1]}
+     */
+    public Tensor var() { return var(0); }
+
+    /**
+     * Computes the standard deviation with delta degrees of freedom {@code ddof}.
+     *
+     * @param ddof delta degrees of freedom
+     * @return scalar standard deviation as a 1-D tensor of shape {@code [1]}
+     */
+    public Tensor std(int ddof) {
+        ensureOpen();
+        try (Tensor v = var(ddof)) {
+            return v.sqrt();
+        }
+    }
+
+    /**
+     * Computes the population standard deviation (ddof = 0).
+     *
+     * @return scalar standard deviation as a 1-D tensor of shape {@code [1]}
+     */
+    public Tensor std() { return std(0); }
+
+    /**
+     * Extracts the main diagonal of a 2-D matrix as a zero-copy strided 1-D view.
+     *
+     * @return 1-D diagonal view tensor
+     */
+    public Tensor diagonal() {
+        ensureOpen();
+        if (shape.length != 2) {
+            throw new IllegalArgumentException("diagonal requires a 2-D tensor, got shape " + Arrays.toString(shape));
+        }
+        int d = Math.min(shape[0], shape[1]);
+        int diagStride = strides[0] + strides[1];
+        handle.retain();
+        return new Tensor(dtype, new int[]{d}, new int[]{diagStride}, elementOffset, handle);
+    }
+
+    /**
+     * Computes the trace (sum of diagonal elements) of a 2-D matrix.
+     *
+     * @return scalar trace as a 1-D tensor of shape {@code [1]}
+     */
+    public Tensor trace() {
+        ensureOpen();
+        try (Tensor diag = diagonal()) {
+            Tensor res = empty(dtype, 1);
+            return NnOps.reduce(Reduction.SUM, diag, res);
+        }
+    }
+
+    /**
+     * Computes the dot product with {@code other}.
+     *
+     * @param other right operand
+     * @return scalar dot product as a 1-D tensor of shape {@code [1]}
+     */
+    public Tensor dot(Tensor other) {
+        ensureOpen();
+        ValidUtil.requireOperandF32("dot", dtype);
+        ValidUtil.requireOperandF32("dot", other.getDType());
+        if (shape.length == 1 && other.getShape().length == 1) {
+            try (Tensor prod = this.mul(other)) {
+                Tensor res = empty(DType.f32, 1);
+                return NnOps.reduce(Reduction.SUM, prod, res);
+            }
+        }
+        return this.matmul(other);
+    }
+
+    /**
+     * Computes the cosine similarity with {@code other}.
+     *
+     * @param other right operand
+     * @return scalar similarity as a 1-D tensor of shape {@code [1]}
+     */
+    public Tensor cosineSimilarity(Tensor other) {
+        ensureOpen();
+        ValidUtil.requireOperandF32("cosineSimilarity", dtype);
+        ValidUtil.requireOperandF32("cosineSimilarity", other.getDType());
+        try (Tensor dotProd = this.dot(other);
+             Tensor normA = this.norm();
+             Tensor normB = other.norm();
+             Tensor denom = normA.mul(normB)) {
+            return dotProd.div(denom);
         }
     }
 

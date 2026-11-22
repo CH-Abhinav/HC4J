@@ -7,10 +7,17 @@ use naga::valid::{Capabilities, ValidationFlags, Validator};
 use super::arithmetic::{DataType, generate_elem_shader};
 use super::elementwise::{COPY_STRIDED_WGSL, generate_unary_shader, generate_unary_shader_with};
 use super::nn::{Activation, RowOp, row_bias_wgsl};
-use super::reduce::{Load, ReduceOp, flat_kernel_wgsl, row_argmax_wgsl, row_kernel_wgsl};
+use super::reduce::{
+    Load, ReduceOp, axis_argmax_wgsl, axis_kernel_wgsl, flat_kernel_wgsl, row_argmax_wgsl, row_kernel_wgsl,
+};
 use super::fusion::{self, op};
 use super::matmul::{
-    TILE_64, TILE_128, TILED16_WGSL, TRANSPOSE_WGSL, gemv_cols_wgsl, gemv_rows_wgsl, register_kernel_wgsl,
+    BATCHED_TILED16_WGSL, TILE_64, TILE_128, TILED16_WGSL, TRANSPOSE_WGSL, gemv_cols_wgsl, gemv_rows_wgsl,
+    register_kernel_wgsl,
+};
+use super::math::{
+    CAST_F32_TO_I32_WGSL, CAST_I32_TO_F32_WGSL, generate_compare_shader, generate_functional_binary_shader,
+    generate_unary_i32_shader, generate_where_shader,
 };
 
 fn validate_with(name: &str, wgsl: &str, capabilities: Capabilities) {
@@ -30,11 +37,17 @@ fn validate(name: &str, wgsl: &str) {
 fn unary_suites() {
     let ops = [
         "sin", "cos", "tan", "asin", "acos", "atan", "sinh", "cosh", "tanh", "asinh", "acosh", "atanh", "exp", "log",
-        "log2", "0.4342944819032518 * log", "sqrt",
+        "log2", "0.4342944819032518 * log", "sqrt", "abs", "floor", "ceil", "round", "inverseSqrt",
     ];
     for op in ops {
         validate(op, &generate_unary_shader(op));
     }
+    let sign_f32_shader = generate_unary_shader_with(
+        super::math::SIGN_F32_PRELUDE,
+        "sign4_f32",
+        "sign1_f32",
+    );
+    validate("sign_f32", &sign_f32_shader);
 }
 
 #[test]
@@ -184,3 +197,58 @@ fn fused_activations_define_only_the_helpers_they_use() {
     assert!(!wgsl.contains("hc4j_"), "a CONST payload must not define a helper");
     validate("fused const payload", &wgsl);
 }
+
+#[test]
+fn batched_gemm_shader() {
+    validate("batched_tiled16", BATCHED_TILED16_WGSL);
+}
+
+#[test]
+fn unary_i32_suite() {
+    for op in 0..4 {
+        validate(&format!("unary_i32_{op}"), &generate_unary_i32_shader(op));
+    }
+}
+
+#[test]
+fn functional_binary_suite() {
+    validate("pow_f32", &generate_functional_binary_shader(DataType::F32, "pow"));
+    for dt in [DataType::F32, DataType::I32] {
+        validate(&format!("max_{dt:?}"), &generate_functional_binary_shader(dt, "max"));
+        validate(&format!("min_{dt:?}"), &generate_functional_binary_shader(dt, "min"));
+    }
+}
+
+#[test]
+fn compare_suite() {
+    for dt in [DataType::F32, DataType::I32] {
+        for cmp_op in 0..6 {
+            validate(&format!("compare_{dt:?}_{cmp_op}"), &generate_compare_shader(dt, cmp_op).unwrap());
+        }
+    }
+}
+
+#[test]
+fn where_suite() {
+    for cond_dt in [DataType::F32, DataType::I32] {
+        for val_dt in [DataType::F32, DataType::I32] {
+            validate(&format!("where_{cond_dt:?}_{val_dt:?}"), &generate_where_shader(cond_dt, val_dt));
+        }
+    }
+}
+
+#[test]
+fn cast_suite() {
+    validate("cast_f32_to_i32", CAST_F32_TO_I32_WGSL);
+    validate("cast_i32_to_f32", CAST_I32_TO_F32_WGSL);
+}
+
+#[test]
+fn axis_reductions_suite() {
+    for op in [ReduceOp::Sum, ReduceOp::Mean, ReduceOp::Max, ReduceOp::Min, ReduceOp::Prod] {
+        validate(&format!("axis_reduce_{}", op.name()), &axis_kernel_wgsl(op));
+    }
+    validate("axis_argmax", &axis_argmax_wgsl(true));
+    validate("axis_argmin", &axis_argmax_wgsl(false));
+}
+

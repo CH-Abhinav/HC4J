@@ -75,31 +75,90 @@ public final class Linalg {
     }
 
     /**
-     * Matrix multiplication {@code a · b}.
+     * Matrix multiplication {@code a · b}, supporting 1-D, 2-D, and batched 3-D/4-D+ tensors with broadcasting.
+     *
+     * @param a left operand
+     * @param b right operand
+     * @return result tensor
      */
     public static Tensor matmul(Tensor a, Tensor b) {
         Objects.requireNonNull(a, "a");
         Objects.requireNonNull(b, "b");
-        TensorAccess access = TensorAccess.getInstance();
-        access.ensureOpen(a);
-        access.ensureOpen(b);
-        Dims d = ValidUtil.matmulDims(access.getShapeUnsafe(a), access.getShapeUnsafe(b), false, false);
-        ValidUtil.requireOperandF32("matmul", a.getDType());
-        ValidUtil.requireOperandF32("matmul", b.getDType());
-        Tensor res = Tensor.empty(DType.f32, d.resultShape());
-        try {
-            return MatmulOps.matmul(a, b, res, false, false);
-        } catch (RuntimeException | Error e) {
-            res.close();
-            throw e;
-        }
+        return a.matmul(b);
     }
 
     /**
-     * Matrix multiplication into {@code out}.
+     * Matrix multiplication into {@code out}, supporting 1-D, 2-D, and batched 3-D/4-D+ tensors with broadcasting.
+     *
+     * @param a left operand
+     * @param b right operand
+     * @param out destination tensor
+     * @return {@code out}
      */
     public static Tensor matmul(Tensor a, Tensor b, Tensor out) {
-        return MatmulOps.matmul(a, b, out, false, false);
+        Objects.requireNonNull(a, "a");
+        Objects.requireNonNull(b, "b");
+        Objects.requireNonNull(out, "out");
+        return a.matmul(b, out);
+    }
+
+    /**
+     * Dot product between two tensors.
+     *
+     * @param a first operand
+     * @param b second operand
+     * @return scalar dot product as a 1-D tensor of shape {@code [1]}
+     */
+    public static Tensor dot(Tensor a, Tensor b) {
+        Objects.requireNonNull(a, "a");
+        Objects.requireNonNull(b, "b");
+        return a.dot(b);
+    }
+
+    /**
+     * Computes the Frobenius (L2) Euclidean norm of a tensor.
+     *
+     * @param a operand tensor
+     * @return norm scalar as a 1-D tensor of shape {@code [1]}
+     */
+    public static Tensor norm(Tensor a) {
+        Objects.requireNonNull(a, "a");
+        return a.norm();
+    }
+
+    /**
+     * Extracts the main diagonal of a 2-D matrix.
+     *
+     * @param a 2-D matrix tensor
+     * @return 1-D tensor view containing diagonal elements
+     */
+    public static Tensor diagonal(Tensor a) {
+        Objects.requireNonNull(a, "a");
+        return a.diagonal();
+    }
+
+    /**
+     * Computes the trace (sum of diagonal elements) of a 2-D matrix.
+     *
+     * @param a 2-D matrix tensor
+     * @return scalar trace as a 1-D tensor of shape {@code [1]}
+     */
+    public static Tensor trace(Tensor a) {
+        Objects.requireNonNull(a, "a");
+        return a.trace();
+    }
+
+    /**
+     * Computes the cosine similarity between two tensors.
+     *
+     * @param a first operand
+     * @param b second operand
+     * @return scalar similarity as a 1-D tensor of shape {@code [1]}
+     */
+    public static Tensor cosineSimilarity(Tensor a, Tensor b) {
+        Objects.requireNonNull(a, "a");
+        Objects.requireNonNull(b, "b");
+        return a.cosineSimilarity(b);
     }
 
     /**

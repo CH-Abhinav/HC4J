@@ -434,7 +434,7 @@ class TensorViewsAndBroadcastTest {
         }
 
         try (Tensor arangeF = Tensor.arange(0f, 1f, 0.25f)) {
-            assertArrayEquals(new float[]{0f, 0.25f, 0.5f, 0.7f}, arangeF.toArray(), 0.1f);
+            assertArrayEquals(new float[]{0f, 0.25f, 0.5f, 0.75f}, arangeF.toArray(), 1e-5f);
         }
 
         try (Tensor ls = Tensor.linspace(0f, 10f, 5)) {

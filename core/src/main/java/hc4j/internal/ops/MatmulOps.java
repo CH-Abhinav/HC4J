@@ -24,6 +24,9 @@ import hc4j.internal.ffi.TensorAccess;
 import hc4j.internal.layout.Dims;
 import hc4j.internal.layout.ValidUtil;
 import hc4j.linalg.Linalg;
+import java.lang.foreign.Arena;
+import java.lang.foreign.MemorySegment;
+import java.lang.foreign.ValueLayout;
 import java.util.Objects;
 
 /**
@@ -95,6 +98,70 @@ public final class MatmulOps {
         } catch (Throwable t) {
             if (t instanceof RuntimeException re) throw re;
             throw new RuntimeException("HC4J native matmul failed", t);
+        }
+    }
+
+    public static Tensor batchedMatmul(Tensor a, Tensor b, Tensor res, boolean transposeA, boolean transposeB) {
+        Objects.requireNonNull(a, "a");
+        Objects.requireNonNull(b, "b");
+        Objects.requireNonNull(res, "res");
+
+        TensorAccess access = TensorAccess.getInstance();
+        access.ensureOpen(a);
+        access.ensureOpen(b);
+        access.ensureOpen(res);
+
+        if (access.elementOffset(a) > 0) {
+            try (Tensor contigA = a.contiguous()) {
+                return batchedMatmul(contigA, b, res, transposeA, transposeB);
+            }
+        }
+        if (access.elementOffset(b) > 0) {
+            try (Tensor contigB = b.contiguous()) {
+                return batchedMatmul(a, contigB, res, transposeA, transposeB);
+            }
+        }
+        if (!res.isContiguous() || access.elementOffset(res) != 0) {
+            throw new IllegalArgumentException("Output tensor must be contiguous with zero offset");
+        }
+
+        ValidUtil.requireOperandF32("batched matmul", a.getDType());
+        ValidUtil.requireOperandF32("batched matmul", b.getDType());
+        ValidUtil.requireResultDType(DType.f32, res.getDType());
+
+        int[] sa = access.getShapeUnsafe(a);
+        int[] sta = access.getStridesUnsafe(a);
+        int[] sb = access.getShapeUnsafe(b);
+        int[] stb = access.getStridesUnsafe(b);
+
+        ValidUtil.BatchedMatmulPlan plan = ValidUtil.batchedMatmulPlan(sa, sta, sb, stb);
+        ValidUtil.requireResultShape(plan.outputShape(), access.getShapeUnsafe(res));
+
+        long idA = access.getVramId(a);
+        long idB = access.getVramId(b);
+        long idRes = access.getVramId(res);
+
+        ValidUtil.requireNoAlias(idRes, idA, "batched matmul result must not alias an operand");
+        ValidUtil.requireNoAlias(idRes, idB, "batched matmul result must not alias an operand");
+
+        int batchRank = plan.batchShape().length;
+        try (Arena arena = Arena.ofConfined()) {
+            MemorySegment batchShapeSeg = arena.allocateFrom(ValueLayout.JAVA_INT, plan.batchShape());
+            MemorySegment aBatchStridesSeg = arena.allocateFrom(ValueLayout.JAVA_INT, plan.aBatchStrides());
+            MemorySegment bBatchStridesSeg = arena.allocateFrom(ValueLayout.JAVA_INT, plan.bBatchStrides());
+
+            int status = NativeBindings.dispatchBatchedMatmul(
+                    idA, idB, idRes,
+                    plan.m(), plan.n(), plan.k(),
+                    batchRank,
+                    batchShapeSeg, aBatchStridesSeg, bBatchStridesSeg,
+                    plan.flags()
+            );
+            NativeEngine.checkStatus(status, "MatmulOps.batchedMatmul");
+            return res;
+        } catch (Throwable t) {
+            if (t instanceof RuntimeException re) throw re;
+            throw new RuntimeException("HC4J native batched matmul failed", t);
         }
     }
 

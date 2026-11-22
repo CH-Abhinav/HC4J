@@ -178,6 +178,144 @@ public final class HC4J {
     public static Tensor sqrt(Tensor a) { return a.sqrt(); }
     public static Tensor sqrt(Tensor a, Tensor out) { return a.sqrt(out); }
 
+    // --- Extra Math & Clamping ---
+
+    public static Tensor abs(Tensor a) { return a.abs(); }
+    public static Tensor abs(Tensor a, Tensor out) { return a.abs(out); }
+
+    public static Tensor neg(Tensor a) { return a.neg(); }
+    public static Tensor neg(Tensor a, Tensor out) { return a.neg(out); }
+
+    public static Tensor rsqrt(Tensor a) { return a.rsqrt(); }
+    public static Tensor rsqrt(Tensor a, Tensor out) { return a.rsqrt(out); }
+
+    public static Tensor floor(Tensor a) { return a.floor(); }
+    public static Tensor floor(Tensor a, Tensor out) { return a.floor(out); }
+
+    public static Tensor ceil(Tensor a) { return a.ceil(); }
+    public static Tensor ceil(Tensor a, Tensor out) { return a.ceil(out); }
+
+    public static Tensor round(Tensor a) { return a.round(); }
+    public static Tensor round(Tensor a, Tensor out) { return a.round(out); }
+
+    public static Tensor sign(Tensor a) { return a.sign(); }
+    public static Tensor sign(Tensor a, Tensor out) { return a.sign(out); }
+
+    public static Tensor clamp(Tensor a, float min, float max) { return a.clamp(min, max); }
+    public static Tensor clamp(Tensor a, float min, float max, Tensor out) { return a.clamp(min, max, out); }
+    public static Tensor clamp(Tensor a, int min, int max) { return a.clamp(min, max); }
+    public static Tensor clamp(Tensor a, int min, int max, Tensor out) { return a.clamp(min, max, out); }
+
+    public static Tensor clip(Tensor a, float min, float max) { return a.clip(min, max); }
+    public static Tensor clip(Tensor a, float min, float max, Tensor out) { return a.clip(min, max, out); }
+    public static Tensor clip(Tensor a, int min, int max) { return a.clip(min, max); }
+    public static Tensor clip(Tensor a, int min, int max, Tensor out) { return a.clip(min, max, out); }
+
+    // --- Functional Binary Ops ---
+
+    public static Tensor pow(Tensor a, Tensor b) { return a.pow(b); }
+    public static Tensor pow(Tensor a, Tensor b, Tensor out) { return a.pow(b, out); }
+    public static Tensor pow(Tensor a, float exp) { return a.pow(exp); }
+
+    public static Tensor maximum(Tensor a, Tensor b) { return a.maximum(b); }
+    public static Tensor maximum(Tensor a, Tensor b, Tensor out) { return a.maximum(b, out); }
+    public static Tensor maximum(Tensor a, float s) { return a.maximum(s); }
+    public static Tensor maximum(Tensor a, int s) { return a.maximum(s); }
+
+    public static Tensor minimum(Tensor a, Tensor b) { return a.minimum(b); }
+    public static Tensor minimum(Tensor a, Tensor b, Tensor out) { return a.minimum(b, out); }
+    public static Tensor minimum(Tensor a, float s) { return a.minimum(s); }
+    public static Tensor minimum(Tensor a, int s) { return a.minimum(s); }
+
+    // --- Comparison Ops ---
+
+    public static Tensor eq(Tensor a, Tensor b) { return a.eq(b); }
+    public static Tensor eq(Tensor a, Tensor b, Tensor out) { return a.eq(b, out); }
+    public static Tensor eq(Tensor a, float s) { return a.eq(s); }
+    public static Tensor eq(Tensor a, int s) { return a.eq(s); }
+
+    public static Tensor ne(Tensor a, Tensor b) { return a.ne(b); }
+    public static Tensor ne(Tensor a, Tensor b, Tensor out) { return a.ne(b, out); }
+    public static Tensor ne(Tensor a, float s) { return a.ne(s); }
+    public static Tensor ne(Tensor a, int s) { return a.ne(s); }
+
+    public static Tensor gt(Tensor a, Tensor b) { return a.gt(b); }
+    public static Tensor gt(Tensor a, Tensor b, Tensor out) { return a.gt(b, out); }
+    public static Tensor gt(Tensor a, float s) { return a.gt(s); }
+    public static Tensor gt(Tensor a, int s) { return a.gt(s); }
+
+    public static Tensor ge(Tensor a, Tensor b) { return a.ge(b); }
+    public static Tensor ge(Tensor a, Tensor b, Tensor out) { return a.ge(b, out); }
+    public static Tensor ge(Tensor a, float s) { return a.ge(s); }
+    public static Tensor ge(Tensor a, int s) { return a.ge(s); }
+
+    public static Tensor lt(Tensor a, Tensor b) { return a.lt(b); }
+    public static Tensor lt(Tensor a, Tensor b, Tensor out) { return a.lt(b, out); }
+    public static Tensor lt(Tensor a, float s) { return a.lt(s); }
+    public static Tensor lt(Tensor a, int s) { return a.lt(s); }
+
+    public static Tensor le(Tensor a, Tensor b) { return a.le(b); }
+    public static Tensor le(Tensor a, Tensor b, Tensor out) { return a.le(b, out); }
+    public static Tensor le(Tensor a, float s) { return a.le(s); }
+    public static Tensor le(Tensor a, int s) { return a.le(s); }
+
+    // --- Masked Where ---
+
+    public static Tensor where(Tensor cond, Tensor x, Tensor y) { return cond.where(x, y); }
+    public static Tensor where(Tensor cond, Tensor x, Tensor y, Tensor out) { return cond.where(x, y, out); }
+    public static Tensor where(Tensor cond, float x, Tensor y) { return cond.where(x, y); }
+    public static Tensor where(Tensor cond, Tensor x, float y) { return cond.where(x, y); }
+    public static Tensor where(Tensor cond, float x, float y) { return cond.where(x, y); }
+    public static Tensor where(Tensor cond, int x, Tensor y) { return cond.where(x, y); }
+    public static Tensor where(Tensor cond, Tensor x, int y) { return cond.where(x, y); }
+    public static Tensor where(Tensor cond, int x, int y) { return cond.where(x, y); }
+
+    // --- Type Casting ---
+
+    public static Tensor cast(Tensor a, DType targetDType) { return a.cast(targetDType); }
+
+    // --- Linear Algebra & Matmul ---
+
+    public static Tensor matmul(Tensor a, Tensor b) { return a.matmul(b); }
+    public static Tensor matmul(Tensor a, Tensor b, Tensor out) { return a.matmul(b, out); }
+    public static Tensor dot(Tensor a, Tensor b) { return a.dot(b); }
+    public static Tensor norm(Tensor a) { return a.norm(); }
+    public static Tensor diagonal(Tensor a) { return a.diagonal(); }
+    public static Tensor trace(Tensor a) { return a.trace(); }
+    public static Tensor cosineSimilarity(Tensor a, Tensor b) { return a.cosineSimilarity(b); }
+
+    // --- General Axis Reductions & Statistics ---
+
+    public static float sum(Tensor a) { return a.sum(); }
+    public static Tensor sum(Tensor a, int axis) { return a.sum(axis); }
+    public static Tensor sum(Tensor a, int axis, boolean keepDims) { return a.sum(axis, keepDims); }
+
+    public static float mean(Tensor a) { return a.mean(); }
+    public static Tensor mean(Tensor a, int axis) { return a.mean(axis); }
+    public static Tensor mean(Tensor a, int axis, boolean keepDims) { return a.mean(axis, keepDims); }
+
+    public static Tensor max(Tensor a, int axis) { return a.max(axis); }
+    public static Tensor max(Tensor a, int axis, boolean keepDims) { return a.max(axis, keepDims); }
+
+    public static Tensor min(Tensor a, int axis) { return a.min(axis); }
+    public static Tensor min(Tensor a, int axis, boolean keepDims) { return a.min(axis, keepDims); }
+
+    public static float prod(Tensor a) { return a.prod(); }
+    public static Tensor prod(Tensor a, int axis) { return a.prod(axis); }
+    public static Tensor prod(Tensor a, int axis, boolean keepDims) { return a.prod(axis, keepDims); }
+
+    public static Tensor argmax(Tensor a, int axis) { return a.argmax(axis); }
+    public static Tensor argmax(Tensor a, int axis, boolean keepDims) { return a.argmax(axis, keepDims); }
+
+    public static Tensor argmin(Tensor a, int axis) { return a.argmin(axis); }
+    public static Tensor argmin(Tensor a, int axis, boolean keepDims) { return a.argmin(axis, keepDims); }
+
+    public static Tensor var(Tensor a) { return a.var(); }
+    public static Tensor var(Tensor a, int ddof) { return a.var(ddof); }
+
+    public static Tensor std(Tensor a) { return a.std(); }
+    public static Tensor std(Tensor a, int ddof) { return a.std(ddof); }
+
     // --- Engine Controls ---
 
     public static void synchronize() {
