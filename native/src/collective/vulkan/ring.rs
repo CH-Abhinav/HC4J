@@ -226,6 +226,7 @@ pub(crate) fn hierarchical_allreduce(
                             bandwidth_gbps: link.bandwidth_gbps,
                             transport: link.transport,
                             loopback: link.loopback,
+                            latency_us: link.latency_us,
                         });
                     }
                 }

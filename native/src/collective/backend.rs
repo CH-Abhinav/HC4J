@@ -35,10 +35,10 @@ impl Transport {
 }
 
 // ============================================================================
-// LinkInfo matching the exact 24-byte C-ABI Link layout
+// LinkInfo matching the exact 32-byte C-ABI Link layout
 // ============================================================================
 
-/// One directed edge of the topology graph (exact 24-byte C-ABI layout).
+/// One directed edge of the topology graph (exact 32-byte C-ABI layout).
 #[repr(C)]
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct LinkInfo {
@@ -51,6 +51,8 @@ pub struct LinkInfo {
     /// 1 when both ranks sit on the same physical adapter (loopback), so the
     /// figure is an intra-GPU copy rather than a link between two devices.
     pub loopback: u32,
+    /// Measured fixed ping latency of the hop, in microseconds.
+    pub latency_us: f64,
 }
 
 pub type Link = LinkInfo;
@@ -102,4 +104,14 @@ pub(crate) trait CollectiveBackend: Send + Sync {
     fn device_profiles(&self) -> &[DeviceProfileC];
     fn ring_order(&self) -> &[u32];
     fn islands(&self) -> &[super::planner::IslandInfo];
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_link_info_c_abi_layout_size() {
+        assert_eq!(std::mem::size_of::<LinkInfo>(), 32);
+    }
 }

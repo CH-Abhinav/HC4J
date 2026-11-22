@@ -600,8 +600,26 @@ fn probe_topology(nodes: &[Node]) -> Result<Vec<LinkInfo>, String> {
             let gbps = (PROBE_BYTES as f64 * f64::from(PROBE_ITERATIONS)) / secs / 1e9;
             let loopback = nodes[src].adapter_index == nodes[dst].adapter_index;
 
+            // Quick 4 KiB latency ping (8 iterations)
+            let ping_bytes = 4096u64;
+            let ping_staging = nodes[src].readback(ping_bytes);
+            let mut ping_hop = vec![0u8; ping_bytes as usize];
+            let ping_run = |hop: &mut Vec<u8>| -> Hc4jResult<()> {
+                nodes[src].download_into(&send, 0, &ping_staging, ping_bytes, hop)?;
+                nodes[dst].upload(&recv, 0, hop)
+            };
+            let latency_us = (|| -> Option<f64> {
+                ping_run(&mut ping_hop).ok()?;
+                let t_ping = Instant::now();
+                for _ in 0..8 {
+                    ping_run(&mut ping_hop).ok()?;
+                }
+                let elapsed_secs = t_ping.elapsed().as_secs_f64();
+                Some((elapsed_secs * 1e6 / 8.0).max(1.0))
+            })().unwrap_or(500.0);
+
             eprintln!(
-                "[HC4J] collective rank {src}->{dst}: {gbps:.1} GB/s host-staged, {} peer-class{}",
+                "[HC4J] collective rank {src}->{dst}: {gbps:.1} GB/s ({latency_us:.0} us) host-staged, {} peer-class{}",
                 if is_peer_class(gbps) { "at" } else { "below" },
                 if loopback { " (loopback, same adapter)" } else { "" }
             );
@@ -611,6 +629,7 @@ fn probe_topology(nodes: &[Node]) -> Result<Vec<LinkInfo>, String> {
                 bandwidth_gbps: gbps,
                 transport: Transport::HostStaged.code(),
                 loopback: u32::from(loopback),
+                latency_us,
             });
         }
     }

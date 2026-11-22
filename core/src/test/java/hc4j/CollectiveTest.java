@@ -29,8 +29,11 @@ import hc4j.collective.CollectiveBuffer;
 import hc4j.collective.DeviceProfile;
 import hc4j.collective.Island;
 import hc4j.collective.Link;
+import hc4j.collective.RolePlan;
 import hc4j.collective.ShardAllocation;
+import hc4j.collective.SplitKvSpec;
 import hc4j.collective.WorkloadPlan;
+import hc4j.collective.WorkloadSpec;
 import hc4j.testutil.GpuTestSupport;
 import hc4j.testutil.TestAssertions;
 import java.util.List;
@@ -113,6 +116,7 @@ class CollectiveTest {
                 assertTrue(link.dst() >= 0 && link.dst() < 4);
                 assertNotEquals(link.src(), link.dst());
                 assertTrue(link.gbps() > 0.0, "Link bandwidth must be strictly positive");
+                assertTrue(link.latencyUs() > 0.0, "Link latency must be strictly positive");
                 assertNotNull(link.transport());
                 assertTrue(link.loopback() || !link.loopback()); // boolean valid
             }
@@ -295,6 +299,17 @@ class CollectiveTest {
             assertEquals(10_000L, plan.totalUnits());
             long sum = plan.allocations().stream().mapToLong(ShardAllocation::units).sum();
             assertEquals(10_000L, sum);
+
+            WorkloadSpec spec = WorkloadSpec.prefill(10_000L, 1e9, 1024, 64 << 20);
+            WorkloadPlan specPlan = ring.planWork(spec);
+            assertNotNull(specPlan);
+            assertEquals(10_000L, specPlan.totalUnits());
+
+            SplitKvSpec kvSpec = new SplitKvSpec(4096, 1024, 1e6, 4096, 0, 0.85);
+            RolePlan rolePlan = ring.planRoles(spec, kvSpec);
+            assertNotNull(rolePlan);
+            assertEquals(2, rolePlan.splitKvAssignments().size());
+            assertNotNull(rolePlan.activeRegime());
         }
     }
 

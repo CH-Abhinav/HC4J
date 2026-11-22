@@ -43,6 +43,12 @@ pub(crate) const RELATIVE_ACCEPT_RATIO: f64 = 0.90;
 /// Default estimated bandwidth for Tier 2 host-staged transfers if benchmark fails.
 pub(crate) const TIER2_DEFAULT_BW_GBPS: f64 = 1.2;
 
+/// Size of the fixed latency ping buffer: 4 KiB.
+pub(crate) const LATENCY_PROBE_BYTES: vk::DeviceSize = 4096;
+
+/// Number of ping iterations for averaging.
+pub(crate) const LATENCY_PROBE_ITERATIONS: u32 = 16;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ForceTier {
     Auto,
@@ -517,6 +523,51 @@ pub(crate) fn select_best_tier(
     }
 }
 
+/// Measures the fixed one-way transfer latency in microseconds using a 4 KiB ping.
+pub(crate) fn probe_latency_us(src: &GpuNode, dst: &GpuNode, tier: &TransportTier) -> f64 {
+    let usage = vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST;
+    let src_buf = match alloc_device_local(src, LATENCY_PROBE_BYTES, usage) {
+        Ok(b) => b,
+        Err(_) => return 500.0,
+    };
+    let dst_buf = match alloc_device_local(dst, LATENCY_PROBE_BYTES, usage) {
+        Ok(b) => b,
+        Err(_) => {
+            destroy_buf(src, &src_buf);
+            return 500.0;
+        }
+    };
+
+    // 2 warm-up transfers
+    for _ in 0..2 {
+        if crate::collective::vulkan::transport::transfer_route(
+            src, dst, tier, src_buf.buffer, 0, dst_buf.buffer, 0, LATENCY_PROBE_BYTES,
+        ).is_err() {
+            destroy_buf(dst, &dst_buf);
+            destroy_buf(src, &src_buf);
+            return 500.0;
+        }
+    }
+
+    let t0 = Instant::now();
+    for _ in 0..LATENCY_PROBE_ITERATIONS {
+        if crate::collective::vulkan::transport::transfer_route(
+            src, dst, tier, src_buf.buffer, 0, dst_buf.buffer, 0, LATENCY_PROBE_BYTES,
+        ).is_err() {
+            destroy_buf(dst, &dst_buf);
+            destroy_buf(src, &src_buf);
+            return 500.0;
+        }
+    }
+    let elapsed_secs = t0.elapsed().as_secs_f64();
+    let latency_us = (elapsed_secs * 1e6 / LATENCY_PROBE_ITERATIONS as f64).max(1.0);
+
+    destroy_buf(dst, &dst_buf);
+    destroy_buf(src, &src_buf);
+
+    latency_us
+}
+
 #[allow(dead_code)]
 pub(crate) fn build_topology(nodes: &[GpuNode]) -> Hc4jResult<TopoGraph> {
     build_topology_and_profiles(nodes).map(|(graph, _)| graph)
@@ -655,6 +706,7 @@ pub(crate) fn build_topology_and_profiles(
                                 bandwidth_gbps: edge.bandwidth_gbps,
                                 transport: edge.transport,
                                 loopback: u32::from(loopback),
+                                latency_us: edge.latency_us,
                             });
                         }
                     }
@@ -700,7 +752,7 @@ pub(crate) fn build_topology_and_profiles(
 
     let mut edges = Vec::new();
     let mut links = Vec::new();
-    let mut probe_cache: HashMap<(vk::PhysicalDevice, vk::PhysicalDevice), (TransportTier, f64)> =
+    let mut probe_cache: HashMap<(vk::PhysicalDevice, vk::PhysicalDevice), (TransportTier, f64, f64)> =
         HashMap::new();
 
     for i in 0..nodes.len() {
@@ -709,7 +761,7 @@ pub(crate) fn build_topology_and_profiles(
                 let pair_key = (nodes[i].physical_device, nodes[j].physical_device);
                 let loopback = nodes[i].physical_device == nodes[j].physical_device;
 
-                let (tier, final_bw) = if let Some(&cached) = probe_cache.get(&pair_key) {
+                let (tier, final_bw, final_lat) = if let Some(&cached) = probe_cache.get(&pair_key) {
                     cached
                 } else {
                     let (selected_tier, bw) = match force_tier {
@@ -809,8 +861,13 @@ pub(crate) fn build_topology_and_profiles(
                         }
                     };
 
-                    probe_cache.insert(pair_key, (selected_tier, bw));
-                    (selected_tier, bw)
+                    let lat_us = probe_latency_us(&nodes[i], &nodes[j], &selected_tier);
+                    eprintln!(
+                        "[HC4J] collective probe {}->{}: selected {} ({:.1} GB/s | {:.0} us, loopback={})",
+                        i, j, selected_tier.name(), bw, lat_us, loopback
+                    );
+                    probe_cache.insert(pair_key, (selected_tier, bw, lat_us));
+                    (selected_tier, bw, lat_us)
                 };
 
                 edges.push(TopoEdge { src: i, dst: j, tier });
@@ -820,6 +877,7 @@ pub(crate) fn build_topology_and_profiles(
                     bandwidth_gbps: final_bw,
                     transport: tier.transport_code(),
                     loopback: u32::from(loopback),
+                    latency_us: final_lat,
                 });
             }
         }
@@ -827,7 +885,7 @@ pub(crate) fn build_topology_and_profiles(
 
     if !bypass {
         let mut cached_edges = Vec::new();
-        for (&(src_phd, dst_phd), &(tier, bw)) in &probe_cache {
+        for (&(src_phd, dst_phd), &(tier, bw, lat_us)) in &probe_cache {
             let src_phys = unique_phds.iter().position(|&p| p == src_phd).unwrap();
             let dst_phys = unique_phds.iter().position(|&p| p == dst_phd).unwrap();
             cached_edges.push(CachedEdge {
@@ -835,6 +893,7 @@ pub(crate) fn build_topology_and_profiles(
                 dst_phys_idx: dst_phys,
                 transport: tier.transport_code(),
                 bandwidth_gbps: bw,
+                latency_us: lat_us,
             });
         }
         let serialized = serialize_cache(&cached_devices, &cached_edges);

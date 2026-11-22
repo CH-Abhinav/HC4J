@@ -45,7 +45,8 @@ public final class Collective implements AutoCloseable {
             JAVA_INT.withName("dst"),
             JAVA_DOUBLE.withName("gbps"),
             JAVA_INT.withName("transport"),
-            JAVA_INT.withName("loopback"));
+            JAVA_INT.withName("loopback"),
+            JAVA_DOUBLE.withName("latency_us"));
 
     static final StructLayout DEVICE_PROFILE_LAYOUT = MemoryLayout.structLayout(
             JAVA_INT.withName("rank"),
@@ -173,7 +174,8 @@ public final class Collective implements AutoCloseable {
                         slot.get(JAVA_INT, 4),
                         slot.get(JAVA_DOUBLE, 8),
                         Transport.of(slot.get(JAVA_INT, 16)),
-                        slot.get(JAVA_INT, 20) != 0));
+                        slot.get(JAVA_INT, 20) != 0,
+                        slot.get(JAVA_DOUBLE, 24)));
             }
         }
         topology = List.copyOf(links);
@@ -300,6 +302,37 @@ public final class Collective implements AutoCloseable {
      */
     public WorkloadPlan planWork(long totalUnits) {
         return planWork(totalUnits, 1e9, 0L, 0L);
+    }
+
+    /**
+     * Generates an exact zero-parameter optimized workload plan according to the given workload specification.
+     *
+     * @param spec detailed workload specification (compute, memory, communication, spilling, host CPU)
+     * @return the globally optimal workload plan
+     * @throws NullPointerException if {@code spec} is null
+     * @throws IllegalStateException if the collective has been closed
+     */
+    public WorkloadPlan planWork(WorkloadSpec spec) {
+        ensureOpen();
+        Objects.requireNonNull(spec, "spec must not be null");
+        return WorkloadPlanner.plan(deviceProfiles(), topology(), spec);
+    }
+
+    /**
+     * Generates a multi-operator role assignment plan executing Tensor Parallel shards on primary
+     * devices and reclaiming excluded straggler GPUs as lossless Split-KV attention workers.
+     *
+     * @param tpSpec specification for the Tensor Parallel operations
+     * @param kvSpec specification for the Split-KV decode attention
+     * @return the combined multi-operator role plan
+     * @throws NullPointerException if either specification is null
+     * @throws IllegalStateException if the collective has been closed
+     */
+    public RolePlan planRoles(WorkloadSpec tpSpec, SplitKvSpec kvSpec) {
+        ensureOpen();
+        Objects.requireNonNull(tpSpec, "tpSpec must not be null");
+        Objects.requireNonNull(kvSpec, "kvSpec must not be null");
+        return WorkloadPlanner.planRoles(deviceProfiles(), topology(), tpSpec, kvSpec);
     }
 
     public CollectiveBuffer allocate(int rank, long elements) {
