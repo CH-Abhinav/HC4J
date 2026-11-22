@@ -165,4 +165,145 @@ class ValidUtilTest {
                 () -> ValidUtil.rows(new int[] {}, 0),
                 "Row ops require a non-empty tensor, got shape []");
     }
+
+    @Test
+    @DisplayName("Valid shape requirement validation")
+    void testRequireValidShape() {
+        ValidUtil.requireValidShape(new int[] {2, 3, 4});
+        ValidUtil.requireValidShape(new int[] {1});
+
+        assertThrowsWithMessage(IllegalArgumentException.class,
+                () -> ValidUtil.requireValidShape(null),
+                "Shape must be non-null and non-empty");
+
+        assertThrowsWithMessage(IllegalArgumentException.class,
+                () -> ValidUtil.requireValidShape(new int[] {}),
+                "Shape must be non-null and non-empty");
+
+        assertThrowsWithMessage(IllegalArgumentException.class,
+                () -> ValidUtil.requireValidShape(new int[] {2, 0, 4}),
+                "Shape dimensions must be strictly positive, got [2, 0, 4]");
+
+        assertThrowsWithMessage(IllegalArgumentException.class,
+                () -> ValidUtil.requireValidShape(new int[] {2, -3, 4}),
+                "Shape dimensions must be strictly positive, got [2, -3, 4]");
+    }
+
+    @Test
+    @DisplayName("Broadcast shape calculations and errors")
+    void testBroadcastShape() {
+        // Equal shapes
+        assertArrayEquals(new int[] {2, 3}, ValidUtil.broadcastShape(new int[] {2, 3}, new int[] {2, 3}));
+
+        // Trailing expansion
+        assertArrayEquals(new int[] {2, 3, 4}, ValidUtil.broadcastShape(new int[] {2, 3, 4}, new int[] {4}));
+        assertArrayEquals(new int[] {2, 3, 4}, ValidUtil.broadcastShape(new int[] {4}, new int[] {2, 3, 4}));
+
+        // 1-dim expansion
+        assertArrayEquals(new int[] {2, 3, 4}, ValidUtil.broadcastShape(new int[] {2, 1, 4}, new int[] {1, 3, 1}));
+
+        // Incompatible dimensions
+        assertThrowsWithMessage(IllegalArgumentException.class,
+                () -> ValidUtil.broadcastShape(new int[] {3, 2}, new int[] {3, 4}),
+                "Cannot broadcast shapes [3, 2] and [3, 4] at dimension 1 (2 != 4)");
+
+        assertThrowsWithMessage(IllegalArgumentException.class,
+                () -> ValidUtil.broadcastShape(new int[] {2, 3}, new int[] {3, 3}),
+                "Cannot broadcast shapes [2, 3] and [3, 3] at dimension 0 (2 != 3)");
+    }
+
+    @Test
+    @DisplayName("Broadcast strides calculation")
+    void testBroadcastStrides() {
+        // [1, 4] with strides [4, 1] broadcast to [3, 4] -> strides [0, 1]
+        int[] bStrides = ValidUtil.broadcastStrides(new int[] {1, 4}, new int[] {4, 1}, new int[] {3, 4});
+        assertArrayEquals(new int[] {0, 1}, bStrides);
+
+        // [4] with strides [1] broadcast to [2, 3, 4] -> strides [0, 0, 1]
+        int[] bStrides3d = ValidUtil.broadcastStrides(new int[] {4}, new int[] {1}, new int[] {2, 3, 4});
+        assertArrayEquals(new int[] {0, 0, 1}, bStrides3d);
+
+        // Rank mismatch error
+        assertThrowsWithMessage(IllegalArgumentException.class,
+                () -> ValidUtil.broadcastStrides(new int[] {2, 3, 4}, new int[] {12, 4, 1}, new int[] {4}),
+                "Source rank 3 exceeds target rank 1");
+
+        // Dimension mismatch error
+        assertThrowsWithMessage(IllegalArgumentException.class,
+                () -> ValidUtil.broadcastStrides(new int[] {2, 4}, new int[] {4, 1}, new int[] {3, 4}),
+                "Cannot broadcast dimension 2 to 3");
+    }
+
+    @Test
+    @DisplayName("Infer reshape dimensions with -1 and validation")
+    void testInferReshape() {
+        // Simple shape without -1
+        assertArrayEquals(new int[] {2, 3}, ValidUtil.inferReshape(new int[] {2, 3}, 6));
+
+        // Unknown dimension inference
+        assertArrayEquals(new int[] {2, 3}, ValidUtil.inferReshape(new int[] {2, -1}, 6));
+        assertArrayEquals(new int[] {2, 3}, ValidUtil.inferReshape(new int[] {-1, 3}, 6));
+        assertArrayEquals(new int[] {6}, ValidUtil.inferReshape(new int[] {-1}, 6));
+        assertArrayEquals(new int[] {2, 3, 4}, ValidUtil.inferReshape(new int[] {2, -1, 4}, 24));
+
+        // Null or empty
+        assertThrowsWithMessage(IllegalArgumentException.class,
+                () -> ValidUtil.inferReshape(null, 6),
+                "Shape must be non-null and non-empty");
+        assertThrowsWithMessage(IllegalArgumentException.class,
+                () -> ValidUtil.inferReshape(new int[] {}, 6),
+                "Shape must be non-null and non-empty");
+
+        // Multiple -1
+        assertThrowsWithMessage(IllegalArgumentException.class,
+                () -> ValidUtil.inferReshape(new int[] {-1, -1}, 6),
+                "Can only specify at most one unknown dimension (-1)");
+
+        // Invalid dimension (e.g. -2 or 0)
+        assertThrowsWithMessage(IllegalArgumentException.class,
+                () -> ValidUtil.inferReshape(new int[] {2, -2}, 6),
+                "Invalid dimension size: -2");
+        assertThrowsWithMessage(IllegalArgumentException.class,
+                () -> ValidUtil.inferReshape(new int[] {2, 0}, 6),
+                "Invalid dimension size: 0");
+
+        // Incompatible element count
+        assertThrowsWithMessage(IllegalArgumentException.class,
+                () -> ValidUtil.inferReshape(new int[] {2, 4}, 6),
+                "Cannot reshape array of size 6 into shape [2, 4]");
+
+        assertThrowsWithMessage(IllegalArgumentException.class,
+                () -> ValidUtil.inferReshape(new int[] {4, -1}, 6),
+                "Cannot reshape array of size 6 into shape [4, -1]");
+    }
+
+    @Test
+    @DisplayName("Permutation axes validation")
+    void testValidatePermutation() {
+        ValidUtil.validatePermutation(new int[] {1, 0}, 2);
+        ValidUtil.validatePermutation(new int[] {2, 0, 1}, 3);
+
+        // Rank mismatch
+        assertThrowsWithMessage(IllegalArgumentException.class,
+                () -> ValidUtil.validatePermutation(new int[] {0, 1}, 3),
+                "Permutation axes length 2 does not match rank 3");
+
+        assertThrowsWithMessage(IllegalArgumentException.class,
+                () -> ValidUtil.validatePermutation(null, 2),
+                "Permutation axes length 0 does not match rank 2");
+
+        // Axis out of bounds
+        assertThrowsWithMessage(IllegalArgumentException.class,
+                () -> ValidUtil.validatePermutation(new int[] {0, 2}, 2),
+                "Axis 2 is out of bounds for rank 2");
+
+        assertThrowsWithMessage(IllegalArgumentException.class,
+                () -> ValidUtil.validatePermutation(new int[] {-1, 0}, 2),
+                "Axis -1 is out of bounds for rank 2");
+
+        // Duplicate axis
+        assertThrowsWithMessage(IllegalArgumentException.class,
+                () -> ValidUtil.validatePermutation(new int[] {1, 1}, 2),
+                "Duplicate axis in permutation: 1");
+    }
 }

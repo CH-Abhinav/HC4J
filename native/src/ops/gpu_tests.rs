@@ -5,7 +5,8 @@
 use std::sync::{Mutex, MutexGuard};
 
 use crate::memory::{hc4j_gpu_alloc, hc4j_gpu_alloc_uninit, hc4j_gpu_download, hc4j_gpu_free, hc4j_gpu_write, manager};
-use crate::ops::arithmetic::dispatch_add_f32;
+use crate::ops::arithmetic::{dispatch_add_f32, dispatch_mul};
+use crate::ops::elementwise::dispatch_copy_strided;
 use crate::ops::exponential::dispatch_exp_f32;
 use crate::ops::fusion::{hc4j_fused_dispatch, op};
 use crate::ops::matmul::{FLAG_TRANS_A, FLAG_TRANS_B, dispatch_matmul_f32_ex};
@@ -873,3 +874,204 @@ fn a_cancelled_zero_fill_leaves_no_phantom_epoch() {
     mgr.configure(budget, 0).expect("quarantine must drain");
     assert_eq!(mgr.stats().quarantined, 0, "freed region should be back in its slab");
 }
+
+fn upload_i32(data: &[i32]) -> u64 {
+    let id = hc4j_gpu_alloc(data.len());
+    assert_ne!(id, 0, "alloc failed");
+    assert_eq!(unsafe { hc4j_gpu_write(id, data.as_ptr().cast::<f32>(), data.len()) }, 0);
+    id
+}
+
+fn download_i32(id: u64, len: usize) -> Vec<i32> {
+    let mut out = vec![0i32; len];
+    assert_eq!(unsafe { hc4j_gpu_download(id, out.as_mut_ptr().cast::<f32>(), len) }, 0);
+    out
+}
+
+#[test]
+fn strided_copy_transpose_broadcast_and_offset() {
+    let Some(_gpu) = gpu() else { return };
+
+    // 1. 2D Transpose copy on f32 (3x4 -> 4x3)
+    let src_data: Vec<f32> = (1..=12).map(|x| x as f32).collect();
+    let src_id = upload(&src_data);
+    let out_id = hc4j_gpu_alloc_uninit(12);
+
+    let shape = [4u32, 3u32];
+    let src_strides = [1u32, 4u32]; // row-major [3, 4] transposed is stride [1, 4]
+    let status = unsafe {
+        dispatch_copy_strided(src_id, out_id, 0, 2, shape.as_ptr(), src_strides.as_ptr(), 12)
+    };
+    assert_eq!(status, 0);
+    let got = download(out_id, 12);
+    // Transposed 3x4:
+    // [ 1,  2,  3,  4 ]
+    // [ 5,  6,  7,  8 ]
+    // [ 9, 10, 11, 12 ]
+    // -> 4x3:
+    // col 0: 1, 5, 9
+    // col 1: 2, 6, 10
+    // col 2: 3, 7, 11
+    // col 3: 4, 8, 12
+    let expected = vec![1.0, 5.0, 9.0, 2.0, 6.0, 10.0, 3.0, 7.0, 11.0, 4.0, 8.0, 12.0];
+    assert_eq!(got, expected);
+    free(out_id);
+
+    // 2. Non-zero offset slice (row 1 of 3x4, offset = 4, length = 4)
+    let out_slice = hc4j_gpu_alloc_uninit(4);
+    let slice_shape = [4u32];
+    let slice_strides = [1u32];
+    let status_slice = unsafe {
+        dispatch_copy_strided(src_id, out_slice, 4, 1, slice_shape.as_ptr(), slice_strides.as_ptr(), 4)
+    };
+    assert_eq!(status_slice, 0);
+    let got_slice = download(out_slice, 4);
+    assert_eq!(got_slice, vec![5.0, 6.0, 7.0, 8.0]);
+    free(out_slice);
+
+    // 3. Broadcast stride-0 copy (1x4 broadcast to 3x4)
+    let out_bcast = hc4j_gpu_alloc_uninit(12);
+    let bcast_shape = [3u32, 4u32];
+    let bcast_strides = [0u32, 1u32]; // row 0 repeated 3 times
+    let status_bcast = unsafe {
+        dispatch_copy_strided(src_id, out_bcast, 0, 2, bcast_shape.as_ptr(), bcast_strides.as_ptr(), 12)
+    };
+    assert_eq!(status_bcast, 0);
+    let got_bcast = download(out_bcast, 12);
+    let expected_bcast = vec![
+        1.0, 2.0, 3.0, 4.0,
+        1.0, 2.0, 3.0, 4.0,
+        1.0, 2.0, 3.0, 4.0,
+    ];
+    assert_eq!(got_bcast, expected_bcast);
+    free(out_bcast);
+    free(src_id);
+
+    // 4. i32 strided copy with negative & large values
+    let src_i32: Vec<i32> = vec![-100, 200, -300, 400, -500, 600];
+    let src_i32_id = upload_i32(&src_i32);
+    let out_i32_id = hc4j_gpu_alloc_uninit(6);
+    let i32_shape = [3u32, 2u32];
+    let i32_strides = [1u32, 3u32]; // transpose 2x3 -> 3x2
+    let status_i32 = unsafe {
+        dispatch_copy_strided(src_i32_id, out_i32_id, 0, 2, i32_shape.as_ptr(), i32_strides.as_ptr(), 6)
+    };
+    assert_eq!(status_i32, 0);
+    let got_i32 = download_i32(out_i32_id, 6);
+    // [-100, 200, -300]
+    // [-500, 600,  ---] wait, 2x3:
+    // row 0: -100, 200, -300
+    // row 1: 400, -500, 600
+    // col 0: -100, 400
+    // col 1: 200, -500
+    // col 2: -300, 600
+    assert_eq!(got_i32, vec![-100, 400, 200, -500, -300, 600]);
+    free(src_i32_id);
+    free(out_i32_id);
+}
+
+#[test]
+fn strided_broadcast_binary_ops() {
+    let Some(_gpu) = gpu() else { return };
+
+    // [4, 1] + [1, 5] -> [4, 5]
+    let a_data = vec![10.0f32, 20.0, 30.0, 40.0];
+    let b_data = vec![1.0f32, 2.0, 3.0, 4.0, 5.0];
+    let a_id = upload(&a_data);
+    let b_id = upload(&b_data);
+    let out_id = hc4j_gpu_alloc_uninit(20);
+
+    let shape = [4u32, 5u32];
+    let strides_a = [1u32, 0u32]; // [4, 1] broadcast along dim 1
+    let strides_b = [0u32, 1u32]; // [1, 5] broadcast along dim 0
+    let strides_c = [5u32, 1u32];
+
+    let status = unsafe {
+        dispatch_add_f32(
+            a_id, b_id, out_id, 2,
+            shape.as_ptr(), strides_a.as_ptr(), strides_b.as_ptr(), strides_c.as_ptr(),
+            20, 0,
+        )
+    };
+    assert_eq!(status, 0);
+    let got = download(out_id, 20);
+    for r in 0..4 {
+        for c in 0..5 {
+            let expected = a_data[r] + b_data[c];
+            assert_eq!(got[r * 5 + c], expected);
+        }
+    }
+    free(a_id);
+    free(b_id);
+    free(out_id);
+
+    // [2, 3, 4] * [4] -> [2, 3, 4]
+    let total = 2 * 3 * 4;
+    let x_data: Vec<f32> = (1..=total).map(|v| v as f32).collect();
+    let y_data = vec![2.0f32, 3.0, 4.0, 5.0];
+    let x_id = upload(&x_data);
+    let y_id = upload(&y_data);
+    let mul_out = hc4j_gpu_alloc_uninit(total);
+
+    let shape3d = [2u32, 3u32, 4u32];
+    let strides_x = [12u32, 4u32, 1u32];
+    let strides_y = [0u32, 0u32, 1u32];
+    let strides_out = [12u32, 4u32, 1u32];
+
+    let status_mul = unsafe {
+        dispatch_mul(
+            x_id, y_id, mul_out, 3,
+            shape3d.as_ptr(), strides_x.as_ptr(), strides_y.as_ptr(), strides_out.as_ptr(),
+            total, 0, 1, // dtype 1 = f32
+        )
+    };
+    assert_eq!(status_mul, 0);
+    let got_mul = download(mul_out, total);
+    for i in 0..total {
+        let expected = x_data[i] * y_data[i % 4];
+        assert_eq!(got_mul[i], expected);
+    }
+    free(x_id);
+    free(y_id);
+    free(mul_out);
+}
+
+#[test]
+fn in_place_self_aliasing_and_mutations() {
+    let Some(_gpu) = gpu() else { return };
+    let n = 256;
+    let host: Vec<f32> = (1..=n).map(|x| x as f32).collect();
+    let a = upload(&host);
+
+    // a.addi(a) -> a = a + a
+    let status = unsafe {
+        dispatch_add_f32(
+            a, a, a, 0,
+            std::ptr::null(), std::ptr::null(), std::ptr::null(), std::ptr::null(),
+            n, 1,
+        )
+    };
+    assert_eq!(status, 0);
+    let got = download(a, n);
+    for i in 0..n {
+        assert_eq!(got[i], host[i] * 2.0);
+    }
+
+    // a.muli(2.0 via a itself: a = a * a)
+    let status_mul = unsafe {
+        dispatch_mul(
+            a, a, a, 0,
+            std::ptr::null(), std::ptr::null(), std::ptr::null(), std::ptr::null(),
+            n, 1, 1,
+        )
+    };
+    assert_eq!(status_mul, 0);
+    let got_mul = download(a, n);
+    for i in 0..n {
+        let doubled = host[i] * 2.0;
+        assert_eq!(got_mul[i], doubled * doubled);
+    }
+
+    free(a);
+}
+

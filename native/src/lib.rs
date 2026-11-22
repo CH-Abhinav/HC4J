@@ -32,6 +32,7 @@ pub use ops::arithmetic::{
     dispatch_add, dispatch_add_f32, dispatch_div, dispatch_div_f32, dispatch_mul, dispatch_mul_f32, dispatch_sub,
     dispatch_sub_f32,
 };
+pub use ops::elementwise::dispatch_copy_strided;
 pub use ops::exponential::{dispatch_exp_f32, dispatch_ln_f32, dispatch_log2_f32, dispatch_log10_f32, dispatch_sqrt_f32};
 pub use ops::fusion::hc4j_fused_dispatch;
 pub use ops::matmul::{dispatch_matmul_f32, dispatch_matmul_f32_ex, dispatch_transpose_f32, hc4j_matmul_plan};

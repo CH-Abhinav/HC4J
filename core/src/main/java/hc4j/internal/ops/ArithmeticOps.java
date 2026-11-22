@@ -25,10 +25,11 @@ import hc4j.internal.layout.ValidUtil;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
+import java.util.Arrays;
 import java.util.Objects;
 
 /**
- * Binary elementwise arithmetic operations.
+ * Binary elementwise arithmetic operations with full NumPy broadcasting.
  */
 public final class ArithmeticOps {
 
@@ -56,28 +57,50 @@ public final class ArithmeticOps {
         ValidUtil.requireSameDType(a.getDType(), b.getDType());
         ValidUtil.requireResultDType(a.getDType(), res.getDType());
 
+        // Materialize non-zero offsets
+        if (access.elementOffset(a) > 0) {
+            try (Tensor contigA = a.contiguous()) {
+                return execute(opIndex, opName, contigA, b, res);
+            }
+        }
+        if (access.elementOffset(b) > 0) {
+            try (Tensor contigB = b.contiguous()) {
+                return execute(opIndex, opName, a, contigB, res);
+            }
+        }
+
+        // Validate output tensor: must be contiguous with zero offset
+        if (!res.isContiguous() || access.elementOffset(res) != 0) {
+            throw new IllegalArgumentException("Output tensor must be contiguous with zero offset");
+        }
+
         int[] sa = access.getShapeUnsafe(a);
         int[] sb = access.getShapeUnsafe(b);
-        int[] sr = access.getShapeUnsafe(res);
+        int[] targetShape = ValidUtil.broadcastShape(sa, sb);
 
-        ValidUtil.requireSameShape(sa, sb);
-        ValidUtil.requireResultShape(sa, sr);
+        int[] sr = access.getShapeUnsafe(res);
+        ValidUtil.requireResultShape(targetShape, sr);
 
         int[] sta = access.getStridesUnsafe(a);
         int[] stb = access.getStridesUnsafe(b);
         int[] str = access.getStridesUnsafe(res);
 
-        boolean contiguous = ValidUtil.isContiguous(sa, sta)
-                && ValidUtil.isContiguous(sb, stb)
-                && ValidUtil.isContiguous(sr, str);
+        int[] bcastStridesA = ValidUtil.broadcastStrides(sa, sta, targetShape);
+        int[] bcastStridesB = ValidUtil.broadcastStrides(sb, stb, targetShape);
 
-        int rank = res.dim();
+        boolean contiguous = Arrays.equals(sa, targetShape)
+                && Arrays.equals(sb, targetShape)
+                && a.isContiguous()
+                && b.isContiguous()
+                && res.isContiguous();
+
+        int rank = targetShape.length;
         int dtypeCode = resolveDTypeCode(a.getDType());
 
         try (Arena arena = Arena.ofConfined()) {
-            MemorySegment shapeSeg = contiguous ? MemorySegment.NULL : arena.allocateFrom(ValueLayout.JAVA_INT, sr);
-            MemorySegment stridesASeg = contiguous ? MemorySegment.NULL : arena.allocateFrom(ValueLayout.JAVA_INT, sta);
-            MemorySegment stridesBSeg = contiguous ? MemorySegment.NULL : arena.allocateFrom(ValueLayout.JAVA_INT, stb);
+            MemorySegment shapeSeg = contiguous ? MemorySegment.NULL : arena.allocateFrom(ValueLayout.JAVA_INT, targetShape);
+            MemorySegment stridesASeg = contiguous ? MemorySegment.NULL : arena.allocateFrom(ValueLayout.JAVA_INT, bcastStridesA);
+            MemorySegment stridesBSeg = contiguous ? MemorySegment.NULL : arena.allocateFrom(ValueLayout.JAVA_INT, bcastStridesB);
             MemorySegment stridesCSeg = contiguous ? MemorySegment.NULL : arena.allocateFrom(ValueLayout.JAVA_INT, str);
 
             int status = NativeBindings.dispatchBinary(

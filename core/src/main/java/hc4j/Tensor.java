@@ -20,6 +20,7 @@ import hc4j.engine.Residency;
 import hc4j.internal.ffi.NativeCleaner;
 import hc4j.internal.ffi.NativeEngine;
 import hc4j.internal.ffi.TensorAccess;
+import hc4j.internal.ffi.VramHandle;
 import hc4j.internal.layout.Dims;
 import hc4j.internal.layout.Rows;
 import hc4j.internal.layout.ValidUtil;
@@ -35,10 +36,12 @@ import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
 import java.lang.ref.Cleaner;
 import java.util.Arrays;
+import java.util.Objects;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
- * A VRAM-resident multi-dimensional array of 32-bit floats or integers.
+ * A VRAM-resident multi-dimensional array of 32-bit floats or integers supporting zero-copy strided views,
+ * automatic broadcasting, in-place ops, and Panama Foreign Function &amp; Memory (FFM) interop.
  */
 public class Tensor implements AutoCloseable {
 
@@ -46,7 +49,7 @@ public class Tensor implements AutoCloseable {
         TensorAccess.setInstance(new TensorAccess() {
             @Override
             public long getVramId(Tensor t) {
-                return t.vramId;
+                return t.handle.vramId();
             }
 
             @Override
@@ -65,28 +68,40 @@ public class Tensor implements AutoCloseable {
             }
 
             @Override
+            public long elementOffset(Tensor t) {
+                return t.elementOffset;
+            }
+
+            @Override
+            public VramHandle getVramHandle(Tensor t) {
+                return t.handle;
+            }
+
+            @Override
             public Tensor create(DType dtype, int[] shape, int[] strides, long vramId) {
-                return new Tensor(dtype, shape, strides, vramId);
+                return new Tensor(dtype, shape, strides, 0L, new VramHandle(vramId));
+            }
+
+            @Override
+            public Tensor create(DType dtype, int[] shape, int[] strides, long elementOffset, VramHandle handle) {
+                return new Tensor(dtype, shape, strides, elementOffset, handle);
             }
         });
     }
 
-    private static final class CleanupAction implements Runnable {
-        private final long vramId;
+    private static final class TensorReleaseAction implements Runnable {
+        private final VramHandle handle;
         private final AtomicBoolean closed;
 
-        CleanupAction(long vramId, AtomicBoolean closed) {
-            this.vramId = vramId;
+        TensorReleaseAction(VramHandle handle, AtomicBoolean closed) {
+            this.handle = handle;
             this.closed = closed;
         }
 
         @Override
         public void run() {
-            if (closed.compareAndSet(false, true) && vramId != 0L) {
-                try {
-                    NativeEngine.freeVram(vramId);
-                } catch (Throwable ignored) {
-                }
+            if (closed.compareAndSet(false, true) && handle != null) {
+                handle.release();
             }
         }
     }
@@ -94,153 +109,1242 @@ public class Tensor implements AutoCloseable {
     private final DType dtype;
     private final int[] shape;
     private final int[] strides;
+    private final long elementOffset;
     private final long size;
-    private final long vramId;
+    private final VramHandle handle;
     private final AtomicBoolean closed = new AtomicBoolean(false);
     private final Cleaner.Cleanable cleanable;
 
-    private Tensor(DType dtype, int[] shape, int[] strides, long vramId) {
+    private Tensor(DType dtype, int[] shape, int[] strides, long elementOffset, VramHandle handle) {
         this.dtype = dtype;
         this.shape = Arrays.copyOf(shape, shape.length);
         this.strides = Arrays.copyOf(strides, strides.length);
+        this.elementOffset = elementOffset;
         this.size = computeSize(this.shape);
-        this.vramId = vramId;
-        this.cleanable = NativeCleaner.register(this, new CleanupAction(vramId, this.closed));
-    }
-
-    private Tensor(long vramId, int[] shape, DType dtype) {
-        this(dtype, shape, computeContiguousStrides(shape), vramId);
+        this.handle = handle;
+        this.cleanable = NativeCleaner.register(this, new TensorReleaseAction(handle, this.closed));
     }
 
     // ------------------------------------------------------------------------------------------
     // Factories
     // ------------------------------------------------------------------------------------------
 
+    /**
+     * Allocates a zero-initialized tensor of the specified shape and data type.
+     *
+     * @param dtype tensor element type
+     * @param shape dimension extents
+     * @return newly allocated zero tensor
+     */
     public static Tensor zeros(DType dtype, int... shape) {
+        Objects.requireNonNull(dtype, "dtype");
+        ValidUtil.requireValidShape(shape);
         long totalSize = computeSize(shape);
         long vramId = NativeEngine.allocVram(totalSize);
-        return new Tensor(vramId, shape, dtype);
+        VramHandle h = new VramHandle(vramId);
+        return new Tensor(dtype, shape, computeContiguousStrides(shape), 0L, h);
     }
 
+    /**
+     * Allocates a tensor initialized with ones of the specified shape and data type.
+     *
+     * @param dtype tensor element type
+     * @param shape dimension extents
+     * @return newly allocated ones tensor
+     */
+    public static Tensor ones(DType dtype, int... shape) {
+        Objects.requireNonNull(dtype, "dtype");
+        ValidUtil.requireValidShape(shape);
+        if (dtype == DType.f32) {
+            return full(1.0f, shape);
+        } else if (dtype == DType.i32) {
+            return full(1, shape);
+        } else {
+            throw new IllegalArgumentException("Unsupported dtype: " + dtype);
+        }
+    }
+
+    /**
+     * Allocates an uninitialized tensor of the specified shape and data type.
+     *
+     * @param dtype tensor element type
+     * @param shape dimension extents
+     * @return newly allocated uninitialized tensor
+     */
     public static Tensor empty(DType dtype, int... shape) {
+        Objects.requireNonNull(dtype, "dtype");
+        ValidUtil.requireValidShape(shape);
         long totalSize = computeSize(shape);
         long vramId = NativeEngine.allocVramUninit(totalSize);
-        return new Tensor(vramId, shape, dtype);
+        VramHandle h = new VramHandle(vramId);
+        return new Tensor(dtype, shape, computeContiguousStrides(shape), 0L, h);
     }
 
+    /**
+     * Allocates a float tensor filled with {@code value}.
+     *
+     * @param value constant fill value
+     * @param shape dimension extents
+     * @return filled tensor
+     */
+    public static Tensor full(float value, int... shape) {
+        ValidUtil.requireValidShape(shape);
+        try (Tensor scalar = fromArray(new float[]{value}, 1);
+             Tensor bcast = scalar.broadcastTo(shape)) {
+            return bcast.copy();
+        }
+    }
+
+    /**
+     * Allocates an integer tensor filled with {@code value}.
+     *
+     * @param value constant fill value
+     * @param shape dimension extents
+     * @return filled tensor
+     */
+    public static Tensor full(int value, int... shape) {
+        ValidUtil.requireValidShape(shape);
+        try (Tensor scalar = fromArray(new int[]{value}, 1);
+             Tensor bcast = scalar.broadcastTo(shape)) {
+            return bcast.copy();
+        }
+    }
+
+    /**
+     * Creates a 1-D float tensor with values in {@code [start, stop)} with given step size.
+     *
+     * @param start start value (inclusive)
+     * @param stop  stop value (exclusive)
+     * @param step  step size
+     * @return 1-D range tensor
+     */
+    public static Tensor arange(float start, float stop, float step) {
+        if (step == 0f) {
+            throw new IllegalArgumentException("step must not be zero");
+        }
+        double diff = stop - start;
+        if ((step > 0 && diff <= 0) || (step < 0 && diff >= 0)) {
+            throw new IllegalArgumentException("arange resulting size must be positive");
+        }
+        int count = (int) Math.ceil(diff / step);
+        if (count <= 0) {
+            throw new IllegalArgumentException("arange length must be > 0");
+        }
+        float[] data = new float[count];
+        float current = start;
+        for (int i = 0; i < count; i++) {
+            data[i] = current;
+            current += step;
+        }
+        return fromArray(data, count);
+    }
+
+    /**
+     * Creates a 1-D integer tensor with values in {@code [0, stop)} with step 1.
+     *
+     * @param stop stop value (exclusive)
+     * @return 1-D range tensor
+     */
+    public static Tensor arange(int stop) {
+        return arange(0, stop, 1);
+    }
+
+    /**
+     * Creates a 1-D integer tensor with values in {@code [start, stop)} with given step size.
+     *
+     * @param start start value (inclusive)
+     * @param stop  stop value (exclusive)
+     * @param step  step size
+     * @return 1-D range tensor
+     */
+    public static Tensor arange(int start, int stop, int step) {
+        if (step == 0) {
+            throw new IllegalArgumentException("step must not be zero");
+        }
+        long diff = (long) stop - start;
+        if ((step > 0 && diff <= 0) || (step < 0 && diff >= 0)) {
+            throw new IllegalArgumentException("arange resulting size must be positive, start=" + start + ", stop=" + stop + ", step=" + step);
+        }
+        int count = (int) (diff > 0 ? (diff + step - 1) / step : (diff + step + 1) / step);
+        if (count <= 0) {
+            throw new IllegalArgumentException("arange length must be > 0");
+        }
+        int[] data = new int[count];
+        int current = start;
+        for (int i = 0; i < count; i++) {
+            data[i] = current;
+            current += step;
+        }
+        return fromArray(data, count);
+    }
+
+    /**
+     * Creates a 1-D float tensor with {@code num} evenly spaced samples in {@code [start, stop]}.
+     *
+     * @param start start value (inclusive)
+     * @param stop  stop value (inclusive)
+     * @param num   number of samples (must be &gt; 0)
+     * @return 1-D linspace tensor
+     */
+    public static Tensor linspace(float start, float stop, int num) {
+        if (num <= 0) {
+            throw new IllegalArgumentException("num must be strictly positive, got " + num);
+        }
+        if (num == 1) {
+            return fromArray(new float[]{start}, 1);
+        }
+        float[] data = new float[num];
+        float step = (stop - start) / (num - 1);
+        for (int i = 0; i < num; i++) {
+            if (i == num - 1) {
+                data[i] = stop;
+            } else {
+                data[i] = start + i * step;
+            }
+        }
+        return fromArray(data, num);
+    }
+
+    /**
+     * Creates a 2-D float identity matrix of size {@code n x n}.
+     *
+     * @param n matrix dimension
+     * @return identity matrix
+     */
+    public static Tensor eye(int n) {
+        return eye(DType.f32, n, n);
+    }
+
+    /**
+     * Creates a 2-D identity matrix of size {@code n x n} with the given data type.
+     *
+     * @param dtype data type
+     * @param n     matrix dimension
+     * @return identity matrix
+     */
+    public static Tensor eye(DType dtype, int n) {
+        return eye(dtype, n, n);
+    }
+
+    /**
+     * Creates a 2-D identity matrix of size {@code rows x cols} with the given data type.
+     *
+     * @param dtype data type
+     * @param rows  row count
+     * @param cols  column count
+     * @return identity matrix
+     */
+    public static Tensor eye(DType dtype, int rows, int cols) {
+        Objects.requireNonNull(dtype, "dtype");
+        if (rows <= 0 || cols <= 0) {
+            throw new IllegalArgumentException("rows and cols must be positive, got " + rows + "x" + cols);
+        }
+        int min = Math.min(rows, cols);
+        int total = rows * cols;
+        if (dtype == DType.f32) {
+            float[] data = new float[total];
+            for (int i = 0; i < min; i++) {
+                data[i * cols + i] = 1.0f;
+            }
+            return fromArray(data, rows, cols);
+        } else if (dtype == DType.i32) {
+            int[] data = new int[total];
+            for (int i = 0; i < min; i++) {
+                data[i * cols + i] = 1;
+            }
+            return fromArray(data, rows, cols);
+        } else {
+            throw new IllegalArgumentException("Unsupported dtype: " + dtype);
+        }
+    }
+
+    /**
+     * Creates a float tensor from a host float array.
+     *
+     * @param values host data
+     * @param shape  tensor shape
+     * @return uploaded tensor
+     */
     public static Tensor fromArray(float[] values, int... shape) {
+        Objects.requireNonNull(values, "values");
         long totalSize = checkLength(values.length, shape);
         long vramId = NativeEngine.allocVramUninit(totalSize);
+        VramHandle h = new VramHandle(vramId);
         try (Arena arena = Arena.ofConfined()) {
             MemorySegment hostSegment = arena.allocateFrom(ValueLayout.JAVA_FLOAT, values);
             NativeEngine.writeVram(vramId, hostSegment, totalSize);
         } catch (RuntimeException | Error e) {
-            NativeEngine.freeVram(vramId);
+            h.release();
             throw e;
         }
-        return new Tensor(vramId, shape, DType.f32);
+        return new Tensor(DType.f32, shape, computeContiguousStrides(shape), 0L, h);
     }
 
+    /**
+     * Creates an integer tensor from a host int array.
+     *
+     * @param values host data
+     * @param shape  tensor shape
+     * @return uploaded tensor
+     */
     public static Tensor fromArray(int[] values, int... shape) {
+        Objects.requireNonNull(values, "values");
         long totalSize = checkLength(values.length, shape);
         long vramId = NativeEngine.allocVramUninit(totalSize);
+        VramHandle h = new VramHandle(vramId);
         try (Arena arena = Arena.ofConfined()) {
             MemorySegment hostSegment = arena.allocateFrom(ValueLayout.JAVA_INT, values);
             NativeEngine.writeVram(vramId, hostSegment, totalSize);
         } catch (RuntimeException | Error e) {
-            NativeEngine.freeVram(vramId);
+            h.release();
             throw e;
         }
-        return new Tensor(vramId, shape, DType.i32);
+        return new Tensor(DType.i32, shape, computeContiguousStrides(shape), 0L, h);
+    }
+
+    /**
+     * Creates a tensor directly from a native or heap Panama {@link MemorySegment}.
+     * If {@code source} is off-heap native memory, uploads directly without intermediate heap arrays.
+     *
+     * @param source source memory segment
+     * @param dtype  data type
+     * @param shape  tensor shape
+     * @return uploaded tensor
+     */
+    public static Tensor fromSegment(MemorySegment source, DType dtype, int... shape) {
+        Objects.requireNonNull(source, "source");
+        Objects.requireNonNull(dtype, "dtype");
+        ValidUtil.requireValidShape(shape);
+        long totalElements = computeSize(shape);
+        long minBytes = totalElements * dtype.byteSize();
+        if (source.byteSize() < minBytes) {
+            throw new IllegalArgumentException("Segment byteSize " + source.byteSize() + " is too small for "
+                    + totalElements + " elements of " + dtype + " (requires " + minBytes + " bytes)");
+        }
+        long vramId = NativeEngine.allocVramUninit(totalElements);
+        VramHandle h = new VramHandle(vramId);
+        try {
+            NativeEngine.writeVramSegment(vramId, source, totalElements);
+        } catch (RuntimeException | Error e) {
+            h.release();
+            throw e;
+        }
+        return new Tensor(dtype, shape, computeContiguousStrides(shape), 0L, h);
+    }
+
+    // ------------------------------------------------------------------------------------------
+    // Panama FFM Segment I/O
+    // ------------------------------------------------------------------------------------------
+
+    /**
+     * Downloads tensor data directly into the destination {@link MemorySegment}.
+     * If this tensor is non-contiguous or has non-zero offset, materializes it prior to download.
+     *
+     * @param destination target memory segment
+     */
+    public void copyTo(MemorySegment destination) {
+        ensureOpen();
+        Objects.requireNonNull(destination, "destination");
+        if (destination.isReadOnly()) {
+            throw new IllegalArgumentException("Destination segment is read-only");
+        }
+        long minBytes = size * dtype.byteSize();
+        if (destination.byteSize() < minBytes) {
+            throw new IllegalArgumentException("Destination segment byteSize " + destination.byteSize()
+                    + " is too small for " + size + " elements (requires " + minBytes + " bytes)");
+        }
+        if (isContiguous() && elementOffset == 0L) {
+            NativeEngine.downloadVramSegment(handle.vramId(), destination, size);
+        } else {
+            try (Tensor contig = contiguous()) {
+                contig.copyTo(destination);
+            }
+        }
+    }
+
+    /**
+     * Uploads data directly from the source {@link MemorySegment} into this tensor.
+     * Requires this tensor to be contiguous, non-offset, and non-broadcast.
+     *
+     * @param source source memory segment
+     */
+    public void copyFrom(MemorySegment source) {
+        ensureOpen();
+        Objects.requireNonNull(source, "source");
+        if (!isContiguous() || elementOffset != 0L || hasZeroStride(shape, strides)) {
+            throw new IllegalArgumentException("copyFrom requires a contiguous, non-offset, non-broadcast target tensor");
+        }
+        long minBytes = size * dtype.byteSize();
+        if (source.byteSize() < minBytes) {
+            throw new IllegalArgumentException("Source segment byteSize " + source.byteSize()
+                    + " is too small for " + size + " elements (requires " + minBytes + " bytes)");
+        }
+        NativeEngine.writeVramSegment(handle.vramId(), source, size);
     }
 
     // ------------------------------------------------------------------------------------------
     // Lifecycle & State
     // ------------------------------------------------------------------------------------------
 
+    /**
+     * Returns true if this tensor reference has been closed.
+     *
+     * @return true if closed
+     */
     public boolean isClosed() {
         return closed.get();
     }
 
+    /**
+     * Asserts that this tensor reference is still open.
+     *
+     * @throws IllegalStateException if already closed
+     */
     public void ensureOpen() {
         if (closed.get()) {
             throw new IllegalStateException("Tensor has already been closed");
         }
     }
 
+    /**
+     * Closes this tensor reference. If all references to the underlying VRAM buffer are closed, frees native VRAM.
+     */
     @Override
     public void close() {
         cleanable.clean();
     }
 
+    /**
+     * Returns the data type of this tensor.
+     *
+     * @return data type
+     */
     public DType getDType() {
         return dtype;
     }
 
+    /**
+     * Returns a copy of the tensor shape.
+     *
+     * @return shape array
+     */
     public int[] getShape() {
         return shape.clone();
     }
 
+    /**
+     * Returns a copy of the tensor strides.
+     *
+     * @return strides array
+     */
+    public int[] getStrides() {
+        return strides.clone();
+    }
+
+    /**
+     * Returns total number of logical elements in this tensor.
+     *
+     * @return element count
+     */
     public long getSize() {
         return size;
     }
 
+    /**
+     * Returns the number of dimensions (rank) of this tensor.
+     *
+     * @return rank
+     */
     public int dim() {
         return shape.length;
     }
 
+    /**
+     * Returns the memory tier residency of the underlying VRAM buffer.
+     *
+     * @return residency tier
+     */
     public Residency residency() {
         ensureOpen();
-        return NativeEngine.residency(vramId);
+        return NativeEngine.residency(handle.vramId());
     }
 
+    /**
+     * Pushes this tensor out of VRAM to host RAM or disk.
+     */
     public void evict() {
         ensureOpen();
-        NativeEngine.evict(vramId);
+        NativeEngine.evict(handle.vramId());
     }
 
     // ------------------------------------------------------------------------------------------
-    // Elementwise Arithmetic
+    // Zero-Copy Strided Views, Layout & Materialization
     // ------------------------------------------------------------------------------------------
 
+    /**
+     * Returns true if elements are tightly packed in standard C row-major order.
+     *
+     * @return true if contiguous
+     */
+    public boolean isContiguous() {
+        int expected = 1;
+        for (int i = shape.length - 1; i >= 0; i--) {
+            if (shape[i] == 1) continue;
+            if (strides[i] != expected) {
+                return false;
+            }
+            expected *= shape[i];
+        }
+        return true;
+    }
+
+    /**
+     * Returns a contiguous copy or view of this tensor.
+     * If this tensor is already contiguous with zero offset, returns a retained zero-copy view.
+     *
+     * @return contiguous tensor
+     */
+    public Tensor contiguous() {
+        ensureOpen();
+        if (isContiguous() && elementOffset == 0L) {
+            handle.retain();
+            return new Tensor(dtype, shape, strides, 0L, handle);
+        }
+        Tensor res = empty(dtype, shape);
+        try {
+            NativeEngine.copyStrided(handle.vramId(), res.handle.vramId(), elementOffset, dim(), shape, strides, size);
+            return res;
+        } catch (RuntimeException | Error e) {
+            res.close();
+            throw e;
+        }
+    }
+
+    /**
+     * Returns a brand-new contiguous copy of this tensor backed by an independent VRAM buffer.
+     *
+     * @return copy of this tensor
+     */
+    public Tensor copy() {
+        ensureOpen();
+        Tensor res = empty(dtype, shape);
+        try {
+            NativeEngine.copyStrided(handle.vramId(), res.handle.vramId(), elementOffset, dim(), shape, strides, size);
+            return res;
+        } catch (RuntimeException | Error e) {
+            res.close();
+            throw e;
+        }
+    }
+
+    /**
+     * Reshapes this tensor to the specified shape, supporting at most one {@code -1} inferred dimension.
+     * If this tensor is contiguous, returns a retained zero-copy view with row-major strides.
+     *
+     * @param newShape new dimension extents
+     * @return reshaped tensor
+     */
+    public Tensor reshape(int... newShape) {
+        ensureOpen();
+        int[] resolvedShape = ValidUtil.inferReshape(newShape, size);
+        if (isContiguous()) {
+            handle.retain();
+            return new Tensor(dtype, resolvedShape, computeContiguousStrides(resolvedShape), elementOffset, handle);
+        }
+        Tensor res = empty(dtype, resolvedShape);
+        try {
+            NativeEngine.copyStrided(handle.vramId(), res.handle.vramId(), elementOffset, dim(), shape, strides, size);
+            return res;
+        } catch (RuntimeException | Error e) {
+            res.close();
+            throw e;
+        }
+    }
+
+    /**
+     * Flattens this tensor into a 1-D tensor.
+     *
+     * @return 1-D flattened tensor
+     */
+    public Tensor flatten() {
+        return reshape(-1);
+    }
+
+    /**
+     * Returns a zero-copy transposed view reversing all dimensions.
+     *
+     * @return reversed axis view
+     */
+    public Tensor T() {
+        return transposeView();
+    }
+
+    /**
+     * Returns a zero-copy transposed view reversing all dimensions.
+     *
+     * @return reversed axis view
+     */
+    public Tensor transposeView() {
+        ensureOpen();
+        int n = shape.length;
+        int[] revShape = new int[n];
+        int[] revStrides = new int[n];
+        for (int i = 0; i < n; i++) {
+            revShape[i] = shape[n - 1 - i];
+            revStrides[i] = strides[n - 1 - i];
+        }
+        handle.retain();
+        return new Tensor(dtype, revShape, revStrides, elementOffset, handle);
+    }
+
+    /**
+     * Returns a zero-copy view permuting axes according to {@code axes}.
+     *
+     * @param axes axis permutation
+     * @return permuted view
+     */
+    public Tensor permute(int... axes) {
+        ensureOpen();
+        ValidUtil.validatePermutation(axes, dim());
+        int n = shape.length;
+        int[] newShape = new int[n];
+        int[] newStrides = new int[n];
+        for (int i = 0; i < n; i++) {
+            newShape[i] = shape[axes[i]];
+            newStrides[i] = strides[axes[i]];
+        }
+        handle.retain();
+        return new Tensor(dtype, newShape, newStrides, elementOffset, handle);
+    }
+
+    /**
+     * Removes all size-1 dimensions from the shape, returning a zero-copy view.
+     *
+     * @return squeezed view
+     */
+    public Tensor squeeze() {
+        ensureOpen();
+        int nonOnes = 0;
+        for (int d : shape) if (d > 1) nonOnes++;
+        if (nonOnes == 0) {
+            handle.retain();
+            return new Tensor(dtype, new int[]{1}, new int[]{1}, elementOffset, handle);
+        }
+        int[] newShape = new int[nonOnes];
+        int[] newStrides = new int[nonOnes];
+        int idx = 0;
+        for (int i = 0; i < shape.length; i++) {
+            if (shape[i] > 1) {
+                newShape[idx] = shape[i];
+                newStrides[idx] = strides[i];
+                idx++;
+            }
+        }
+        handle.retain();
+        return new Tensor(dtype, newShape, newStrides, elementOffset, handle);
+    }
+
+    /**
+     * Removes the size-1 dimension at {@code axis}, returning a zero-copy view.
+     *
+     * @param axis dimension axis to squeeze
+     * @return squeezed view
+     */
+    public Tensor squeeze(int axis) {
+        ensureOpen();
+        if (axis < 0) axis += dim();
+        if (axis < 0 || axis >= dim()) {
+            throw new IllegalArgumentException("Axis " + axis + " is out of bounds for dim " + dim());
+        }
+        if (shape[axis] != 1) {
+            throw new IllegalArgumentException("Cannot squeeze dimension " + axis + " with size " + shape[axis]);
+        }
+        if (dim() == 1) {
+            handle.retain();
+            return new Tensor(dtype, new int[]{1}, new int[]{1}, elementOffset, handle);
+        }
+        int[] newShape = new int[dim() - 1];
+        int[] newStrides = new int[dim() - 1];
+        int idx = 0;
+        for (int i = 0; i < dim(); i++) {
+            if (i != axis) {
+                newShape[idx] = shape[i];
+                newStrides[idx] = strides[i];
+                idx++;
+            }
+        }
+        handle.retain();
+        return new Tensor(dtype, newShape, newStrides, elementOffset, handle);
+    }
+
+    /**
+     * Inserts a dimension of size 1 at {@code axis}, returning a zero-copy view.
+     *
+     * @param axis position to insert dimension
+     * @return expanded view
+     */
+    public Tensor expandDims(int axis) {
+        ensureOpen();
+        if (axis < 0) axis += (dim() + 1);
+        if (axis < 0 || axis > dim()) {
+            throw new IllegalArgumentException("Axis " + axis + " is out of bounds for expanding rank " + dim());
+        }
+        int[] newShape = new int[dim() + 1];
+        int[] newStrides = new int[dim() + 1];
+        int nextStride = axis < dim() ? strides[axis] : 1;
+        int idx = 0;
+        for (int i = 0; i <= dim(); i++) {
+            if (i == axis) {
+                newShape[i] = 1;
+                newStrides[i] = nextStride;
+            } else {
+                newShape[i] = shape[idx];
+                newStrides[i] = strides[idx];
+                idx++;
+            }
+        }
+        handle.retain();
+        return new Tensor(dtype, newShape, newStrides, elementOffset, handle);
+    }
+
+    /**
+     * Alias for {@link #expandDims(int)}.
+     *
+     * @param axis position to insert dimension
+     * @return unsqueezed view
+     */
+    public Tensor unsqueeze(int axis) {
+        return expandDims(axis);
+    }
+
+    /**
+     * Broadcasts this tensor to {@code targetShape} using NumPy rules, returning a zero-copy view.
+     *
+     * @param targetShape broadcast target shape
+     * @return broadcast view with stride 0 along broadcast dimensions
+     */
+    public Tensor broadcastTo(int... targetShape) {
+        ensureOpen();
+        ValidUtil.requireValidShape(targetShape);
+        int[] bcastShape = ValidUtil.broadcastShape(shape, targetShape);
+        if (!Arrays.equals(bcastShape, targetShape)) {
+            throw new IllegalArgumentException("Cannot broadcast shape " + Arrays.toString(shape) + " to " + Arrays.toString(targetShape));
+        }
+        int[] bcastStrides = ValidUtil.broadcastStrides(shape, strides, targetShape);
+        handle.retain();
+        return new Tensor(dtype, targetShape, bcastStrides, elementOffset, handle);
+    }
+
+    /**
+     * Slices this tensor along leading dimensions according to {@code slices}, returning a zero-copy view.
+     *
+     * @param slices dimension slices
+     * @return sliced view
+     */
+    public Tensor slice(Slice... slices) {
+        ensureOpen();
+        if (slices == null) {
+            slices = new Slice[0];
+        }
+        if (slices.length > dim()) {
+            throw new IllegalArgumentException("Too many slices: " + slices.length + " for rank " + dim());
+        }
+        int[] newShape = new int[dim()];
+        int[] newStrides = new int[dim()];
+        long newOffset = elementOffset;
+        for (int d = 0; d < dim(); d++) {
+            Slice s = (d < slices.length && slices[d] != null) ? slices[d] : Slice.all();
+            Slice.ResolvedSlice res = s.resolve(shape[d]);
+            newShape[d] = res.length();
+            newStrides[d] = strides[d] * res.step();
+            newOffset += (long) res.start() * strides[d];
+        }
+        handle.retain();
+        return new Tensor(dtype, newShape, newStrides, newOffset, handle);
+    }
+
+    /**
+     * Reads a single float scalar from this tensor.
+     *
+     * @return scalar float value
+     * @throws IllegalStateException if size != 1 or dtype != f32
+     */
+    public float item() {
+        ensureOpen();
+        if (size != 1) {
+            throw new IllegalStateException("item() requires tensor with exactly 1 element, got size " + size);
+        }
+        if (dtype != DType.f32) {
+            throw new IllegalStateException("item() requires f32 tensor, got " + dtype);
+        }
+        try (Tensor contig = contiguous()) {
+            return contig.toFloatArray()[0];
+        }
+    }
+
+    /**
+     * Reads a single int scalar from this tensor.
+     *
+     * @return scalar int value
+     * @throws IllegalStateException if size != 1 or dtype != i32
+     */
+    public int itemInt() {
+        ensureOpen();
+        if (size != 1) {
+            throw new IllegalStateException("itemInt() requires tensor with exactly 1 element, got size " + size);
+        }
+        if (dtype != DType.i32) {
+            throw new IllegalStateException("itemInt() requires i32 tensor, got " + dtype);
+        }
+        try (Tensor contig = contiguous()) {
+            return contig.toIntArray()[0];
+        }
+    }
+
+    // ------------------------------------------------------------------------------------------
+    // Elementwise Arithmetic & NumPy Broadcasting
+    // ------------------------------------------------------------------------------------------
+
+    /**
+     * Computes elementwise addition with automatic NumPy broadcasting.
+     *
+     * @param other right operand
+     * @return newly allocated result tensor
+     */
     public Tensor add(Tensor other) {
         ensureOpen();
-        Tensor res = empty(dtype, shape);
+        int[] targetShape = ValidUtil.broadcastShape(shape, other.getShape());
+        Tensor res = empty(dtype, targetShape);
         try { return add(other, res); } catch (RuntimeException | Error e) { res.close(); throw e; }
     }
+
+    /**
+     * Computes elementwise addition into caller-provided {@code res}.
+     *
+     * @param other right operand
+     * @param res   destination tensor
+     * @return {@code res}
+     */
     public Tensor add(Tensor other, Tensor res) { ensureOpen(); return ArithmeticOps.add(this, other, res); }
 
+    /**
+     * Computes elementwise subtraction with automatic NumPy broadcasting.
+     *
+     * @param other right operand
+     * @return newly allocated result tensor
+     */
     public Tensor sub(Tensor other) {
         ensureOpen();
-        Tensor res = empty(dtype, shape);
+        int[] targetShape = ValidUtil.broadcastShape(shape, other.getShape());
+        Tensor res = empty(dtype, targetShape);
         try { return sub(other, res); } catch (RuntimeException | Error e) { res.close(); throw e; }
     }
+
+    /**
+     * Computes elementwise subtraction into caller-provided {@code res}.
+     *
+     * @param other right operand
+     * @param res   destination tensor
+     * @return {@code res}
+     */
     public Tensor sub(Tensor other, Tensor res) { ensureOpen(); return ArithmeticOps.sub(this, other, res); }
 
+    /**
+     * Computes elementwise multiplication with automatic NumPy broadcasting.
+     *
+     * @param other right operand
+     * @return newly allocated result tensor
+     */
     public Tensor mul(Tensor other) {
         ensureOpen();
-        Tensor res = empty(dtype, shape);
+        int[] targetShape = ValidUtil.broadcastShape(shape, other.getShape());
+        Tensor res = empty(dtype, targetShape);
         try { return mul(other, res); } catch (RuntimeException | Error e) { res.close(); throw e; }
     }
+
+    /**
+     * Computes elementwise multiplication into caller-provided {@code res}.
+     *
+     * @param other right operand
+     * @param res   destination tensor
+     * @return {@code res}
+     */
     public Tensor mul(Tensor other, Tensor res) { ensureOpen(); return ArithmeticOps.mul(this, other, res); }
 
+    /**
+     * Computes elementwise division with automatic NumPy broadcasting.
+     *
+     * @param other right operand
+     * @return newly allocated result tensor
+     */
     public Tensor div(Tensor other) {
         ensureOpen();
-        Tensor res = empty(dtype, shape);
+        int[] targetShape = ValidUtil.broadcastShape(shape, other.getShape());
+        Tensor res = empty(dtype, targetShape);
         try { return div(other, res); } catch (RuntimeException | Error e) { res.close(); throw e; }
     }
+
+    /**
+     * Computes elementwise division into caller-provided {@code res}.
+     *
+     * @param other right operand
+     * @param res   destination tensor
+     * @return {@code res}
+     */
     public Tensor div(Tensor other, Tensor res) { ensureOpen(); return ArithmeticOps.div(this, other, res); }
 
     // Scalar arithmetic
-    public Tensor add(float c) { ensureOpen(); return lazy().add(c).eval(); }
-    public Tensor sub(float c) { ensureOpen(); return lazy().sub(c).eval(); }
-    public Tensor mul(float c) { ensureOpen(); return lazy().mul(c).eval(); }
-    public Tensor div(float c) { ensureOpen(); return lazy().div(c).eval(); }
+    public Tensor add(float c) {
+        ensureOpen();
+        if (this.dtype == DType.i32) {
+            return add((int) c);
+        }
+        return lazy().add(c).eval();
+    }
+    public Tensor sub(float c) {
+        ensureOpen();
+        if (this.dtype == DType.i32) {
+            return sub((int) c);
+        }
+        return lazy().sub(c).eval();
+    }
+    public Tensor mul(float c) {
+        ensureOpen();
+        if (this.dtype == DType.i32) {
+            return mul((int) c);
+        }
+        return lazy().mul(c).eval();
+    }
+    public Tensor div(float c) {
+        ensureOpen();
+        if (this.dtype == DType.i32) {
+            return div((int) c);
+        }
+        return lazy().div(c).eval();
+    }
 
-    public Tensor add(float c, Tensor res) { ensureOpen(); return lazy().add(c).eval(res); }
-    public Tensor sub(float c, Tensor res) { ensureOpen(); return lazy().sub(c).eval(res); }
-    public Tensor mul(float c, Tensor res) { ensureOpen(); return lazy().mul(c).eval(res); }
-    public Tensor div(float c, Tensor res) { ensureOpen(); return lazy().div(c).eval(res); }
+    public Tensor add(float c, Tensor res) {
+        ensureOpen();
+        if (this.dtype == DType.i32) {
+            return add((int) c, res);
+        }
+        return lazy().add(c).eval(res);
+    }
+    public Tensor sub(float c, Tensor res) {
+        ensureOpen();
+        if (this.dtype == DType.i32) {
+            return sub((int) c, res);
+        }
+        return lazy().sub(c).eval(res);
+    }
+    public Tensor mul(float c, Tensor res) {
+        ensureOpen();
+        if (this.dtype == DType.i32) {
+            return mul((int) c, res);
+        }
+        return lazy().mul(c).eval(res);
+    }
+    public Tensor div(float c, Tensor res) {
+        ensureOpen();
+        if (this.dtype == DType.i32) {
+            return div((int) c, res);
+        }
+        return lazy().div(c).eval(res);
+    }
+
+    public Tensor add(int c) {
+        ensureOpen();
+        if (this.dtype == DType.i32) {
+            try (Tensor s = fromArray(new int[]{c}, 1)) {
+                return add(s);
+            }
+        }
+        return add((float) c);
+    }
+    public Tensor sub(int c) {
+        ensureOpen();
+        if (this.dtype == DType.i32) {
+            try (Tensor s = fromArray(new int[]{c}, 1)) {
+                return sub(s);
+            }
+        }
+        return sub((float) c);
+    }
+    public Tensor mul(int c) {
+        ensureOpen();
+        if (this.dtype == DType.i32) {
+            try (Tensor s = fromArray(new int[]{c}, 1)) {
+                return mul(s);
+            }
+        }
+        return mul((float) c);
+    }
+    public Tensor div(int c) {
+        ensureOpen();
+        if (this.dtype == DType.i32) {
+            try (Tensor s = fromArray(new int[]{c}, 1)) {
+                return div(s);
+            }
+        }
+        return div((float) c);
+    }
+
+    public Tensor add(int c, Tensor res) {
+        ensureOpen();
+        if (this.dtype == DType.i32) {
+            try (Tensor s = fromArray(new int[]{c}, 1)) {
+                return add(s, res);
+            }
+        }
+        return add((float) c, res);
+    }
+    public Tensor sub(int c, Tensor res) {
+        ensureOpen();
+        if (this.dtype == DType.i32) {
+            try (Tensor s = fromArray(new int[]{c}, 1)) {
+                return sub(s, res);
+            }
+        }
+        return sub((float) c, res);
+    }
+    public Tensor mul(int c, Tensor res) {
+        ensureOpen();
+        if (this.dtype == DType.i32) {
+            try (Tensor s = fromArray(new int[]{c}, 1)) {
+                return mul(s, res);
+            }
+        }
+        return mul((float) c, res);
+    }
+    public Tensor div(int c, Tensor res) {
+        ensureOpen();
+        if (this.dtype == DType.i32) {
+            try (Tensor s = fromArray(new int[]{c}, 1)) {
+                return div(s, res);
+            }
+        }
+        return div((float) c, res);
+    }
+
+    // ------------------------------------------------------------------------------------------
+    // In-Place Operations
+    // ------------------------------------------------------------------------------------------
+
+    /**
+     * Computes in-place addition {@code this += other}.
+     *
+     * @param other operand tensor
+     * @return {@code this}
+     */
+    public Tensor addi(Tensor other) {
+        ensureOpen();
+        validateInPlaceTarget(other);
+        return ArithmeticOps.add(this, other, this);
+    }
+
+    /**
+     * Computes in-place subtraction {@code this -= other}.
+     *
+     * @param other operand tensor
+     * @return {@code this}
+     */
+    public Tensor subi(Tensor other) {
+        ensureOpen();
+        validateInPlaceTarget(other);
+        return ArithmeticOps.sub(this, other, this);
+    }
+
+    /**
+     * Computes in-place multiplication {@code this *= other}.
+     *
+     * @param other operand tensor
+     * @return {@code this}
+     */
+    public Tensor muli(Tensor other) {
+        ensureOpen();
+        validateInPlaceTarget(other);
+        return ArithmeticOps.mul(this, other, this);
+    }
+
+    /**
+     * Computes in-place division {@code this /= other}.
+     *
+     * @param other operand tensor
+     * @return {@code this}
+     */
+    public Tensor divi(Tensor other) {
+        ensureOpen();
+        validateInPlaceTarget(other);
+        return ArithmeticOps.div(this, other, this);
+    }
+
+    public Tensor addi(float scalar) { return add(scalar, this); }
+    public Tensor subi(float scalar) { return sub(scalar, this); }
+    public Tensor muli(float scalar) { return mul(scalar, this); }
+    public Tensor divi(float scalar) { return div(scalar, this); }
+
+    public Tensor addi(int scalar) {
+        try (Tensor s = fromArray(new int[]{scalar}, 1)) {
+            return addi(s);
+        }
+    }
+
+    public Tensor subi(int scalar) {
+        try (Tensor s = fromArray(new int[]{scalar}, 1)) {
+            return subi(s);
+        }
+    }
+
+    public Tensor muli(int scalar) {
+        try (Tensor s = fromArray(new int[]{scalar}, 1)) {
+            return muli(s);
+        }
+    }
+
+    public Tensor divi(int scalar) {
+        try (Tensor s = fromArray(new int[]{scalar}, 1)) {
+            return divi(s);
+        }
+    }
+
+    private void validateInPlaceTarget(Tensor other) {
+        if (!isContiguous() || elementOffset != 0L || hasZeroStride(shape, strides)) {
+            throw new IllegalArgumentException("In-place operations require a contiguous, non-offset, non-broadcast target tensor");
+        }
+        int[] bcast = ValidUtil.broadcastShape(shape, other.getShape());
+        if (!Arrays.equals(bcast, shape)) {
+            throw new IllegalArgumentException("Cannot broadcast operand shape " + Arrays.toString(other.getShape())
+                    + " into in-place target shape " + Arrays.toString(shape));
+        }
+    }
+
+    // ------------------------------------------------------------------------------------------
+    // Reverse Scalar Operations
+    // ------------------------------------------------------------------------------------------
+
+    /**
+     * Computes reverse scalar subtraction {@code scalar - this} on GPU.
+     *
+     * @param scalar left scalar operand
+     * @return newly allocated result tensor
+     */
+    public Tensor rsub(float scalar) {
+        ensureOpen();
+        if (this.dtype == DType.i32) {
+            return rsub((int) scalar);
+        }
+        return lazy().rsub(scalar).eval();
+    }
+
+    /**
+     * Computes reverse scalar subtraction {@code scalar - this} into {@code res}.
+     *
+     * @param scalar left scalar operand
+     * @param res    destination tensor
+     * @return {@code res}
+     */
+    public Tensor rsub(float scalar, Tensor res) {
+        ensureOpen();
+        if (this.dtype == DType.i32) {
+            return rsub((int) scalar, res);
+        }
+        return lazy().rsub(scalar).eval(res);
+    }
+
+    /**
+     * Computes reverse scalar division {@code scalar / this} on GPU.
+     *
+     * @param scalar left scalar operand
+     * @return newly allocated result tensor
+     */
+    public Tensor rdiv(float scalar) {
+        ensureOpen();
+        if (this.dtype == DType.i32) {
+            return rdiv((int) scalar);
+        }
+        return lazy().rdiv(scalar).eval();
+    }
+
+    /**
+     * Computes reverse scalar division {@code scalar / this} into {@code res}.
+     *
+     * @param scalar left scalar operand
+     * @param res    destination tensor
+     * @return {@code res}
+     */
+    public Tensor rdiv(float scalar, Tensor res) {
+        ensureOpen();
+        if (this.dtype == DType.i32) {
+            return rdiv((int) scalar, res);
+        }
+        return lazy().rdiv(scalar).eval(res);
+    }
+
+    /**
+     * Computes reverse scalar subtraction {@code scalar - this} on GPU for integers.
+     *
+     * @param scalar left scalar operand
+     * @return newly allocated result tensor
+     */
+    public Tensor rsub(int scalar) {
+        ensureOpen();
+        if (this.dtype == DType.i32) {
+            try (Tensor s = fromArray(new int[]{scalar}, 1)) {
+                return s.sub(this);
+            }
+        }
+        return rsub((float) scalar);
+    }
+
+    /**
+     * Computes reverse scalar subtraction {@code scalar - this} into {@code res} for integers.
+     *
+     * @param scalar left scalar operand
+     * @param res    destination tensor
+     * @return {@code res}
+     */
+    public Tensor rsub(int scalar, Tensor res) {
+        ensureOpen();
+        if (this.dtype == DType.i32) {
+            try (Tensor s = fromArray(new int[]{scalar}, 1)) {
+                return s.sub(this, res);
+            }
+        }
+        return rsub((float) scalar, res);
+    }
+
+    /**
+     * Computes reverse scalar division {@code scalar / this} on GPU for integers.
+     *
+     * @param scalar left scalar operand
+     * @return newly allocated result tensor
+     */
+    public Tensor rdiv(int scalar) {
+        ensureOpen();
+        if (this.dtype == DType.i32) {
+            try (Tensor s = fromArray(new int[]{scalar}, 1)) {
+                return s.div(this);
+            }
+        }
+        return rdiv((float) scalar);
+    }
+
+    /**
+     * Computes reverse scalar division {@code scalar / this} into {@code res} for integers.
+     *
+     * @param scalar left scalar operand
+     * @param res    destination tensor
+     * @return {@code res}
+     */
+    public Tensor rdiv(int scalar, Tensor res) {
+        ensureOpen();
+        if (this.dtype == DType.i32) {
+            try (Tensor s = fromArray(new int[]{scalar}, 1)) {
+                return s.div(this, res);
+            }
+        }
+        return rdiv((float) scalar, res);
+    }
 
     // ------------------------------------------------------------------------------------------
     // Trigonometric
@@ -319,7 +1423,7 @@ public class Tensor implements AutoCloseable {
     public Tensor matmul(Tensor other) {
         ensureOpen();
         ValidUtil.requireOperandF32("matmul", dtype);
-        Dims d = ValidUtil.matmulDims(shape, other.shape, false, false);
+        Dims d = ValidUtil.matmulDims(shape, other.getShape(), false, false);
         Tensor res = empty(DType.f32, d.resultShape());
         try {
             return MatmulOps.matmul(this, other, res, false, false);
@@ -581,13 +1685,28 @@ public class Tensor implements AutoCloseable {
         if (this.dtype != DType.f32) {
             throw new IllegalStateException("Cannot readback " + this.dtype + " as float[]");
         }
-        float[] result = new float[(int) this.size];
-        try (Arena arena = Arena.ofConfined()) {
-            MemorySegment hostSegment = arena.allocate(ValueLayout.JAVA_FLOAT, this.size);
-            NativeEngine.downloadVram(this.vramId, hostSegment, this.size);
-            MemorySegment.copy(hostSegment, ValueLayout.JAVA_FLOAT, 0, result, 0, (int) this.size);
+        if (isContiguous() && elementOffset == 0L) {
+            float[] result = new float[(int) this.size];
+            try (Arena arena = Arena.ofConfined()) {
+                MemorySegment hostSegment = arena.allocate(ValueLayout.JAVA_FLOAT, this.size);
+                NativeEngine.downloadVram(this.handle.vramId(), hostSegment, this.size);
+                MemorySegment.copy(hostSegment, ValueLayout.JAVA_FLOAT, 0, result, 0, (int) this.size);
+            }
+            return result;
         }
-        return result;
+        try (Tensor contig = contiguous()) {
+            return contig.toFloatArray();
+        }
+    }
+
+    /**
+     * Convenience alias for {@link #toFloatArray()}. Downloads the tensor data to a newly allocated {@code float[]}.
+     *
+     * @return newly allocated float array containing tensor elements in row-major order
+     * @throws IllegalStateException if this tensor is not of dtype {@link DType#f32} or has been closed
+     */
+    public float[] toArray() {
+        return toFloatArray();
     }
 
     public int[] toIntArray() {
@@ -595,13 +1714,28 @@ public class Tensor implements AutoCloseable {
         if (this.dtype != DType.i32) {
             throw new IllegalStateException("Cannot readback " + this.dtype + " as int[]");
         }
-        int[] result = new int[(int) this.size];
-        try (Arena arena = Arena.ofConfined()) {
-            MemorySegment hostSegment = arena.allocate(ValueLayout.JAVA_INT, this.size);
-            NativeEngine.downloadVram(this.vramId, hostSegment, this.size);
-            MemorySegment.copy(hostSegment, ValueLayout.JAVA_INT, 0, result, 0, (int) this.size);
+        if (isContiguous() && elementOffset == 0L) {
+            int[] result = new int[(int) this.size];
+            try (Arena arena = Arena.ofConfined()) {
+                MemorySegment hostSegment = arena.allocate(ValueLayout.JAVA_INT, this.size);
+                NativeEngine.downloadVram(this.handle.vramId(), hostSegment, this.size);
+                MemorySegment.copy(hostSegment, ValueLayout.JAVA_INT, 0, result, 0, (int) this.size);
+            }
+            return result;
         }
-        return result;
+        try (Tensor contig = contiguous()) {
+            return contig.toIntArray();
+        }
+    }
+
+    /**
+     * Convenience alias for {@link #toIntArray()}. Downloads the tensor data to a newly allocated {@code int[]}.
+     *
+     * @return newly allocated int array containing tensor elements in row-major order
+     * @throws IllegalStateException if this tensor is not of dtype {@link DType#i32} or has been closed
+     */
+    public int[] toArrayInt() {
+        return toIntArray();
     }
 
     // ------------------------------------------------------------------------------------------
@@ -633,8 +1767,17 @@ public class Tensor implements AutoCloseable {
         return total;
     }
 
+    private static boolean hasZeroStride(int[] shape, int[] strides) {
+        for (int i = 0; i < shape.length; i++) {
+            if (shape[i] > 1 && strides[i] == 0) return true;
+        }
+        return false;
+    }
+
     @Override
     public String toString() {
-        return "Tensor(vramId=" + vramId + ", shape=" + Arrays.toString(shape) + ", dtype=" + dtype + ", size=" + size + ")";
+        return "Tensor(vramId=" + handle.vramId() + ", shape=" + Arrays.toString(shape)
+                + ", strides=" + Arrays.toString(strides) + ", offset=" + elementOffset
+                + ", dtype=" + dtype + ", size=" + size + ")";
     }
 }

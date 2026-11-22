@@ -17,6 +17,7 @@
 package hc4j.engine;
 
 import hc4j.internal.ffi.NativeEngine;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * A command-batching scope. Every GPU op issued while a batch is open is recorded into one shared
@@ -24,21 +25,36 @@ import hc4j.internal.ffi.NativeEngine;
  */
 public final class GpuBatch implements AutoCloseable {
 
-    private boolean open = true;
+    private final AtomicBoolean closed = new AtomicBoolean(false);
 
     private GpuBatch() {}
 
+    /**
+     * Opens a new or nested command-batching scope.
+     *
+     * @return an AutoCloseable batch handle
+     */
     public static GpuBatch open() {
         NativeEngine.batchBegin();
         return new GpuBatch();
     }
 
+    /**
+     * Opens a new or nested command-batching scope. Alias for {@link #open()}.
+     *
+     * @return an AutoCloseable batch handle
+     */
+    public static GpuBatch begin() {
+        return open();
+    }
+
+    /**
+     * Closes this batch scope. Idempotent across multiple invocations.
+     */
     @Override
     public void close() {
-        if (!open) {
-            return;
+        if (closed.compareAndSet(false, true)) {
+            NativeEngine.batchEnd();
         }
-        open = false;
-        NativeEngine.batchEnd();
     }
 }

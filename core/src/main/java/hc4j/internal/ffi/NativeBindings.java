@@ -72,6 +72,11 @@ public final class NativeBindings {
         static final MethodHandle DISPATCH_MUL = bind("dispatch_mul", BINARY_DESC);
         static final MethodHandle DISPATCH_DIV = bind("dispatch_div", BINARY_DESC);
 
+        // Strided copy / materialization
+        static final FunctionDescriptor COPY_STRIDED_DESC = FunctionDescriptor.of(
+                JAVA_INT, JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_INT, ADDRESS, ADDRESS, JAVA_LONG);
+        static final MethodHandle DISPATCH_COPY_STRIDED = bind("dispatch_copy_strided", COPY_STRIDED_DESC);
+
         // Unary elementwise (trigonometric & exponential)
         static final FunctionDescriptor UNARY_DESC = FunctionDescriptor.of(
                 JAVA_INT, JAVA_LONG, JAVA_LONG, JAVA_INT, ADDRESS, ADDRESS, ADDRESS, JAVA_LONG, JAVA_INT);
@@ -271,5 +276,10 @@ public final class NativeBindings {
 
     public static int dispatchFused(MemorySegment program, int len, MemorySegment inputs, int n, long idOut) throws Throwable {
         return (int) Holder.FUSED_DISPATCH.invokeExact(program, len, inputs, n, idOut);
+    }
+
+    public static int dispatchCopyStrided(long src, long out, long srcOffset, int rank,
+            MemorySegment shape, MemorySegment srcStrides, long len) throws Throwable {
+        return (int) Holder.DISPATCH_COPY_STRIDED.invokeExact(src, out, srcOffset, rank, shape, srcStrides, len);
     }
 }

@@ -126,4 +126,107 @@ public final class ValidUtil {
         }
         return new Rows((int) rows, (int) cols);
     }
+
+    public static void requireValidShape(int... shape) {
+        if (shape == null || shape.length == 0) {
+            throw new IllegalArgumentException("Shape must be non-null and non-empty");
+        }
+        for (int dim : shape) {
+            if (dim <= 0) {
+                throw new IllegalArgumentException("Shape dimensions must be strictly positive, got " + Arrays.toString(shape));
+            }
+        }
+    }
+
+    public static int[] broadcastShape(int[] a, int[] b) {
+        int maxLen = Math.max(a.length, b.length);
+        int[] result = new int[maxLen];
+        for (int i = 0; i < maxLen; i++) {
+            int dimA = i < a.length ? a[a.length - 1 - i] : 1;
+            int dimB = i < b.length ? b[b.length - 1 - i] : 1;
+            if (dimA == dimB || dimA == 1 || dimB == 1) {
+                result[maxLen - 1 - i] = Math.max(dimA, dimB);
+            } else {
+                int dimIndex = maxLen - 1 - i;
+                throw new IllegalArgumentException("Cannot broadcast shapes " + Arrays.toString(a)
+                        + " and " + Arrays.toString(b) + " at dimension " + dimIndex + " (" + dimA + " != " + dimB + ")");
+            }
+        }
+        return result;
+    }
+
+    public static int[] broadcastStrides(int[] srcShape, int[] srcStrides, int[] targetShape) {
+        if (srcShape.length > targetShape.length) {
+            throw new IllegalArgumentException("Source rank " + srcShape.length + " exceeds target rank " + targetShape.length);
+        }
+        int[] result = new int[targetShape.length];
+        int offset = targetShape.length - srcShape.length;
+        for (int i = 0; i < offset; i++) {
+            result[i] = 0;
+        }
+        for (int i = 0; i < srcShape.length; i++) {
+            int srcDim = srcShape[i];
+            int targetDim = targetShape[offset + i];
+            if (srcDim == 1 && targetDim > 1) {
+                result[offset + i] = 0;
+            } else if (srcDim == targetDim) {
+                result[offset + i] = srcStrides[i];
+            } else {
+                throw new IllegalArgumentException("Cannot broadcast dimension " + srcDim + " to " + targetDim);
+            }
+        }
+        return result;
+    }
+
+    public static int[] inferReshape(int[] requestedShape, long totalElements) {
+        if (requestedShape == null || requestedShape.length == 0) {
+            throw new IllegalArgumentException("Shape must be non-null and non-empty");
+        }
+        int unknownIndex = -1;
+        long knownProduct = 1;
+        for (int i = 0; i < requestedShape.length; i++) {
+            int dim = requestedShape[i];
+            if (dim == -1) {
+                if (unknownIndex != -1) {
+                    throw new IllegalArgumentException("Can only specify at most one unknown dimension (-1)");
+                }
+                unknownIndex = i;
+            } else if (dim <= 0) {
+                throw new IllegalArgumentException("Invalid dimension size: " + dim);
+            } else {
+                knownProduct *= dim;
+            }
+        }
+        int[] result = requestedShape.clone();
+        if (unknownIndex != -1) {
+            if (totalElements % knownProduct != 0) {
+                throw new IllegalArgumentException("Cannot reshape array of size " + totalElements
+                        + " into shape " + Arrays.toString(requestedShape));
+            }
+            result[unknownIndex] = (int) (totalElements / knownProduct);
+        } else {
+            if (knownProduct != totalElements) {
+                throw new IllegalArgumentException("Cannot reshape array of size " + totalElements
+                        + " into shape " + Arrays.toString(requestedShape));
+            }
+        }
+        return result;
+    }
+
+    public static void validatePermutation(int[] axes, int rank) {
+        if (axes == null || axes.length != rank) {
+            throw new IllegalArgumentException("Permutation axes length " + (axes == null ? 0 : axes.length)
+                    + " does not match rank " + rank);
+        }
+        boolean[] seen = new boolean[rank];
+        for (int axis : axes) {
+            if (axis < 0 || axis >= rank) {
+                throw new IllegalArgumentException("Axis " + axis + " is out of bounds for rank " + rank);
+            }
+            if (seen[axis]) {
+                throw new IllegalArgumentException("Duplicate axis in permutation: " + axis);
+            }
+            seen[axis] = true;
+        }
+    }
 }

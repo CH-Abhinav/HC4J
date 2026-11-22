@@ -52,5 +52,11 @@ public abstract class TensorAccess {
 
     public abstract void ensureOpen(Tensor t);
 
+    public abstract long elementOffset(Tensor t);
+
+    public abstract VramHandle getVramHandle(Tensor t);
+
     public abstract Tensor create(DType dtype, int[] shape, int[] strides, long vramId);
+
+    public abstract Tensor create(DType dtype, int[] shape, int[] strides, long elementOffset, VramHandle handle);
 }

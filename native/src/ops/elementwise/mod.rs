@@ -216,3 +216,37 @@ pub unsafe fn dispatch_unary_kernel(
         run_strided(&pipeline, &[id_a, id_out], bytemuck::bytes_of(&dims), length as u64)
     })
 }
+
+/// Copies `len` 4-byte elements from `src` (at logical index `src_offset + dot(coords, src_strides)`)
+/// into contiguous `out[0..len]`. Works for both f32 and i32 without NaN canonicalization.
+///
+/// # Safety
+/// If `rank > 0`, `shape` and `src_strides` must point to `rank` readable `u32` values.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn dispatch_copy_strided(
+    src: u64,
+    out: u64,
+    src_offset: u64,
+    rank: u32,
+    shape: *const u32,
+    src_strides: *const u32,
+    len: usize,
+) -> i32 {
+    ffi_guard("dispatch_copy_strided", || {
+        if len == 0 {
+            return Ok(());
+        }
+        let len_u32 = u32::try_from(len).map_err(|_| Hc4jError::InvalidParam("len exceeds u32"))?;
+        let offset_u32 = u32::try_from(src_offset).map_err(|_| Hc4jError::InvalidParam("src_offset exceeds u32"))?;
+
+        let (pruned_shape, pruned_strides) = unsafe { pruned_layout(rank, shape, &[src_strides])? };
+        let dims = CopyStridedDims {
+            params: [len_u32, offset_u32, 0, 0],
+            shape: pruned_shape,
+            strides: pruned_strides[0],
+        };
+        let pipeline = crate::get_engine()?.get_or_compile("copy_strided", "main", COPY_STRIDED_WGSL)?;
+        run_strided(&pipeline, &[src, out], bytemuck::bytes_of(&dims), len as u64)
+    })
+}
+

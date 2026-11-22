@@ -5,7 +5,7 @@
 use naga::valid::{Capabilities, ValidationFlags, Validator};
 
 use super::arithmetic::{DataType, generate_elem_shader};
-use super::elementwise::{generate_unary_shader, generate_unary_shader_with};
+use super::elementwise::{COPY_STRIDED_WGSL, generate_unary_shader, generate_unary_shader_with};
 use super::nn::{Activation, RowOp, row_bias_wgsl};
 use super::reduce::{Load, ReduceOp, flat_kernel_wgsl, row_argmax_wgsl, row_kernel_wgsl};
 use super::fusion::{self, op};
@@ -35,6 +35,11 @@ fn unary_suites() {
     for op in ops {
         validate(op, &generate_unary_shader(op));
     }
+}
+
+#[test]
+fn strided_copy_shader() {
+    validate("copy_strided", COPY_STRIDED_WGSL);
 }
 
 #[test]

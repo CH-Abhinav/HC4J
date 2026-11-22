@@ -138,3 +138,43 @@ impl<'a> UnaryKernel<'a> {
         )
     }
 }
+
+/// Strided copy WGSL shader. Copies `len` 4-byte words from `src` (at `src_offset + dot(coords, strides)`)
+/// into contiguous `out[0..len]`.
+pub const COPY_STRIDED_WGSL: &str = r#"
+struct CopyStridedDims {
+    params: vec4<u32>, // x = length, y = src_offset, z = 0, w = 0
+    shape: array<vec4<u32>, 2>,
+    strides: array<vec4<u32>, 2>,
+}
+
+@group(0) @binding(0) var<storage, read_write> src: array<u32>;
+@group(0) @binding(1) var<storage, read_write> out: array<u32>;
+@group(0) @binding(2) var<uniform> dims: CopyStridedDims;
+
+@compute @workgroup_size(256)
+fn main(
+    @builtin(global_invocation_id) gid: vec3<u32>,
+    @builtin(num_workgroups) nwg: vec3<u32>,
+) {
+    let tid = gid.x + gid.y * (nwg.x * 256u);
+    let length = dims.params.x;
+
+    if (tid >= length) { return; }
+
+    var remaining = tid;
+    var src_idx = dims.params.y; // src_offset
+
+    for (var d = 0u; d < 8u; d = d + 1u) {
+        let dim_size = dims.shape[d >> 2u][d & 3u];
+        if (dim_size > 1u) {
+            let coord = remaining % dim_size;
+            remaining = remaining / dim_size;
+            src_idx = src_idx + coord * dims.strides[d >> 2u][d & 3u];
+        }
+    }
+
+    out[tid] = src[src_idx];
+}
+"#;
+

@@ -378,26 +378,99 @@ public final class NativeEngine {
         checkStatus(status, "evict");
     }
 
+    private static final Object BATCH_LOCK = new Object();
+    private static int batchDepth = 0;
+
     public static void batchBegin() {
-        ensureInitialized();
-        int status;
-        try {
-            status = (int) batchBeginHandle.invokeExact();
-        } catch (Throwable t) {
-            throw new RuntimeException("HC4J batch begin failed", t);
+        synchronized (BATCH_LOCK) {
+            if (batchDepth++ == 0) {
+                ensureInitialized();
+                int status;
+                try {
+                    status = (int) batchBeginHandle.invokeExact();
+                } catch (Throwable t) {
+                    batchDepth--;
+                    throw new RuntimeException("HC4J batch begin failed", t);
+                }
+                checkStatus(status, "batchBegin");
+            }
         }
-        checkStatus(status, "batchBegin");
     }
 
     public static void batchEnd() {
-        ensureInitialized();
-        int status;
-        try {
-            status = (int) batchEndHandle.invokeExact();
-        } catch (Throwable t) {
-            throw new RuntimeException("HC4J batch end failed", t);
+        synchronized (BATCH_LOCK) {
+            if (batchDepth <= 0) {
+                return;
+            }
+            if (--batchDepth == 0) {
+                ensureInitialized();
+                int status;
+                try {
+                    status = (int) batchEndHandle.invokeExact();
+                } catch (Throwable t) {
+                    throw new RuntimeException("HC4J batch end failed", t);
+                }
+                checkStatus(status, "batchEnd");
+            }
         }
-        checkStatus(status, "batchEnd");
+    }
+
+    public static void writeVramSegment(long vramId, MemorySegment hostData, long totalElements) {
+        ensureInitialized();
+        if (hostData.isNative()) {
+            try {
+                int status = (int) gpuWriteHandle.invokeExact(vramId, hostData, totalElements);
+                checkStatus(status, "writeVramSegment");
+            } catch (Throwable t) {
+                throw new RuntimeException("HC4J VRAM Write Exception", t);
+            }
+        } else {
+            long bytes = totalElements * 4L;
+            try (Arena arena = Arena.ofConfined()) {
+                MemorySegment nativeBuf = arena.allocate(bytes, 16);
+                MemorySegment.copy(hostData, 0, nativeBuf, 0, bytes);
+                int status = (int) gpuWriteHandle.invokeExact(vramId, nativeBuf, totalElements);
+                checkStatus(status, "writeVramSegment");
+            } catch (Throwable t) {
+                throw new RuntimeException("HC4J VRAM Write Exception", t);
+            }
+        }
+    }
+
+    public static void downloadVramSegment(long vramId, MemorySegment destination, long totalElements) {
+        ensureInitialized();
+        if (destination.isNative()) {
+            try {
+                int status = (int) gpuDownloadHandle.invokeExact(vramId, destination, totalElements);
+                checkStatus(status, "downloadVramSegment");
+            } catch (Throwable t) {
+                throw new RuntimeException("HC4J VRAM Download Exception", t);
+            }
+        } else {
+            long bytes = totalElements * 4L;
+            try (Arena arena = Arena.ofConfined()) {
+                MemorySegment nativeBuf = arena.allocate(bytes, 16);
+                int status = (int) gpuDownloadHandle.invokeExact(vramId, nativeBuf, totalElements);
+                checkStatus(status, "downloadVramSegment");
+                MemorySegment.copy(nativeBuf, 0, destination, 0, bytes);
+            } catch (Throwable t) {
+                throw new RuntimeException("HC4J VRAM Download Exception", t);
+            }
+        }
+    }
+
+    public static void copyStrided(long src, long out, long srcOffset, int rank, int[] shape, int[] srcStrides, long len) {
+        ensureInitialized();
+        if (len == 0) return;
+        try (Arena arena = Arena.ofConfined()) {
+            MemorySegment shapeSeg = rank > 0 ? arena.allocateFrom(ValueLayout.JAVA_INT, shape) : MemorySegment.NULL;
+            MemorySegment stridesSeg = rank > 0 ? arena.allocateFrom(ValueLayout.JAVA_INT, srcStrides) : MemorySegment.NULL;
+            int status = NativeBindings.dispatchCopyStrided(src, out, srcOffset, rank, shapeSeg, stridesSeg, len);
+            checkStatus(status, "copyStrided");
+        } catch (Throwable t) {
+            if (t instanceof RuntimeException re) throw re;
+            throw new RuntimeException("HC4J copyStrided failed", t);
+        }
     }
 
     public static EngineStats engineStats() {

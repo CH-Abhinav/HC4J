@@ -76,6 +76,16 @@ public final class TrigOps {
         access.ensureOpen(input);
         access.ensureOpen(out);
 
+        if (access.elementOffset(input) > 0) {
+            try (Tensor contig = input.contiguous()) {
+                return apply(fn, contig, out);
+            }
+        }
+
+        if (!out.isContiguous() || access.elementOffset(out) != 0) {
+            throw new IllegalArgumentException("Output tensor must be contiguous with zero offset");
+        }
+
         ValidUtil.requireOperandF32(fn.opName(), input.getDType());
         ValidUtil.requireResultDType(DType.f32, out.getDType());
 

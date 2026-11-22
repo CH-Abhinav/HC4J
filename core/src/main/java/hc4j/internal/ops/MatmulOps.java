@@ -52,6 +52,20 @@ public final class MatmulOps {
         access.ensureOpen(b);
         access.ensureOpen(res);
 
+        if (!a.isContiguous() || access.elementOffset(a) != 0) {
+            try (Tensor contigA = a.contiguous()) {
+                return matmul(contigA, b, res, transposeA, transposeB);
+            }
+        }
+        if (!b.isContiguous() || access.elementOffset(b) != 0) {
+            try (Tensor contigB = b.contiguous()) {
+                return matmul(a, contigB, res, transposeA, transposeB);
+            }
+        }
+        if (!res.isContiguous() || access.elementOffset(res) != 0) {
+            throw new IllegalArgumentException("Output tensor must be contiguous with zero offset");
+        }
+
         ValidUtil.requireOperandF32("matmul", a.getDType());
         ValidUtil.requireOperandF32("matmul", b.getDType());
         ValidUtil.requireResultDType(DType.f32, res.getDType());
@@ -91,6 +105,15 @@ public final class MatmulOps {
         TensorAccess access = TensorAccess.getInstance();
         access.ensureOpen(in);
         access.ensureOpen(res);
+
+        if (!in.isContiguous() || access.elementOffset(in) != 0) {
+            try (Tensor contig = in.contiguous()) {
+                return transpose(contig, res);
+            }
+        }
+        if (!res.isContiguous() || access.elementOffset(res) != 0) {
+            throw new IllegalArgumentException("Output tensor must be contiguous with zero offset");
+        }
 
         ValidUtil.requireOperandF32("transpose", in.getDType());
         ValidUtil.requireResultDType(in.getDType(), res.getDType());

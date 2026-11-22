@@ -26,9 +26,11 @@ import hc4j.internal.layout.ValidUtil;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.util.ArrayDeque;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Deque;
 import java.util.IdentityHashMap;
+import java.util.List;
 import java.util.Objects;
 
 /**
@@ -158,57 +160,76 @@ public final class FusedExpr {
         ValidUtil.requireResultDType(DType.f32, res.getDType());
         ValidUtil.requireResultShape(shape, access.getShapeUnsafe(res));
 
-        IdentityHashMap<Tensor, Integer> inputs = new IdentityHashMap<>();
-        int[] program = new int[words];
-        int pc = 0;
-
-        Deque<Object> work = new ArrayDeque<>();
-        work.push(root);
-        while (!work.isEmpty()) {
-            Object item = work.pop();
-            if (item instanceof Integer opWord) {
-                program[pc++] = opWord;
-                continue;
-            }
-            switch ((Node) item) {
-                case Load(Tensor t) -> {
-                    access.ensureOpen(t);
-                    ValidUtil.requireOperandF32("fusion input", t.getDType());
-                    ValidUtil.requireSameShape(shape, access.getShapeUnsafe(t));
-                    int k = inputs.computeIfAbsent(t, unused -> inputs.size());
-                    program[pc++] = word(LOAD, k);
-                }
-                case Const(float v) -> {
-                    program[pc++] = word(CONST, 0);
-                    program[pc++] = Float.floatToRawIntBits(v);
-                }
-                case Unary(int op, Node x) -> {
-                    work.push(word(op, 0));
-                    work.push(x);
-                }
-                case Binary(int op, Node l, Node r) -> {
-                    work.push(word(op, 0));
-                    work.push(r);
-                    work.push(l);
-                }
-            }
+        if (!res.isContiguous() || access.elementOffset(res) != 0) {
+            throw new IllegalArgumentException("Output tensor must be contiguous with zero offset");
         }
 
-        long[] handles = new long[inputs.size()];
-        inputs.forEach((t, k) -> {
-            access.ensureOpen(t);
-            handles[k] = access.getVramId(t);
-        });
+        List<Tensor> temporaryCopies = new ArrayList<>();
+        try {
+            IdentityHashMap<Tensor, Integer> inputs = new IdentityHashMap<>();
+            int[] program = new int[words];
+            int pc = 0;
 
-        try (Arena arena = Arena.ofConfined()) {
-            MemorySegment prog = arena.allocateFrom(JAVA_INT, Arrays.copyOf(program, pc));
-            MemorySegment ids = arena.allocateFrom(JAVA_LONG, handles);
-            int status = NativeBindings.dispatchFused(prog, pc, ids, handles.length, access.getVramId(res));
-            NativeEngine.checkStatus(status, "FusedExpr.eval");
-            return res;
-        } catch (Throwable t) {
-            if (t instanceof RuntimeException re) throw re;
-            throw new RuntimeException("HC4J fused dispatch failed", t);
+            Deque<Object> work = new ArrayDeque<>();
+            work.push(root);
+            while (!work.isEmpty()) {
+                Object item = work.pop();
+                if (item instanceof Integer opWord) {
+                    program[pc++] = opWord;
+                    continue;
+                }
+                switch ((Node) item) {
+                    case Load(Tensor t) -> {
+                        access.ensureOpen(t);
+                        Tensor effective = t;
+                        if (!effective.isContiguous() || access.elementOffset(effective) != 0) {
+                            effective = effective.contiguous();
+                            temporaryCopies.add(effective);
+                        }
+                        ValidUtil.requireOperandF32("fusion input", effective.getDType());
+                        ValidUtil.requireSameShape(shape, access.getShapeUnsafe(effective));
+                        int k = inputs.computeIfAbsent(effective, unused -> inputs.size());
+                        program[pc++] = word(LOAD, k);
+                    }
+                    case Const(float v) -> {
+                        program[pc++] = word(CONST, 0);
+                        program[pc++] = Float.floatToRawIntBits(v);
+                    }
+                    case Unary(int op, Node x) -> {
+                        work.push(word(op, 0));
+                        work.push(x);
+                    }
+                    case Binary(int op, Node l, Node r) -> {
+                        work.push(word(op, 0));
+                        work.push(r);
+                        work.push(l);
+                    }
+                }
+            }
+
+            long[] handles = new long[inputs.size()];
+            inputs.forEach((t, k) -> {
+                access.ensureOpen(t);
+                handles[k] = access.getVramId(t);
+            });
+
+            try (Arena arena = Arena.ofConfined()) {
+                MemorySegment prog = arena.allocateFrom(JAVA_INT, Arrays.copyOf(program, pc));
+                MemorySegment ids = arena.allocateFrom(JAVA_LONG, handles);
+                int status = NativeBindings.dispatchFused(prog, pc, ids, handles.length, access.getVramId(res));
+                NativeEngine.checkStatus(status, "FusedExpr.eval");
+                return res;
+            } catch (Throwable t) {
+                if (t instanceof RuntimeException re) throw re;
+                throw new RuntimeException("HC4J fused dispatch failed", t);
+            }
+        } finally {
+            for (Tensor temp : temporaryCopies) {
+                try {
+                    temp.close();
+                } catch (Throwable ignored) {
+                }
+            }
         }
     }
 

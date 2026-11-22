@@ -54,6 +54,16 @@ public final class NnOps {
         access.ensureOpen(a);
         access.ensureOpen(res);
 
+        if (access.elementOffset(a) > 0) {
+            try (Tensor contigA = a.contiguous()) {
+                return activation(act, contigA, res, alpha);
+            }
+        }
+
+        if (!res.isContiguous() || access.elementOffset(res) != 0) {
+            throw new IllegalArgumentException("Output tensor must be contiguous with zero offset");
+        }
+
         ValidUtil.requireOperandF32(act.name(), a.getDType());
         ValidUtil.requireResultDType(DType.f32, res.getDType());
 
@@ -104,6 +114,16 @@ public final class NnOps {
         access.ensureOpen(a);
         access.ensureOpen(res);
 
+        if (!a.isContiguous() || access.elementOffset(a) != 0) {
+            try (Tensor contigA = a.contiguous()) {
+                return reduce(op, contigA, res);
+            }
+        }
+
+        if (!res.isContiguous() || access.elementOffset(res) != 0) {
+            throw new IllegalArgumentException("Output tensor must be contiguous with zero offset");
+        }
+
         ValidUtil.requireOperandF32("reduce", a.getDType());
         ValidUtil.requireResultDType(DType.f32, res.getDType());
         if (res.getSize() != 1) {
@@ -128,6 +148,16 @@ public final class NnOps {
         TensorAccess access = TensorAccess.getInstance();
         access.ensureOpen(a);
         access.ensureOpen(res);
+
+        if (!a.isContiguous() || access.elementOffset(a) != 0) {
+            try (Tensor contigA = a.contiguous()) {
+                return reduceSquare(op, contigA, res);
+            }
+        }
+
+        if (!res.isContiguous() || access.elementOffset(res) != 0) {
+            throw new IllegalArgumentException("Output tensor must be contiguous with zero offset");
+        }
 
         ValidUtil.requireOperandF32("reduceSquare", a.getDType());
         ValidUtil.requireResultDType(DType.f32, res.getDType());
@@ -155,6 +185,21 @@ public final class NnOps {
         access.ensureOpen(a);
         access.ensureOpen(b);
         access.ensureOpen(res);
+
+        if (!a.isContiguous() || access.elementOffset(a) != 0) {
+            try (Tensor contigA = a.contiguous()) {
+                return reduceDiffSquared(op, contigA, b, res);
+            }
+        }
+        if (!b.isContiguous() || access.elementOffset(b) != 0) {
+            try (Tensor contigB = b.contiguous()) {
+                return reduceDiffSquared(op, a, contigB, res);
+            }
+        }
+
+        if (!res.isContiguous() || access.elementOffset(res) != 0) {
+            throw new IllegalArgumentException("Output tensor must be contiguous with zero offset");
+        }
 
         ValidUtil.requireOperandF32("reduceDiffSquared", a.getDType());
         ValidUtil.requireOperandF32("reduceDiffSquared", b.getDType());
@@ -185,6 +230,16 @@ public final class NnOps {
         access.ensureOpen(a);
         access.ensureOpen(res);
 
+        if (!a.isContiguous() || access.elementOffset(a) != 0) {
+            try (Tensor contigA = a.contiguous()) {
+                return reduceRows(op, contigA, res);
+            }
+        }
+
+        if (!res.isContiguous() || access.elementOffset(res) != 0) {
+            throw new IllegalArgumentException("Output tensor must be contiguous with zero offset");
+        }
+
         ValidUtil.requireOperandF32("reduceRows", a.getDType());
         ValidUtil.requireResultDType(DType.f32, res.getDType());
 
@@ -210,6 +265,16 @@ public final class NnOps {
         TensorAccess access = TensorAccess.getInstance();
         access.ensureOpen(a);
         access.ensureOpen(res);
+
+        if (!a.isContiguous() || access.elementOffset(a) != 0) {
+            try (Tensor contigA = a.contiguous()) {
+                return argmaxRows(contigA, res, largest);
+            }
+        }
+
+        if (!res.isContiguous() || access.elementOffset(res) != 0) {
+            throw new IllegalArgumentException("Output tensor must be contiguous with zero offset");
+        }
 
         ValidUtil.requireOperandF32("argmaxRows", a.getDType());
         ValidUtil.requireResultDType(DType.i32, res.getDType());
@@ -237,6 +302,16 @@ public final class NnOps {
         access.ensureOpen(a);
         access.ensureOpen(res);
 
+        if (!a.isContiguous() || access.elementOffset(a) != 0) {
+            try (Tensor contigA = a.contiguous()) {
+                return softmaxRows(contigA, res, logarithmic);
+            }
+        }
+
+        if (!res.isContiguous() || access.elementOffset(res) != 0) {
+            throw new IllegalArgumentException("Output tensor must be contiguous with zero offset");
+        }
+
         ValidUtil.requireOperandF32("softmaxRows", a.getDType());
         ValidUtil.requireResultDType(DType.f32, res.getDType());
 
@@ -262,6 +337,26 @@ public final class NnOps {
         TensorAccess access = TensorAccess.getInstance();
         access.ensureOpen(a);
         access.ensureOpen(res);
+
+        if (!a.isContiguous() || access.elementOffset(a) != 0) {
+            try (Tensor contigA = a.contiguous()) {
+                return layerNormRows(contigA, gamma, beta, res, eps);
+            }
+        }
+        if (gamma != null && (!gamma.isContiguous() || access.elementOffset(gamma) != 0)) {
+            try (Tensor contigG = gamma.contiguous()) {
+                return layerNormRows(a, contigG, beta, res, eps);
+            }
+        }
+        if (beta != null && (!beta.isContiguous() || access.elementOffset(beta) != 0)) {
+            try (Tensor contigB = beta.contiguous()) {
+                return layerNormRows(a, gamma, contigB, res, eps);
+            }
+        }
+
+        if (!res.isContiguous() || access.elementOffset(res) != 0) {
+            throw new IllegalArgumentException("Output tensor must be contiguous with zero offset");
+        }
 
         ValidUtil.requireOperandF32("layerNormRows", a.getDType());
         ValidUtil.requireResultDType(DType.f32, res.getDType());
@@ -310,6 +405,21 @@ public final class NnOps {
         access.ensureOpen(a);
         access.ensureOpen(res);
 
+        if (!a.isContiguous() || access.elementOffset(a) != 0) {
+            try (Tensor contigA = a.contiguous()) {
+                return rmsNormRows(contigA, gamma, res, eps);
+            }
+        }
+        if (gamma != null && (!gamma.isContiguous() || access.elementOffset(gamma) != 0)) {
+            try (Tensor contigG = gamma.contiguous()) {
+                return rmsNormRows(a, contigG, res, eps);
+            }
+        }
+
+        if (!res.isContiguous() || access.elementOffset(res) != 0) {
+            throw new IllegalArgumentException("Output tensor must be contiguous with zero offset");
+        }
+
         ValidUtil.requireOperandF32("rmsNormRows", a.getDType());
         ValidUtil.requireResultDType(DType.f32, res.getDType());
 
@@ -349,6 +459,21 @@ public final class NnOps {
         access.ensureOpen(targets);
         access.ensureOpen(res);
 
+        if (!logits.isContiguous() || access.elementOffset(logits) != 0) {
+            try (Tensor contigL = logits.contiguous()) {
+                return crossEntropyRows(contigL, targets, res);
+            }
+        }
+        if (!targets.isContiguous() || access.elementOffset(targets) != 0) {
+            try (Tensor contigT = targets.contiguous()) {
+                return crossEntropyRows(logits, contigT, res);
+            }
+        }
+
+        if (!res.isContiguous() || access.elementOffset(res) != 0) {
+            throw new IllegalArgumentException("Output tensor must be contiguous with zero offset");
+        }
+
         ValidUtil.requireOperandF32("crossEntropy logits", logits.getDType());
         if (targets.getDType() != DType.i32) {
             throw new IllegalArgumentException("crossEntropy targets must be i32, got " + targets.getDType());
@@ -381,6 +506,21 @@ public final class NnOps {
         access.ensureOpen(a);
         access.ensureOpen(bias);
         access.ensureOpen(res);
+
+        if (!a.isContiguous() || access.elementOffset(a) != 0) {
+            try (Tensor contigA = a.contiguous()) {
+                return addRowBias(contigA, bias, res);
+            }
+        }
+        if (!bias.isContiguous() || access.elementOffset(bias) != 0) {
+            try (Tensor contigB = bias.contiguous()) {
+                return addRowBias(a, contigB, res);
+            }
+        }
+
+        if (!res.isContiguous() || access.elementOffset(res) != 0) {
+            throw new IllegalArgumentException("Output tensor must be contiguous with zero offset");
+        }
 
         ValidUtil.requireOperandF32("addRowBias input", a.getDType());
         ValidUtil.requireOperandF32("addRowBias bias", bias.getDType());

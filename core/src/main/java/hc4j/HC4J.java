@@ -17,6 +17,7 @@
 package hc4j;
 
 import hc4j.internal.ffi.NativeEngine;
+import java.lang.foreign.MemorySegment;
 
 /**
  * Top-level static facade for HC4J providing tensor creation, arithmetic,
@@ -34,8 +35,48 @@ public final class HC4J {
         return Tensor.zeros(dtype, shape);
     }
 
+    public static Tensor ones(DType dtype, int... shape) {
+        return Tensor.ones(dtype, shape);
+    }
+
     public static Tensor empty(DType dtype, int... shape) {
         return Tensor.empty(dtype, shape);
+    }
+
+    public static Tensor full(float value, int... shape) {
+        return Tensor.full(value, shape);
+    }
+
+    public static Tensor full(int value, int... shape) {
+        return Tensor.full(value, shape);
+    }
+
+    public static Tensor arange(float start, float stop, float step) {
+        return Tensor.arange(start, stop, step);
+    }
+
+    public static Tensor arange(int stop) {
+        return Tensor.arange(stop);
+    }
+
+    public static Tensor arange(int start, int stop, int step) {
+        return Tensor.arange(start, stop, step);
+    }
+
+    public static Tensor linspace(float start, float stop, int num) {
+        return Tensor.linspace(start, stop, num);
+    }
+
+    public static Tensor eye(int n) {
+        return Tensor.eye(n);
+    }
+
+    public static Tensor eye(DType dtype, int n) {
+        return Tensor.eye(dtype, n);
+    }
+
+    public static Tensor eye(DType dtype, int rows, int cols) {
+        return Tensor.eye(dtype, rows, cols);
     }
 
     public static Tensor fromArray(float[] values, int... shape) {
@@ -44,6 +85,10 @@ public final class HC4J {
 
     public static Tensor fromArray(int[] values, int... shape) {
         return Tensor.fromArray(values, shape);
+    }
+
+    public static Tensor fromSegment(MemorySegment source, DType dtype, int... shape) {
+        return Tensor.fromSegment(source, dtype, shape);
     }
 
     // --- Elementwise Arithmetic ---
@@ -67,6 +112,16 @@ public final class HC4J {
     public static Tensor div(Tensor a, Tensor b, Tensor out) { return a.div(b, out); }
     public static Tensor div(Tensor a, float c) { return a.div(c); }
     public static Tensor div(Tensor a, float c, Tensor out) { return a.div(c, out); }
+
+    public static Tensor rsub(float scalar, Tensor a) { return a.rsub(scalar); }
+    public static Tensor rsub(float scalar, Tensor a, Tensor out) { return a.rsub(scalar, out); }
+    public static Tensor rsub(int scalar, Tensor a) { return a.rsub(scalar); }
+    public static Tensor rsub(int scalar, Tensor a, Tensor out) { return a.rsub(scalar, out); }
+
+    public static Tensor rdiv(float scalar, Tensor a) { return a.rdiv(scalar); }
+    public static Tensor rdiv(float scalar, Tensor a, Tensor out) { return a.rdiv(scalar, out); }
+    public static Tensor rdiv(int scalar, Tensor a) { return a.rdiv(scalar); }
+    public static Tensor rdiv(int scalar, Tensor a, Tensor out) { return a.rdiv(scalar, out); }
 
     // --- Trigonometric ---
 

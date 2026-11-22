@@ -52,6 +52,14 @@ impl BinaryElemDims {
     }
 }
 
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct CopyStridedDims {
+    pub params: [u32; 4],
+    pub shape: [u32; 8],
+    pub strides: [u32; 8],
+}
+
 /// Reads a strided layout and reverse-prunes it: size-1 dimensions are
 /// dropped and the rest reordered innermost-first, so kernels decompose the
 /// linear index without knowing the rank. Returns the shape and one stride
