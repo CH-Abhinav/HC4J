@@ -70,7 +70,9 @@ public final class MatmulOps {
         }
 
         ValidUtil.requireOperandF32("matmul", a.getDType());
-        ValidUtil.requireOperandF32("matmul", b.getDType());
+        if (b.getDType() != DType.f32 && b.getDType() != DType.f16) {
+            throw new IllegalArgumentException("Right operand must be f32 or f16, got " + b.getDType());
+        }
         ValidUtil.requireResultDType(DType.f32, res.getDType());
 
         int[] sa = access.getShapeUnsafe(a);
@@ -87,6 +89,21 @@ public final class MatmulOps {
         ValidUtil.requireNoAlias(idRes, idA, "matmul result must not alias an operand");
         ValidUtil.requireNoAlias(idRes, idB, "matmul result must not alias an operand");
 
+        if (b.getDType() == DType.f16) {
+            if (transposeA) {
+                throw new UnsupportedOperationException("transposeA is not supported for f16 operands");
+            }
+            int flags = transposeB ? FLAG_TRANS_B : 0;
+            try {
+                int status = NativeBindings.dispatchMatmulF32F16(idA, idB, idRes, d.m(), d.n(), d.k(), flags);
+                NativeEngine.checkStatus(status, "MatmulOps.matmul f32 x f16");
+                return res;
+            } catch (Throwable t) {
+                if (t instanceof RuntimeException re) throw re;
+                throw new RuntimeException("HC4J native matmul f32 x f16 failed", t);
+            }
+        }
+
         int flags = (transposeA && a.dim() == 2 ? FLAG_TRANS_A : 0) | (transposeB && b.dim() == 2 ? FLAG_TRANS_B : 0);
 
         try {
@@ -98,6 +115,117 @@ public final class MatmulOps {
         } catch (Throwable t) {
             if (t instanceof RuntimeException re) throw re;
             throw new RuntimeException("HC4J native matmul failed", t);
+        }
+    }
+
+    public static int[] transposedBOutputShape(Tensor a, Tensor b) {
+        TensorAccess access = TensorAccess.getInstance();
+        access.ensureOpen(a);
+        access.ensureOpen(b);
+        int[] sa = access.getShapeUnsafe(a);
+        int[] sb = access.getShapeUnsafe(b);
+        if (sb.length != 2) {
+            throw new IllegalArgumentException("transposedB requires a 2-D right operand [N, K], got " + java.util.Arrays.toString(sb));
+        }
+        int n = sb[0];
+        int k = sb[1];
+        if (sa.length == 1) {
+            if (sa[0] != k) {
+                throw new IllegalArgumentException("Inner dimension mismatch: " + sa[0] + " vs " + k);
+            }
+            return new int[] {n};
+        }
+        int ka = sa[sa.length - 1];
+        if (ka != k) {
+            throw new IllegalArgumentException("Inner dimension mismatch: " + ka + " vs " + k);
+        }
+        int[] outShape = new int[sa.length];
+        System.arraycopy(sa, 0, outShape, 0, sa.length - 1);
+        outShape[sa.length - 1] = n;
+        return outShape;
+    }
+
+    public static Tensor matmulTransposedB(Tensor a, Tensor b, Tensor res) {
+        Objects.requireNonNull(a, "a");
+        Objects.requireNonNull(b, "b");
+        Objects.requireNonNull(res, "res");
+
+        TensorAccess access = TensorAccess.getInstance();
+        access.ensureOpen(a);
+        access.ensureOpen(b);
+        access.ensureOpen(res);
+
+        if (!a.isContiguous() || access.elementOffset(a) != 0) {
+            try (Tensor contigA = a.contiguous()) {
+                return matmulTransposedB(contigA, b, res);
+            }
+        }
+        if (!b.isContiguous() || access.elementOffset(b) != 0) {
+            try (Tensor contigB = b.contiguous()) {
+                return matmulTransposedB(a, contigB, res);
+            }
+        }
+        if (!res.isContiguous() || access.elementOffset(res) != 0) {
+            throw new IllegalArgumentException("Output tensor must be contiguous with zero offset");
+        }
+
+        ValidUtil.requireOperandF32("matmulTransposedB input", a.getDType());
+        if (b.getDType() != DType.f32 && b.getDType() != DType.f16) {
+            throw new IllegalArgumentException("matmulTransposedB right operand must be f32 or f16, got " + b.getDType());
+        }
+        ValidUtil.requireResultDType(DType.f32, res.getDType());
+
+        int[] sa = access.getShapeUnsafe(a);
+        int[] sb = access.getShapeUnsafe(b);
+        if (sb.length != 2) {
+            throw new IllegalArgumentException("matmulTransposedB requires a 2-D right operand [N, K], got " + java.util.Arrays.toString(sb));
+        }
+
+        int n = sb[0];
+        int k = sb[1];
+        int m;
+        if (sa.length == 1) {
+            if (sa[0] != k) {
+                throw new IllegalArgumentException("Inner dimension mismatch: " + sa[0] + " vs " + k);
+            }
+            m = 1;
+        } else {
+            int ka = sa[sa.length - 1];
+            if (ka != k) {
+                throw new IllegalArgumentException("Inner dimension mismatch: " + ka + " vs " + k);
+            }
+            long mLong = 1;
+            for (int i = 0; i < sa.length - 1; i++) {
+                mLong = Math.multiplyExact(mLong, sa[i]);
+            }
+            if (mLong > Integer.MAX_VALUE) {
+                throw new IllegalArgumentException("Total leading dimension exceeds Integer.MAX_VALUE: " + mLong);
+            }
+            m = (int) mLong;
+        }
+
+        int[] expectedOutShape = transposedBOutputShape(a, b);
+        ValidUtil.requireResultShape(expectedOutShape, access.getShapeUnsafe(res));
+
+        long idA = access.getVramId(a);
+        long idB = access.getVramId(b);
+        long idRes = access.getVramId(res);
+
+        ValidUtil.requireNoAlias(idRes, idA, "matmul result must not alias an operand");
+        ValidUtil.requireNoAlias(idRes, idB, "matmul result must not alias an operand");
+
+        try {
+            int status;
+            if (b.getDType() == DType.f16) {
+                status = NativeBindings.dispatchMatmulF32F16(idA, idB, idRes, m, n, k, FLAG_TRANS_B);
+            } else {
+                status = NativeBindings.dispatchMatmulEx(idA, idB, idRes, m, n, k, FLAG_TRANS_B);
+            }
+            NativeEngine.checkStatus(status, "MatmulOps.matmulTransposedB");
+            return res;
+        } catch (Throwable t) {
+            if (t instanceof RuntimeException re) throw re;
+            throw new RuntimeException("HC4J native matmulTransposedB failed", t);
         }
     }
 

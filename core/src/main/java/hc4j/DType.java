@@ -23,7 +23,8 @@ import java.lang.foreign.ValueLayout;
  */
 public enum DType {
     i32(ValueLayout.JAVA_INT),
-    f32(ValueLayout.JAVA_FLOAT);
+    f32(ValueLayout.JAVA_FLOAT),
+    f16(ValueLayout.JAVA_SHORT);
 
     public final ValueLayout layout;
 

@@ -30,7 +30,9 @@ import hc4j.internal.ops.MathOps;
 import hc4j.internal.ops.MatmulOps;
 import hc4j.internal.ops.NnOps;
 import hc4j.internal.ops.TrigOps;
+import hc4j.linalg.Linalg;
 import hc4j.nn.Activation;
+import hc4j.nn.Nn;
 import hc4j.nn.Reduction;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
@@ -141,7 +143,9 @@ public class Tensor implements AutoCloseable {
         Objects.requireNonNull(dtype, "dtype");
         ValidUtil.requireValidShape(shape);
         long totalSize = computeSize(shape);
-        long vramId = NativeEngine.allocVram(totalSize);
+        long vramId = (dtype == DType.f16)
+                ? NativeEngine.allocVramBytes(Math.multiplyExact(totalSize, 2L), true)
+                : NativeEngine.allocVram(totalSize);
         VramHandle h = new VramHandle(vramId);
         return new Tensor(dtype, shape, computeContiguousStrides(shape), 0L, h);
     }
@@ -176,7 +180,9 @@ public class Tensor implements AutoCloseable {
         Objects.requireNonNull(dtype, "dtype");
         ValidUtil.requireValidShape(shape);
         long totalSize = computeSize(shape);
-        long vramId = NativeEngine.allocVramUninit(totalSize);
+        long vramId = (dtype == DType.f16)
+                ? NativeEngine.allocVramBytes(Math.multiplyExact(totalSize, 2L), false)
+                : NativeEngine.allocVramUninit(totalSize);
         VramHandle h = new VramHandle(vramId);
         return new Tensor(dtype, shape, computeContiguousStrides(shape), 0L, h);
     }
@@ -422,15 +428,79 @@ public class Tensor implements AutoCloseable {
             throw new IllegalArgumentException("Segment byteSize " + source.byteSize() + " is too small for "
                     + totalElements + " elements of " + dtype + " (requires " + minBytes + " bytes)");
         }
-        long vramId = NativeEngine.allocVramUninit(totalElements);
+        long vramId = (dtype == DType.f16)
+                ? NativeEngine.allocVramBytes(minBytes, false)
+                : NativeEngine.allocVramUninit(totalElements);
         VramHandle h = new VramHandle(vramId);
         try {
-            NativeEngine.writeVramSegment(vramId, source, totalElements);
+            if (dtype == DType.f16) {
+                NativeEngine.writeVramBytesSegment(vramId, source, minBytes);
+            } else {
+                NativeEngine.writeVramSegment(vramId, source, totalElements);
+            }
         } catch (RuntimeException | Error e) {
             h.release();
             throw e;
         }
         return new Tensor(dtype, shape, computeContiguousStrides(shape), 0L, h);
+    }
+
+    /**
+     * Creates an f16 tensor from host short values representing raw IEEE 754 half-precision float bits.
+     *
+     * @param bits  raw half-precision float bit values
+     * @param shape tensor shape
+     * @return uploaded f16 tensor
+     */
+    public static Tensor fromHalfBits(short[] bits, int... shape) {
+        Objects.requireNonNull(bits, "bits");
+        long totalSize = checkLength(bits.length, shape);
+        long byteSize = Math.multiplyExact(totalSize, 2L);
+        long vramId = NativeEngine.allocVramBytes(byteSize, false);
+        VramHandle h = new VramHandle(vramId);
+        try (Arena arena = Arena.ofConfined()) {
+            MemorySegment hostSegment = arena.allocateFrom(ValueLayout.JAVA_SHORT, bits);
+            NativeEngine.writeVramBytesSegment(vramId, hostSegment, byteSize);
+        } catch (RuntimeException | Error e) {
+            h.release();
+            throw e;
+        }
+        return new Tensor(DType.f16, shape, computeContiguousStrides(shape), 0L, h);
+    }
+
+    /**
+     * Downloads an f16 tensor into a host array of raw half-precision float bits.
+     *
+     * @return short array of raw f16 bits
+     * @throws IllegalStateException if this tensor is not f16
+     */
+    public short[] toHalfBitsArray() {
+        ensureOpen();
+        if (dtype != DType.f16) {
+            throw new IllegalStateException("toHalfBitsArray is only supported for f16 tensors, got " + dtype);
+        }
+        if (size > Integer.MAX_VALUE) {
+            throw new IllegalArgumentException("Tensor size exceeds Integer.MAX_VALUE: " + size);
+        }
+        int len = (int) size;
+        short[] result = new short[len];
+        try (Arena arena = Arena.ofConfined()) {
+            MemorySegment hostSegment = arena.allocate(ValueLayout.JAVA_SHORT, len);
+            copyTo(hostSegment);
+            MemorySegment.copy(hostSegment, ValueLayout.JAVA_SHORT, 0L, result, 0, len);
+        }
+        return result;
+    }
+
+    /**
+     * Converts this f16 tensor to f32 on the GPU and downloads it to a host float array.
+     *
+     * @return float array of tensor values
+     */
+    public float[] toFloatArrayFromF16() {
+        try (Tensor f32 = cast(DType.f32)) {
+            return f32.toFloatArray();
+        }
     }
 
     // ------------------------------------------------------------------------------------------
@@ -455,7 +525,11 @@ public class Tensor implements AutoCloseable {
                     + " is too small for " + size + " elements (requires " + minBytes + " bytes)");
         }
         if (isContiguous() && elementOffset == 0L) {
-            NativeEngine.downloadVramSegment(handle.vramId(), destination, size);
+            if (dtype == DType.f16) {
+                NativeEngine.downloadVramBytesSegment(handle.vramId(), destination, minBytes);
+            } else {
+                NativeEngine.downloadVramSegment(handle.vramId(), destination, size);
+            }
         } else {
             try (Tensor contig = contiguous()) {
                 contig.copyTo(destination);
@@ -480,7 +554,11 @@ public class Tensor implements AutoCloseable {
             throw new IllegalArgumentException("Source segment byteSize " + source.byteSize()
                     + " is too small for " + size + " elements (requires " + minBytes + " bytes)");
         }
-        NativeEngine.writeVramSegment(handle.vramId(), source, size);
+        if (dtype == DType.f16) {
+            NativeEngine.writeVramBytesSegment(handle.vramId(), source, minBytes);
+        } else {
+            NativeEngine.writeVramSegment(handle.vramId(), source, size);
+        }
     }
 
     // ------------------------------------------------------------------------------------------
@@ -2342,6 +2420,9 @@ public class Tensor implements AutoCloseable {
     public Tensor matmul(Tensor other) {
         ensureOpen();
         ValidUtil.requireOperandF32("matmul", dtype);
+        if (other.getDType() != DType.f32 && other.getDType() != DType.f16) {
+            throw new IllegalArgumentException("matmul right operand must be f32 or f16, got " + other.getDType());
+        }
         int[] outShape;
         if (this.dim() <= 2 && other.dim() <= 2) {
             Dims d = ValidUtil.matmulDims(shape, other.getShape(), false, false);
@@ -2373,6 +2454,30 @@ public class Tensor implements AutoCloseable {
         } else {
             return MatmulOps.batchedMatmul(this, other, res, false, false);
         }
+    }
+
+    /**
+     * Matrix multiplication with transposed second operand {@code B^T},
+     * supporting 2-D {@code [M, K] @ [N, K]^T -> [M, N]} and
+     * 3-D+ {@code [..., M, K] @ [N, K]^T -> [..., M, N]}.
+     * Supports both f32 and f16 right operands.
+     *
+     * @param other right operand of shape [N, K]
+     * @return result tensor of shape [..., M, N]
+     */
+    public Tensor matmulTransposedB(Tensor other) {
+        return Linalg.matmulTransposedB(this, other);
+    }
+
+    /**
+     * Matrix multiplication with transposed second operand {@code B^T} into caller-provided {@code res}.
+     *
+     * @param other right operand of shape [N, K]
+     * @param res   destination tensor
+     * @return {@code res}
+     */
+    public Tensor matmulTransposedB(Tensor other, Tensor res) {
+        return Linalg.matmulTransposedB(this, other, res);
     }
 
     public Tensor transpose() {
@@ -2983,6 +3088,58 @@ public class Tensor implements AutoCloseable {
         ensureOpen();
         matmul(weights, res);
         return bias == null ? res : NnOps.addRowBias(res, bias, res);
+    }
+
+    /**
+     * Look up embeddings from this embedding table for the given token IDs.
+     * Supports both f32 and f16 embedding tables.
+     *
+     * @param tokenIds integer token tensor of any shape
+     * @return newly allocated float embedding tensor
+     */
+    public Tensor embedding(Tensor tokenIds) {
+        ensureOpen();
+        return Nn.embedding(this, tokenIds);
+    }
+
+    /**
+     * Look up embeddings from this embedding table into caller-provided {@code out}.
+     * Supports both f32 and f16 embedding tables.
+     *
+     * @param tokenIds integer token tensor of any shape
+     * @param out      destination tensor
+     * @return {@code out}
+     */
+    public Tensor embedding(Tensor tokenIds, Tensor out) {
+        ensureOpen();
+        return Nn.embedding(this, tokenIds, out);
+    }
+
+    /**
+     * Applies Rotary Position Embedding (RoPE) using the NeoX half-split convention.
+     * In-place safe.
+     *
+     * @param positionOffset token position offset
+     * @param theta          rotary embedding base theta (e.g. 10000.0f)
+     * @return newly allocated tensor with rotary embeddings applied
+     */
+    public Tensor rope(int positionOffset, float theta) {
+        ensureOpen();
+        return Nn.rope(this, positionOffset, theta);
+    }
+
+    /**
+     * Applies Rotary Position Embedding (RoPE) into caller-provided {@code out}.
+     * In-place safe when {@code this == out}.
+     *
+     * @param positionOffset token position offset
+     * @param theta          rotary embedding base theta (e.g. 10000.0f)
+     * @param out            destination tensor (may be {@code this})
+     * @return {@code out}
+     */
+    public Tensor rope(int positionOffset, float theta, Tensor out) {
+        ensureOpen();
+        return Nn.rope(this, positionOffset, theta, out);
     }
 
     // ------------------------------------------------------------------------------------------

@@ -1,0 +1,23 @@
+plugins {
+    id 'application'
+}
+
+dependencies {
+    implementation project(':core')
+    testImplementation platform('org.junit:junit-bom:5.12.2')
+    testImplementation 'org.junit.jupiter:junit-jupiter'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+}
+
+application {
+    mainClass = 'hc4j.examples.llm.LlamaCli'
+}
+
+tasks.withType(JavaExec).configureEach {
+    jvmArgs += ['--enable-native-access=ALL-UNNAMED']
+}
+
+tasks.named('test') {
+    useJUnitPlatform()
+    jvmArgs += ['--enable-native-access=ALL-UNNAMED']
+}

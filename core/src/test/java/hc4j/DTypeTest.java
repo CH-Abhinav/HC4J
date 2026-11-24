@@ -35,15 +35,20 @@ class DTypeTest {
 
         assertSame(ValueLayout.JAVA_INT, DType.i32.layout);
         assertEquals(4, DType.i32.byteSize());
+
+        assertSame(ValueLayout.JAVA_SHORT, DType.f16.layout);
+        assertEquals(2, DType.f16.byteSize());
     }
 
     @Test
     @DisplayName("DType enum valueOf and values consistency")
     void testEnumValues() {
         DType[] values = DType.values();
-        assertEquals(2, values.length);
+        assertEquals(3, values.length);
         assertSame(DType.i32, DType.valueOf("i32"));
         assertSame(DType.f32, DType.valueOf("f32"));
+        assertSame(DType.f16, DType.valueOf("f16"));
         assertNotNull(DType.f32.toString());
+        assertNotNull(DType.f16.toString());
     }
 }

@@ -41,6 +41,7 @@ public final class MathOps {
         return switch (type) {
             case i32 -> 0;
             case f32 -> 1;
+            default -> throw new UnsupportedOperationException("Operation not supported for dtype " + type);
         };
     }
 
@@ -582,7 +583,56 @@ public final class MathOps {
 
         ValidUtil.requireResultShape(access.getShapeUnsafe(src), access.getShapeUnsafe(res));
 
-        int srcDtype = resolveDTypeCode(src.getDType());
+        DType srcType = src.getDType();
+        if (srcType == targetDType) {
+            NativeEngine.copyStrided(
+                    access.getVramId(src), access.getVramId(res),
+                    access.elementOffset(src), src.dim(),
+                    access.getShapeUnsafe(src), access.getStridesUnsafe(src),
+                    src.getSize()
+            );
+            return res;
+        }
+
+        // F16 <-> F32 direct GPU kernels
+        if (srcType == DType.f32 && targetDType == DType.f16) {
+            try {
+                int status = NativeBindings.dispatchCastF32ToF16(
+                        access.getVramId(src), access.getVramId(res), src.getSize()
+                );
+                NativeEngine.checkStatus(status, "MathOps.cast(f32->f16)");
+                return res;
+            } catch (Throwable t) {
+                if (t instanceof RuntimeException re) throw re;
+                throw new RuntimeException("HC4J native cast failed", t);
+            }
+        }
+        if (srcType == DType.f16 && targetDType == DType.f32) {
+            try {
+                int status = NativeBindings.dispatchCastF16ToF32(
+                        access.getVramId(src), access.getVramId(res), src.getSize()
+                );
+                NativeEngine.checkStatus(status, "MathOps.cast(f16->f32)");
+                return res;
+            } catch (Throwable t) {
+                if (t instanceof RuntimeException re) throw re;
+                throw new RuntimeException("HC4J native cast failed", t);
+            }
+        }
+
+        // I32 <-> F16 routed via F32
+        if (srcType == DType.i32 && targetDType == DType.f16) {
+            try (Tensor f32Temp = src.cast(DType.f32)) {
+                return cast(f32Temp, DType.f16, res);
+            }
+        }
+        if (srcType == DType.f16 && targetDType == DType.i32) {
+            try (Tensor f32Temp = src.cast(DType.f32)) {
+                return cast(f32Temp, DType.i32, res);
+            }
+        }
+
+        int srcDtype = resolveDTypeCode(srcType);
         int dstDtype = resolveDTypeCode(targetDType);
 
         try {

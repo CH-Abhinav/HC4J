@@ -4,6 +4,7 @@
 pub mod arithmetic;
 pub mod elementwise;
 pub mod exponential;
+pub mod f16;
 pub mod fusion;
 pub mod math;
 pub mod matmul;
@@ -12,6 +13,7 @@ pub mod reduce;
 pub mod trigno;
 
 pub use math::*;
+pub use f16::*;
 
 #[cfg(test)]
 mod gpu_tests;

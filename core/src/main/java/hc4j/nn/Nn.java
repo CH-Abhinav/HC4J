@@ -223,4 +223,121 @@ public final class Nn {
         try { return argminRows(a, res); } catch (RuntimeException | Error e) { res.close(); throw e; }
     }
     public static Tensor argminRows(Tensor a, Tensor out) { return NnOps.argmaxRows(a, out, false); }
+
+    // --- Linear, Embedding & RoPE ---
+
+    /**
+     * Computes a linear transformation with weights in transposed format: {@code input @ weightOutByIn^T + bias}.
+     * Supports both f32 and f16 weights.
+     *
+     * @param input         input activations of shape {@code [..., M, K]} or {@code [M, K]}
+     * @param weightOutByIn weights of shape {@code [N, K]} (f32 or f16)
+     * @param bias          optional 1-D bias of shape {@code [N]} or broadcastable tensor (may be null)
+     * @return transformed tensor of shape {@code [..., M, N]}
+     */
+    public static Tensor linearTransposed(Tensor input, Tensor weightOutByIn, Tensor bias) {
+        Tensor res = Linalg.matmulTransposedB(input, weightOutByIn);
+        if (bias != null) {
+            try {
+                res.add(bias, res);
+            } catch (RuntimeException | Error e) {
+                res.close();
+                throw e;
+            }
+        }
+        return res;
+    }
+
+    /**
+     * Computes a linear transformation with weights in transposed format into {@code out}: {@code input @ weightOutByIn^T + bias}.
+     *
+     * @param input         input activations of shape {@code [..., M, K]} or {@code [M, K]}
+     * @param weightOutByIn weights of shape {@code [N, K]} (f32 or f16)
+     * @param bias          optional 1-D bias of shape {@code [N]} or broadcastable tensor (may be null)
+     * @param out           destination tensor
+     * @return {@code out}
+     */
+    public static Tensor linearTransposed(Tensor input, Tensor weightOutByIn, Tensor bias, Tensor out) {
+        Linalg.matmulTransposedB(input, weightOutByIn, out);
+        if (bias != null) {
+            out.add(bias, out);
+        }
+        return out;
+    }
+
+    /**
+     * Looks up embeddings for {@code tokenIds} in {@code table}.
+     * Supports both f32 and f16 embedding tables.
+     *
+     * @param table    2-D embedding table of shape {@code [vocabSize, hiddenDim]}
+     * @param tokenIds integer token tensor
+     * @return float embedding tensor of shape {@code [..., hiddenDim]}
+     */
+    public static Tensor embedding(Tensor table, Tensor tokenIds) {
+        Objects.requireNonNull(table, "table");
+        Objects.requireNonNull(tokenIds, "tokenIds");
+        TensorAccess access = TensorAccess.getInstance();
+        access.ensureOpen(table);
+        access.ensureOpen(tokenIds);
+        int[] tableShape = access.getShapeUnsafe(table);
+        if (tableShape.length != 2) {
+            throw new IllegalArgumentException("Embedding table must be 2-D [vocabSize, hiddenDim], got " + table.dim() + "-D");
+        }
+        int[] tokenShape = access.getShapeUnsafe(tokenIds);
+        int[] outShape = new int[tokenShape.length + 1];
+        System.arraycopy(tokenShape, 0, outShape, 0, tokenShape.length);
+        outShape[tokenShape.length] = tableShape[1];
+        Tensor res = Tensor.empty(DType.f32, outShape);
+        try {
+            return NnOps.embedding(table, tokenIds, res);
+        } catch (RuntimeException | Error e) {
+            res.close();
+            throw e;
+        }
+    }
+
+    /**
+     * Looks up embeddings for {@code tokenIds} into caller-provided {@code out}.
+     *
+     * @param table    2-D embedding table of shape {@code [vocabSize, hiddenDim]}
+     * @param tokenIds integer token tensor
+     * @param out      destination tensor
+     * @return {@code out}
+     */
+    public static Tensor embedding(Tensor table, Tensor tokenIds, Tensor out) {
+        return NnOps.embedding(table, tokenIds, out);
+    }
+
+    /**
+     * Applies Rotary Position Embedding (RoPE) using the NeoX half-split convention.
+     *
+     * @param x              input tensor of shape {@code [batch, seqLen, numHeads, headDim]}, {@code [seqLen, numHeads, headDim]}, or {@code [seqLen, headDim]}
+     * @param positionOffset token position offset
+     * @param theta          rotary embedding base theta (e.g. 10000.0f)
+     * @return newly allocated tensor with rotary embeddings applied
+     */
+    public static Tensor rope(Tensor x, int positionOffset, float theta) {
+        Objects.requireNonNull(x, "x");
+        Tensor res = createLike(x);
+        try {
+            return NnOps.rope(x, positionOffset, theta, res);
+        } catch (RuntimeException | Error e) {
+            res.close();
+            throw e;
+        }
+    }
+
+    /**
+     * Applies Rotary Position Embedding (RoPE) into caller-provided {@code out}.
+     * In-place safe when {@code x == out}.
+     *
+     * @param x              input tensor
+     * @param positionOffset token position offset
+     * @param theta          rotary embedding base theta
+     * @param out            destination tensor (may be {@code x})
+     * @return {@code out}
+     */
+    public static Tensor rope(Tensor x, int positionOffset, float theta, Tensor out) {
+        return NnOps.rope(x, positionOffset, theta, out);
+    }
 }

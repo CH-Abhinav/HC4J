@@ -41,6 +41,7 @@ public final class ArithmeticOps {
         return switch (type) {
             case i32 -> 0;
             case f32 -> 1;
+            default -> throw new UnsupportedOperationException("Operation not supported for dtype " + type);
         };
     }
 

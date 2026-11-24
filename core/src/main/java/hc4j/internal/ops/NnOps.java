@@ -550,4 +550,144 @@ public final class NnOps {
             throw new RuntimeException("HC4J GPU Error: addRowBias failed", t);
         }
     }
+
+    public static Tensor embedding(Tensor table, Tensor tokenIds, Tensor res) {
+        Objects.requireNonNull(table, "table");
+        Objects.requireNonNull(tokenIds, "tokenIds");
+        Objects.requireNonNull(res, "res");
+
+        TensorAccess access = TensorAccess.getInstance();
+        access.ensureOpen(table);
+        access.ensureOpen(tokenIds);
+        access.ensureOpen(res);
+
+        if (!table.isContiguous() || access.elementOffset(table) != 0) {
+            try (Tensor contigTable = table.contiguous()) {
+                return embedding(contigTable, tokenIds, res);
+            }
+        }
+        if (!tokenIds.isContiguous() || access.elementOffset(tokenIds) != 0) {
+            try (Tensor contigTokens = tokenIds.contiguous()) {
+                return embedding(table, contigTokens, res);
+            }
+        }
+        if (!res.isContiguous() || access.elementOffset(res) != 0) {
+            throw new IllegalArgumentException("Output tensor must be contiguous with zero offset");
+        }
+
+        if (table.getDType() != DType.f32 && table.getDType() != DType.f16) {
+            throw new IllegalArgumentException("Embedding table must be f32 or f16, got " + table.getDType());
+        }
+        if (tokenIds.getDType() != DType.i32) {
+            throw new IllegalArgumentException("tokenIds must be i32, got " + tokenIds.getDType());
+        }
+        ValidUtil.requireResultDType(DType.f32, res.getDType());
+
+        int[] tableShape = access.getShapeUnsafe(table);
+        if (tableShape.length != 2) {
+            throw new IllegalArgumentException("Embedding table must be 2-D [vocabSize, hiddenDim], got " + table.dim() + "-D");
+        }
+        int vocabSize = tableShape[0];
+        int hiddenDim = tableShape[1];
+
+        int[] tokenShape = access.getShapeUnsafe(tokenIds);
+        int[] expectedOutShape = new int[tokenShape.length + 1];
+        System.arraycopy(tokenShape, 0, expectedOutShape, 0, tokenShape.length);
+        expectedOutShape[tokenShape.length] = hiddenDim;
+        ValidUtil.requireResultShape(expectedOutShape, access.getShapeUnsafe(res));
+
+        long idTable = access.getVramId(table);
+        long idTokens = access.getVramId(tokenIds);
+        long idRes = access.getVramId(res);
+
+        ValidUtil.requireNoAlias(idRes, idTable, "embedding result must not alias embedding table");
+        ValidUtil.requireNoAlias(idRes, idTokens, "embedding result must not alias tokenIds");
+
+        long numTokensLong = tokenIds.getSize();
+        if (numTokensLong > Integer.MAX_VALUE) {
+            throw new IllegalArgumentException("Total token count exceeds Integer.MAX_VALUE: " + numTokensLong);
+        }
+        int numTokens = (int) numTokensLong;
+        int isF16 = (table.getDType() == DType.f16) ? 1 : 0;
+
+        try {
+            int status = NativeBindings.dispatchEmbedding(idTable, idTokens, idRes, vocabSize, hiddenDim, numTokens, isF16);
+            NativeEngine.checkStatus(status, "NnOps.embedding");
+            return res;
+        } catch (Throwable t) {
+            if (t instanceof RuntimeException re) throw re;
+            throw new RuntimeException("HC4J GPU Error: embedding failed", t);
+        }
+    }
+
+    public static Tensor rope(Tensor x, int positionOffset, float theta, Tensor res) {
+        Objects.requireNonNull(x, "x");
+        Objects.requireNonNull(res, "res");
+
+        TensorAccess access = TensorAccess.getInstance();
+        access.ensureOpen(x);
+        access.ensureOpen(res);
+
+        if (access.getVramId(x) == access.getVramId(res) && !access.hasIdenticalLayout(x, res)) {
+            try (Tensor copyX = x.copy()) {
+                return rope(copyX, positionOffset, theta, res);
+            }
+        }
+
+        if (access.elementOffset(x) > 0 || !x.isContiguous()) {
+            try (Tensor contigX = x.contiguous()) {
+                return rope(contigX, positionOffset, theta, res);
+            }
+        }
+
+        if (!res.isContiguous() || access.elementOffset(res) != 0) {
+            throw new IllegalArgumentException("Output tensor must be contiguous with zero offset");
+        }
+
+        ValidUtil.requireOperandF32("rope input", x.getDType());
+        ValidUtil.requireResultDType(DType.f32, res.getDType());
+
+        int[] sx = access.getShapeUnsafe(x);
+        ValidUtil.requireResultShape(sx, access.getShapeUnsafe(res));
+
+        int batch;
+        int seqLen;
+        int numHeads;
+        int headDim;
+        if (sx.length == 4) {
+            batch = sx[0];
+            seqLen = sx[1];
+            numHeads = sx[2];
+            headDim = sx[3];
+        } else if (sx.length == 3) {
+            batch = 1;
+            seqLen = sx[0];
+            numHeads = sx[1];
+            headDim = sx[2];
+        } else if (sx.length == 2) {
+            batch = 1;
+            seqLen = sx[0];
+            numHeads = 1;
+            headDim = sx[1];
+        } else {
+            throw new IllegalArgumentException("rope requires a 2-D, 3-D, or 4-D tensor, got " + sx.length + "-D");
+        }
+
+        if (headDim % 2 != 0) {
+            throw new IllegalArgumentException("head_dim must be even for half-split RoPE, got " + headDim);
+        }
+
+        long idIn = access.getVramId(x);
+        long idOut = access.getVramId(res);
+        int thetaBits = Float.floatToRawIntBits(theta);
+
+        try {
+            int status = NativeBindings.dispatchRopeF32(idIn, idOut, batch, seqLen, numHeads, headDim, positionOffset, thetaBits);
+            NativeEngine.checkStatus(status, "NnOps.rope");
+            return res;
+        } catch (Throwable t) {
+            if (t instanceof RuntimeException re) throw re;
+            throw new RuntimeException("HC4J GPU Error: rope failed", t);
+        }
+    }
 }

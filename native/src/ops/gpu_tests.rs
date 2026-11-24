@@ -1481,3 +1481,296 @@ fn axis_reduce_and_argmax_gpu_test() {
     free(id_argmax_out);
 }
 
+#[test]
+fn f32_to_f16_cast_round_trip() {
+    let Some(_gpu) = gpu() else { return };
+    let n = 1003usize; // Odd length to test padding & non-aligned byte boundaries
+    let host: Vec<f32> = (0..n)
+        .map(|i| {
+            let v = (i as f32 - 500.0) * 0.05;
+            if i % 10 == 0 { 0.0 } else { v }
+        })
+        .collect();
+
+    let id_f32 = upload(&host);
+    let bytes_f16 = (n * 2) as u64;
+    let id_f16 = crate::memory::hc4j_gpu_alloc_bytes(bytes_f16, 1);
+    assert_ne!(id_f16, 0);
+
+    assert_eq!(crate::ops::f16::dispatch_cast_f32_to_f16(id_f32, id_f16, n as u64), 0);
+
+    // Verify byte download preserves exact byte length:
+    let mut f16_bytes = vec![0u8; n * 2];
+    assert_eq!(
+        unsafe { crate::memory::hc4j_gpu_download_bytes(id_f16, f16_bytes.as_mut_ptr(), n * 2) },
+        0
+    );
+
+    // Cast back to f32 on GPU:
+    let id_back = hc4j_gpu_alloc(n);
+    assert_eq!(crate::ops::f16::dispatch_cast_f16_to_f32(id_f16, id_back, n as u64), 0);
+
+    let got = download(id_back, n);
+    for i in 0..n {
+        let diff = (got[i] - host[i]).abs();
+        let tol = 1e-2 * host[i].abs().max(1.0);
+        assert!(diff <= tol, "Mismatch at {i}: expected {}, got {}", host[i], got[i]);
+    }
+
+    free(id_f32);
+    free(id_f16);
+    free(id_back);
+}
+
+#[test]
+fn mixed_precision_matmul_f32_f16() {
+    let Some(_gpu) = gpu() else { return };
+
+    // Case 1: M = 1 Decode GEMV (trans_b = 1)
+    {
+        let (m, n, k) = (1u32, 32u32, 64u32);
+        let a_data = noise((m * k) as usize, 42);
+        let b_data = noise((n * k) as usize, 43);
+
+        let id_a = upload(&a_data);
+        let id_b_f32 = upload(&b_data);
+        let id_b_f16 = crate::memory::hc4j_gpu_alloc_bytes((n * k * 2) as u64, 1);
+        assert_eq!(
+            crate::ops::f16::dispatch_cast_f32_to_f16(id_b_f32, id_b_f16, (n * k) as u64),
+            0
+        );
+
+        let id_out = hc4j_gpu_alloc((m * n) as usize);
+        assert_eq!(
+            crate::ops::f16::dispatch_matmul_f32_f16(id_a, id_b_f16, id_out, m, n, k, FLAG_TRANS_B),
+            0
+        );
+
+        let got = download(id_out, (m * n) as usize);
+        for col in 0..n as usize {
+            let mut expected = 0.0f64;
+            for p in 0..k as usize {
+                expected += (a_data[p] as f64) * (b_data[col * (k as usize) + p] as f64);
+            }
+            let diff = ((got[col] as f64) - expected).abs();
+            assert!(diff <= 2e-2, "Decode GEMV mismatch at {col}: expected {expected}, got {}", got[col]);
+        }
+
+        free(id_a);
+        free(id_b_f32);
+        free(id_b_f16);
+        free(id_out);
+    }
+
+    // Case 2: M = 17, N = 35, K = 64 GEMM (both trans_b = 0 and trans_b = 1)
+    {
+        let (m, n, k) = (17u32, 35u32, 64u32);
+        let a_data = noise((m * k) as usize, 101);
+
+        for flags in [0u32, FLAG_TRANS_B] {
+            let trans_b = flags != 0;
+            let b_data = noise((n * k) as usize, 202);
+
+            let id_a = upload(&a_data);
+            let id_b_f32 = upload(&b_data);
+            let id_b_f16 = crate::memory::hc4j_gpu_alloc_bytes((n * k * 2) as u64, 1);
+            assert_eq!(
+                crate::ops::f16::dispatch_cast_f32_to_f16(id_b_f32, id_b_f16, (n * k) as u64),
+                0
+            );
+
+            let id_out = hc4j_gpu_alloc((m * n) as usize);
+            assert_eq!(
+                crate::ops::f16::dispatch_matmul_f32_f16(id_a, id_b_f16, id_out, m, n, k, flags),
+                0
+            );
+
+            let got = download(id_out, (m * n) as usize);
+            for r in 0..m as usize {
+                for c in 0..n as usize {
+                    let mut expected = 0.0f64;
+                    for p in 0..k as usize {
+                        let b_val = if trans_b {
+                            b_data[c * (k as usize) + p]
+                        } else {
+                            b_data[p * (n as usize) + c]
+                        };
+                        expected += (a_data[r * (k as usize) + p] as f64) * (b_val as f64);
+                    }
+                    let idx = r * (n as usize) + c;
+                    let diff = ((got[idx] as f64) - expected).abs();
+                    assert!(
+                        diff <= 5e-2,
+                        "GEMM flags={flags} mismatch at ({r},{c}): expected {expected}, got {}",
+                        got[idx]
+                    );
+                }
+            }
+
+            free(id_a);
+            free(id_b_f32);
+            free(id_b_f16);
+            free(id_out);
+        }
+    }
+}
+
+#[test]
+fn embedding_lookup_f32_and_f16() {
+    let Some(_gpu) = gpu() else { return };
+    let (vocab, hidden, tokens) = (16u32, 32u32, 5u32);
+    let table_data = noise((vocab * hidden) as usize, 77);
+    let indices: Vec<i32> = vec![0, 15, 3, -1, 20]; // 2 valid, 1 middle, 2 out-of-bounds
+
+    let id_table_f32 = upload(&table_data);
+    let id_indices = hc4j_gpu_alloc(tokens as usize);
+    assert_eq!(
+        unsafe { crate::memory::hc4j_gpu_write(id_indices, indices.as_ptr().cast::<f32>(), tokens as usize) },
+        0
+    );
+
+    // Test f32 table
+    let id_out_f32 = hc4j_gpu_alloc((tokens * hidden) as usize);
+    assert_eq!(
+        crate::ops::nn::embedding::dispatch_embedding(
+            id_table_f32,
+            id_indices,
+            id_out_f32,
+            vocab,
+            hidden,
+            tokens,
+            0
+        ),
+        0
+    );
+    let got_f32 = download(id_out_f32, (tokens * hidden) as usize);
+    for t in 0..tokens as usize {
+        let row = indices[t];
+        for c in 0..hidden as usize {
+            let val = got_f32[t * (hidden as usize) + c];
+            if row < 0 || row >= vocab as i32 {
+                assert!(val.is_nan(), "Expected NaN for out-of-bounds row {row}");
+            } else {
+                let want = table_data[(row as usize) * (hidden as usize) + c];
+                assert_eq!(val, want);
+            }
+        }
+    }
+
+    // Test f16 table
+    let id_table_f16 = crate::memory::hc4j_gpu_alloc_bytes((vocab * hidden * 2) as u64, 1);
+    assert_eq!(
+        crate::ops::f16::dispatch_cast_f32_to_f16(id_table_f32, id_table_f16, (vocab * hidden) as u64),
+        0
+    );
+    let id_out_f16 = hc4j_gpu_alloc((tokens * hidden) as usize);
+    assert_eq!(
+        crate::ops::nn::embedding::dispatch_embedding(
+            id_table_f16,
+            id_indices,
+            id_out_f16,
+            vocab,
+            hidden,
+            tokens,
+            1
+        ),
+        0
+    );
+    let got_f16 = download(id_out_f16, (tokens * hidden) as usize);
+    for t in 0..tokens as usize {
+        let row = indices[t];
+        for c in 0..hidden as usize {
+            let val = got_f16[t * (hidden as usize) + c];
+            if row < 0 || row >= vocab as i32 {
+                assert!(val.is_nan(), "Expected NaN for out-of-bounds row {row}");
+            } else {
+                let want = table_data[(row as usize) * (hidden as usize) + c];
+                let diff = (val - want).abs();
+                assert!(diff <= 1e-2, "Embedding f16 mismatch at ({t},{c}): expected {want}, got {val}");
+            }
+        }
+    }
+
+    free(id_table_f32);
+    free(id_table_f16);
+    free(id_indices);
+    free(id_out_f32);
+    free(id_out_f16);
+}
+
+#[test]
+fn rope_neox_half_split() {
+    let Some(_gpu) = gpu() else { return };
+    let (batch, seq_len, num_heads, head_dim) = (2u32, 4u32, 3u32, 16u32);
+    let total = (batch * seq_len * num_heads * head_dim) as usize;
+    let input = noise(total, 999);
+    let theta = 10000.0f32;
+
+    for (pos_offset, in_place) in [(0u32, false), (7u32, false), (0u32, true), (5u32, true)] {
+        let id_in = upload(&input);
+        let id_out = if in_place {
+            id_in
+        } else {
+            hc4j_gpu_alloc(total)
+        };
+
+        assert_eq!(
+            crate::ops::nn::rope::dispatch_rope_f32(
+                id_in,
+                id_out,
+                batch,
+                seq_len,
+                num_heads,
+                head_dim,
+                pos_offset,
+                theta.to_bits(),
+            ),
+            0
+        );
+
+        let got = download(id_out, total);
+        let half = (head_dim / 2) as usize;
+
+        for b in 0..batch as usize {
+            for s in 0..seq_len as usize {
+                for h in 0..num_heads as usize {
+                    let base = ((b * (seq_len as usize) + s) * (num_heads as usize) + h) * (head_dim as usize);
+                    let pos = (pos_offset as usize + s) as f64;
+                    for d in 0..half {
+                        let freq = (-(theta as f64).ln() * (2.0 * (d as f64)) / (head_dim as f64)).exp();
+                        let angle = pos * freq;
+                        let c = angle.cos() as f32;
+                        let sn = angle.sin() as f32;
+
+                        let x0 = input[base + d];
+                        let x1 = input[base + d + half];
+                        let exp0 = x0 * c - x1 * sn;
+                        let exp1 = x0 * sn + x1 * c;
+
+                        let diff0 = (got[base + d] - exp0).abs();
+                        let diff1 = (got[base + d + half] - exp1).abs();
+                        assert!(
+                            diff0 <= 1e-4,
+                            "RoPE mismatch at first half ({b},{s},{h},{d}): expected {exp0}, got {}",
+                            got[base + d]
+                        );
+                        assert!(
+                            diff1 <= 1e-4,
+                            "RoPE mismatch at second half ({b},{s},{h},{d}): expected {exp1}, got {}",
+                            got[base + d + half]
+                        );
+                    }
+                }
+            }
+        }
+
+        if in_place {
+            free(id_in);
+        } else {
+            free(id_in);
+            free(id_out);
+        }
+    }
+}
+
+

@@ -107,6 +107,69 @@ pub extern "C" fn hc4j_gpu_alloc_uninit(length: usize) -> u64 {
     alloc_elements("hc4j_gpu_alloc_uninit", length, false)
 }
 
+fn align_up_u64(val: u64, align: u64) -> u64 {
+    (val.saturating_add(align - 1)) & !(align - 1)
+}
+
+/// Allocates `bytes` in VRAM/host/spill, aligned up to 4 bytes for WebGPU/WGSL compatibility.
+/// If `zeroed != 0`, zero-fills the allocation. Returns 0 on failure.
+#[unsafe(no_mangle)]
+pub extern "C" fn hc4j_gpu_alloc_bytes(bytes: u64, zeroed: u32) -> u64 {
+    let mut id = 0;
+    let status = ffi_guard("hc4j_gpu_alloc_bytes", || {
+        if bytes == 0 {
+            return Err(Hc4jError::InvalidParam("bytes must be positive"));
+        }
+        let aligned = align_up_u64(bytes, 4);
+        id = manager()?.allocate(aligned, zeroed != 0)?;
+        Ok(())
+    });
+    if status == HC4J_SUCCESS { id } else { 0 }
+}
+
+/// # Safety
+/// `ptr_in` must point to at least `bytes` readable bytes for the duration of the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn hc4j_gpu_write_bytes(id: u64, ptr_in: *const u8, bytes: usize) -> i32 {
+    ffi_guard("hc4j_gpu_write_bytes", || {
+        if ptr_in.is_null() || bytes == 0 {
+            return Err(Hc4jError::InvalidParam("null pointer or zero bytes"));
+        }
+        if bytes.is_multiple_of(4) {
+            let data = unsafe { std::slice::from_raw_parts(ptr_in, bytes) };
+            manager()?.write(id, data)
+        } else {
+            let aligned = bytes.checked_add(4 - (bytes % 4)).ok_or(Hc4jError::InvalidParam("overflow"))?;
+            let mut padded = vec![0u8; aligned];
+            let data = unsafe { std::slice::from_raw_parts(ptr_in, bytes) };
+            padded[..bytes].copy_from_slice(data);
+            manager()?.write(id, &padded)
+        }
+    })
+}
+
+/// # Safety
+/// `ptr_out` must point to at least `bytes` writable bytes for the duration of the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn hc4j_gpu_download_bytes(id: u64, ptr_out: *mut u8, bytes: usize) -> i32 {
+    ffi_guard("hc4j_gpu_download_bytes", || {
+        if ptr_out.is_null() || bytes == 0 {
+            return Err(Hc4jError::InvalidParam("null pointer or zero bytes"));
+        }
+        if bytes.is_multiple_of(4) {
+            let out = unsafe { std::slice::from_raw_parts_mut(ptr_out, bytes) };
+            manager()?.read(id, out)
+        } else {
+            let aligned = bytes.checked_add(4 - (bytes % 4)).ok_or(Hc4jError::InvalidParam("overflow"))?;
+            let mut temp = vec![0u8; aligned];
+            manager()?.read(id, &mut temp)?;
+            let out = unsafe { std::slice::from_raw_parts_mut(ptr_out, bytes) };
+            out.copy_from_slice(&temp[..bytes]);
+            Ok(())
+        }
+    })
+}
+
 /// # Safety
 /// `ptr_in` must point to `length` readable f32 values for the duration of the call.
 #[unsafe(no_mangle)]

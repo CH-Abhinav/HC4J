@@ -55,10 +55,13 @@ public final class NativeEngine {
 
     private static MethodHandle initGpuHandle;
     private static MethodHandle gpuAllocHandle;
+    private static MethodHandle gpuAllocBytesHandle;
     private static MethodHandle gpuAllocUninitHandle;
     private static MethodHandle gpuWriteHandle;
+    private static MethodHandle gpuWriteBytesHandle;
     private static MethodHandle gpuFreeHandle;
     private static MethodHandle gpuDownloadHandle;
+    private static MethodHandle gpuDownloadBytesHandle;
     private static MethodHandle memConfigureHandle;
     private static MethodHandle memStatsHandle;
     private static MethodHandle memResidencyHandle;
@@ -172,16 +175,25 @@ public final class NativeEngine {
         gpuAllocHandle = linker.downcallHandle(lookup.find("hc4j_gpu_alloc").orElseThrow(),
                 FunctionDescriptor.of(ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG));
 
+        gpuAllocBytesHandle = linker.downcallHandle(lookup.find("hc4j_gpu_alloc_bytes").orElseThrow(),
+                FunctionDescriptor.of(ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG, ValueLayout.JAVA_INT));
+
         gpuAllocUninitHandle = linker.downcallHandle(lookup.find("hc4j_gpu_alloc_uninit").orElseThrow(),
                 FunctionDescriptor.of(ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG));
 
         gpuWriteHandle = linker.downcallHandle(lookup.find("hc4j_gpu_write").orElseThrow(),
                 FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.JAVA_LONG, ValueLayout.ADDRESS, ValueLayout.JAVA_LONG));
 
+        gpuWriteBytesHandle = linker.downcallHandle(lookup.find("hc4j_gpu_write_bytes").orElseThrow(),
+                FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.JAVA_LONG, ValueLayout.ADDRESS, ValueLayout.JAVA_LONG));
+
         gpuFreeHandle = linker.downcallHandle(lookup.find("hc4j_gpu_free").orElseThrow(),
                 FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.JAVA_LONG));
 
         gpuDownloadHandle = linker.downcallHandle(lookup.find("hc4j_gpu_download").orElseThrow(),
+                FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.JAVA_LONG, ValueLayout.ADDRESS, ValueLayout.JAVA_LONG));
+
+        gpuDownloadBytesHandle = linker.downcallHandle(lookup.find("hc4j_gpu_download_bytes").orElseThrow(),
                 FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.JAVA_LONG, ValueLayout.ADDRESS, ValueLayout.JAVA_LONG));
 
         memConfigureHandle = linker.downcallHandle(lookup.find("hc4j_mem_configure").orElseThrow(),
@@ -317,6 +329,69 @@ public final class NativeEngine {
             throw new GpuOutOfMemoryException("allocVramUninit: could not allocate " + totalElements + " elements in any tier");
         }
         return id;
+    }
+
+    public static long allocVramBytes(long bytes, boolean zeroed) {
+        ensureInitialized();
+        if (bytes <= 0) {
+            throw new IllegalArgumentException("Allocation byte size must be positive: " + bytes);
+        }
+        long id;
+        try {
+            id = (long) gpuAllocBytesHandle.invokeExact(bytes, zeroed ? 1 : 0);
+        } catch (Throwable t) {
+            if (t instanceof RuntimeException re) throw re;
+            if (t instanceof Error err) throw err;
+            throw new RuntimeException("allocVramBytes failed", t);
+        }
+        if (id == 0) {
+            throw new GpuOutOfMemoryException("allocVramBytes: could not allocate " + bytes + " bytes in any tier");
+        }
+        return id;
+    }
+
+    public static void writeVramBytesSegment(long id, MemorySegment segment, long bytes) {
+        ensureInitialized();
+        if (id == 0) {
+            throw new IllegalArgumentException("Invalid VRAM handle: 0");
+        }
+        if (bytes < 0) {
+            throw new IllegalArgumentException("Negative byte count: " + bytes);
+        }
+        if (bytes == 0) {
+            return;
+        }
+        int status;
+        try {
+            status = (int) gpuWriteBytesHandle.invokeExact(id, segment, bytes);
+        } catch (Throwable t) {
+            if (t instanceof RuntimeException re) throw re;
+            if (t instanceof Error err) throw err;
+            throw new RuntimeException("writeVramBytesSegment failed", t);
+        }
+        checkStatus(status, "writeVramBytesSegment");
+    }
+
+    public static void downloadVramBytesSegment(long id, MemorySegment segment, long bytes) {
+        ensureInitialized();
+        if (id == 0) {
+            throw new IllegalArgumentException("Invalid VRAM handle: 0");
+        }
+        if (bytes < 0) {
+            throw new IllegalArgumentException("Negative byte count: " + bytes);
+        }
+        if (bytes == 0) {
+            return;
+        }
+        int status;
+        try {
+            status = (int) gpuDownloadBytesHandle.invokeExact(id, segment, bytes);
+        } catch (Throwable t) {
+            if (t instanceof RuntimeException re) throw re;
+            if (t instanceof Error err) throw err;
+            throw new RuntimeException("downloadVramBytesSegment failed", t);
+        }
+        checkStatus(status, "downloadVramBytesSegment");
     }
 
     public static void writeVram(long vramId, MemorySegment hostData, long totalElements) {

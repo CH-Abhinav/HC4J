@@ -25,8 +25,9 @@ use stream::CommandStream;
 pub use adapter::{hc4j_adapter_info, pick_adapter, AdapterInfoC};
 pub use collective::*;
 pub use memory::{
-    hc4j_gpu_alloc, hc4j_gpu_alloc_uninit, hc4j_gpu_download, hc4j_gpu_free, hc4j_gpu_write, hc4j_mem_configure,
-    hc4j_mem_evict, hc4j_mem_residency, hc4j_mem_stats,
+    hc4j_gpu_alloc, hc4j_gpu_alloc_bytes, hc4j_gpu_alloc_uninit, hc4j_gpu_download, hc4j_gpu_download_bytes,
+    hc4j_gpu_free, hc4j_gpu_write, hc4j_gpu_write_bytes, hc4j_mem_configure, hc4j_mem_evict, hc4j_mem_residency,
+    hc4j_mem_stats,
 };
 pub use ops::arithmetic::{
     dispatch_add, dispatch_add_f32, dispatch_div, dispatch_div_f32, dispatch_mul, dispatch_mul_f32, dispatch_sub,
@@ -34,6 +35,7 @@ pub use ops::arithmetic::{
 };
 pub use ops::elementwise::dispatch_copy_strided;
 pub use ops::exponential::{dispatch_exp_f32, dispatch_ln_f32, dispatch_log2_f32, dispatch_log10_f32, dispatch_sqrt_f32};
+pub use ops::f16::{dispatch_cast_f16_to_f32, dispatch_cast_f32_to_f16, dispatch_matmul_f32_f16};
 pub use ops::fusion::hc4j_fused_dispatch;
 pub use ops::math::{
     dispatch_abs_f32, dispatch_cast, dispatch_ceil_f32, dispatch_clamp_f32, dispatch_compare, dispatch_floor_f32,
@@ -44,6 +46,8 @@ pub use ops::matmul::{
     dispatch_batched_matmul_f32, dispatch_matmul_f32, dispatch_matmul_f32_ex, dispatch_transpose_f32, hc4j_matmul_plan,
 };
 pub use ops::nn::abi::*;
+pub use ops::nn::embedding::dispatch_embedding;
+pub use ops::nn::rope::dispatch_rope_f32;
 pub use ops::reduce::abi::*;
 pub use ops::trigno::{
     dispatch_acos_f32, dispatch_acosh_f32, dispatch_asin_f32, dispatch_asinh_f32, dispatch_atan_f32,

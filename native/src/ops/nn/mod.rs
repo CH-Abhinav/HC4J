@@ -28,9 +28,13 @@
 pub mod abi;
 pub mod activations;
 pub mod bias;
+pub mod embedding;
+pub mod rope;
 pub mod row_ops;
 
 pub use abi::*;
 pub use activations::*;
 pub use bias::*;
+pub use embedding::*;
+pub use rope::*;
 pub use row_ops::*;

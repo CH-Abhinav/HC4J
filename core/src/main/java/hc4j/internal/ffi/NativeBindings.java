@@ -202,6 +202,20 @@ public final class NativeBindings {
         static final MethodHandle FUSED_DISPATCH = bind("hc4j_fused_dispatch",
                 FunctionDescriptor.of(JAVA_INT, ADDRESS, JAVA_INT, ADDRESS, JAVA_INT, JAVA_LONG));
 
+        // f16 cast and mixed precision matmul
+        static final MethodHandle DISPATCH_CAST_F32_TO_F16 = bind("dispatch_cast_f32_to_f16",
+                FunctionDescriptor.of(JAVA_INT, JAVA_LONG, JAVA_LONG, JAVA_LONG));
+        static final MethodHandle DISPATCH_CAST_F16_TO_F32 = bind("dispatch_cast_f16_to_f32",
+                FunctionDescriptor.of(JAVA_INT, JAVA_LONG, JAVA_LONG, JAVA_LONG));
+        static final MethodHandle DISPATCH_MATMUL_F32_F16 = bind("dispatch_matmul_f32_f16",
+                FunctionDescriptor.of(JAVA_INT, JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_INT, JAVA_INT, JAVA_INT, JAVA_INT));
+
+        // Transformer primitives: embedding & rope
+        static final MethodHandle DISPATCH_EMBEDDING = bind("dispatch_embedding",
+                FunctionDescriptor.of(JAVA_INT, JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_INT, JAVA_INT, JAVA_INT, JAVA_INT));
+        static final MethodHandle DISPATCH_ROPE_F32 = bind("dispatch_rope_f32",
+                FunctionDescriptor.of(JAVA_INT, JAVA_LONG, JAVA_LONG, JAVA_INT, JAVA_INT, JAVA_INT, JAVA_INT, JAVA_INT, JAVA_INT));
+
         @SuppressWarnings("restricted")
         private static MethodHandle bind(String name, FunctionDescriptor desc) {
             MemorySegment addr = SYMBOLS.find(name).orElseThrow(() -> new UnsatisfiedLinkError(
@@ -406,5 +420,25 @@ public final class NativeBindings {
     public static int dispatchBatchedMatmul(long a, long b, long out, int m, int n, int k, int batchRank,
                                            MemorySegment batchShape, MemorySegment aBatchStrides, MemorySegment bBatchStrides, int flags) throws Throwable {
         return (int) Holder.DISPATCH_BATCHED_MATMUL.invokeExact(a, b, out, m, n, k, batchRank, batchShape, aBatchStrides, bBatchStrides, flags);
+    }
+
+    public static int dispatchCastF32ToF16(long src, long out, long length) throws Throwable {
+        return (int) Holder.DISPATCH_CAST_F32_TO_F16.invokeExact(src, out, length);
+    }
+
+    public static int dispatchCastF16ToF32(long src, long out, long length) throws Throwable {
+        return (int) Holder.DISPATCH_CAST_F16_TO_F32.invokeExact(src, out, length);
+    }
+
+    public static int dispatchMatmulF32F16(long a, long bF16, long out, int m, int n, int k, int flags) throws Throwable {
+        return (int) Holder.DISPATCH_MATMUL_F32_F16.invokeExact(a, bF16, out, m, n, k, flags);
+    }
+
+    public static int dispatchEmbedding(long table, long indices, long out, int vocabSize, int hiddenDim, int numTokens, int tableIsF16) throws Throwable {
+        return (int) Holder.DISPATCH_EMBEDDING.invokeExact(table, indices, out, vocabSize, hiddenDim, numTokens, tableIsF16);
+    }
+
+    public static int dispatchRopeF32(long in, long out, int batch, int seqLen, int numHeads, int headDim, int posOffset, int thetaBits) throws Throwable {
+        return (int) Holder.DISPATCH_ROPE_F32.invokeExact(in, out, batch, seqLen, numHeads, headDim, posOffset, thetaBits);
     }
 }

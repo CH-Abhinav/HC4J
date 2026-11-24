@@ -103,6 +103,41 @@ public final class Linalg {
     }
 
     /**
+     * Matrix multiplication with transposed second operand {@code B^T},
+     * supporting 2-D {@code [M, K] @ [N, K]^T -> [M, N]} and
+     * 3-D+ {@code [..., M, K] @ [N, K]^T -> [..., M, N]}.
+     * Supports both f32 and f16 right operands.
+     *
+     * @param a left operand
+     * @param b right operand of shape [N, K]
+     * @return result tensor of shape [..., M, N]
+     */
+    public static Tensor matmulTransposedB(Tensor a, Tensor b) {
+        Objects.requireNonNull(a, "a");
+        Objects.requireNonNull(b, "b");
+        int[] outShape = MatmulOps.transposedBOutputShape(a, b);
+        Tensor res = Tensor.empty(DType.f32, outShape);
+        try {
+            return MatmulOps.matmulTransposedB(a, b, res);
+        } catch (RuntimeException | Error e) {
+            res.close();
+            throw e;
+        }
+    }
+
+    /**
+     * Matrix multiplication with transposed second operand {@code B^T} into caller-provided {@code out}.
+     *
+     * @param a left operand
+     * @param b right operand of shape [N, K]
+     * @param out destination tensor
+     * @return {@code out}
+     */
+    public static Tensor matmulTransposedB(Tensor a, Tensor b, Tensor out) {
+        return MatmulOps.matmulTransposedB(a, b, out);
+    }
+
+    /**
      * Dot product between two tensors.
      *
      * @param a first operand

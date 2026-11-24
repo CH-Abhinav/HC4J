@@ -267,4 +267,20 @@ fn collective_reduce_shader() {
     validate("collective_reduce", include_str!("../collective/vulkan/reduce.wgsl"));
 }
 
+#[test]
+fn f16_and_transformer_shaders() {
+    // Pure f32 transformer primitives validate with zero capabilities:
+    validate("embedding_f32", super::nn::embedding::EMBEDDING_F32_WGSL);
+    validate("rope_f32", super::nn::rope::ROPE_F32_WGSL);
+
+    // Portable f16 shaders use standard WGSL 1.0 pack2x16float/unpack2x16float (no `enable f16;`):
+    let f16_in_f32 = Capabilities::SHADER_FLOAT16_IN_FLOAT32;
+    validate_with("cast_f32_to_f16", super::f16::CAST_F32_TO_F16_WGSL, f16_in_f32);
+    validate_with("cast_f16_to_f32", super::f16::CAST_F16_TO_F32_WGSL, f16_in_f32);
+    validate_with("matmul_f32_f16_gemv_trans_b", super::f16::MATMUL_F32_F16_GEMV_TRANS_B_WGSL, f16_in_f32);
+    validate_with("matmul_f32_f16_tiled16", super::f16::MATMUL_F32_F16_TILED16_WGSL, f16_in_f32);
+    validate_with("embedding_f16", super::nn::embedding::EMBEDDING_F16_WGSL, f16_in_f32);
+}
+
+
 
