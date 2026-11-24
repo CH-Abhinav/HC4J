@@ -59,4 +59,14 @@ public abstract class TensorAccess {
     public abstract Tensor create(DType dtype, int[] shape, int[] strides, long vramId);
 
     public abstract Tensor create(DType dtype, int[] shape, int[] strides, long elementOffset, VramHandle handle);
+
+    public boolean hasIdenticalLayout(Tensor input, Tensor out) {
+        if (input == null || out == null) {
+            return false;
+        }
+        return java.util.Arrays.equals(getShapeUnsafe(input), getShapeUnsafe(out))
+                && java.util.Arrays.equals(getStridesUnsafe(input), getStridesUnsafe(out))
+                && elementOffset(input) == 0
+                && elementOffset(out) == 0;
+    }
 }

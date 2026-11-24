@@ -251,14 +251,37 @@ class EngineOpsTest {
                 }
             }
             Engine.synchronize();
-            assertTrue(a.toFloatArray().length == n);
+            float[] expected = new float[n];
+            for (int j = 0; j < n; j++) {
+                float v = data[j];
+                for (int i = 0; i < 10; i++) {
+                    v = (float) Math.sin(v);
+                }
+                expected[j] = v;
+            }
+            TestAssertions.assertArrayClose(expected, a.toFloatArray(), 5e-4f, 5e-4f);
         }
     }
 
     @Test
     @DisplayName("Leak check on allocations")
     void testLeakCheck() {
-        MemoryStats stats = Engine.memoryStats();
-        assertEquals(0, stats.tensorsDevice() + stats.tensorsHost() + stats.tensorsEvicted());
+        MemoryStats before = Engine.memoryStats();
+        long baselineLiveTensors = before.tensorsDevice() + before.tensorsHost() + before.tensorsEvicted();
+        long baselineVramUsed = before.vramUsed();
+
+        for (int i = 0; i < 20; i++) {
+            try (Tensor t = Tensor.empty(DType.f32, 128, 128);
+                 Tensor s = t.sin();
+                 Tensor r = s.add(t)) {
+                r.toFloatArray();
+            }
+        }
+        Engine.synchronize();
+
+        MemoryStats after = Engine.memoryStats();
+        long afterLiveTensors = after.tensorsDevice() + after.tensorsHost() + after.tensorsEvicted();
+        assertEquals(baselineLiveTensors, afterLiveTensors, "Live tensor count must return to baseline");
+        assertEquals(baselineVramUsed, after.vramUsed(), "VRAM used must return to baseline");
     }
 }

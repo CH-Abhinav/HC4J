@@ -164,6 +164,7 @@ pub fn parse_cache(content: &str, expected_phys_devices: usize) -> Option<Cached
 
     let mut devices = Vec::with_capacity(expected_phys_devices);
     let mut edges = Vec::new();
+    let mut seen_edges = std::collections::HashSet::new();
 
     for line in lines {
         let trimmed = line.trim();
@@ -188,6 +189,14 @@ pub fn parse_cache(content: &str, expected_phys_devices: usize) -> Option<Cached
                 let transport: u32 = parts[3].parse().ok()?;
                 let bandwidth_gbps: f64 = parts[4].parse().ok()?;
                 let latency_us: f64 = parts[5].parse().ok()?;
+
+                if src_phys_idx >= expected_phys_devices || dst_phys_idx >= expected_phys_devices {
+                    return None;
+                }
+                if !seen_edges.insert((src_phys_idx, dst_phys_idx)) {
+                    return None; // duplicate edge key
+                }
+
                 edges.push(CachedEdge {
                     src_phys_idx,
                     dst_phys_idx,
@@ -207,14 +216,6 @@ pub fn parse_cache(content: &str, expected_phys_devices: usize) -> Option<Cached
     devices.sort_by_key(|d| d.phys_idx);
     for (i, dev) in devices.iter().enumerate() {
         if dev.phys_idx != i {
-            return None;
-        }
-    }
-
-    // Verify all expected directed edges are present when expected_phys_devices > 1
-    if expected_phys_devices > 1 {
-        let expected_edges = expected_phys_devices * (expected_phys_devices - 1);
-        if edges.len() != expected_edges {
             return None;
         }
     }
@@ -339,5 +340,68 @@ mod tests {
         assert_ne!(fp1, fp2);
         assert_ne!(fp1, fp1_cpu);
         assert_eq!(fp1.len(), 16);
+    }
+
+    #[test]
+    fn test_multi_gpu_loopback_cache() {
+        let temp_dir = std::env::temp_dir().join("hc4j_test_loopback_cache");
+        let path = temp_dir.join("topo_loopback.cache");
+
+        let devices = vec![
+            CachedDevice {
+                phys_idx: 0,
+                vram_bytes: 8 * 1024 * 1024 * 1024,
+                compute_gflops: 500.0,
+            },
+            CachedDevice {
+                phys_idx: 1,
+                vram_bytes: 8 * 1024 * 1024 * 1024,
+                compute_gflops: 500.0,
+            },
+        ];
+        // 4 edges: (0,0), (0,1), (1,0), (1,1)
+        let edges = vec![
+            CachedEdge {
+                src_phys_idx: 0,
+                dst_phys_idx: 0,
+                transport: 0,
+                bandwidth_gbps: 500.0,
+                latency_us: 1.0,
+            },
+            CachedEdge {
+                src_phys_idx: 0,
+                dst_phys_idx: 1,
+                transport: 1,
+                bandwidth_gbps: 25.0,
+                latency_us: 100.0,
+            },
+            CachedEdge {
+                src_phys_idx: 1,
+                dst_phys_idx: 0,
+                transport: 1,
+                bandwidth_gbps: 25.0,
+                latency_us: 100.0,
+            },
+            CachedEdge {
+                src_phys_idx: 1,
+                dst_phys_idx: 1,
+                transport: 0,
+                bandwidth_gbps: 500.0,
+                latency_us: 1.0,
+            },
+        ];
+
+        let serialized = serialize_cache(&devices, &edges);
+        let parsed = parse_cache(&serialized, 2).expect("parse_cache must succeed for 4 edges on 2 physical GPUs");
+        assert_eq!(parsed.devices, devices);
+        assert_eq!(parsed.edges, edges);
+
+        write_cache_atomic(&path, &serialized).expect("write should succeed");
+        let loaded = load_cache(&path, 2).expect("load_cache must succeed for 4 edges on 2 physical GPUs");
+        assert_eq!(loaded.devices, devices);
+        assert_eq!(loaded.edges, edges);
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&temp_dir);
     }
 }

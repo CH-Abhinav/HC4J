@@ -184,25 +184,26 @@ pub fn compile(program: &[u32], n_inputs: u32) -> Result<FusedKernel, FusionErro
                 let a = stack.pop().ok_or(FusionError::StackUnderflow)?;
                 ((op::NEG, a as u64, 0), format!("-v{a}"))
             }
-            _ if let Some(name) = unary_fn(opcode) => {
-                let a = stack.pop().ok_or(FusionError::StackUnderflow)?;
-                // Activations are not built-ins: note which helpers the
-                // generated shader has to define. Collected here rather than
-                // by scanning the program, since a CONST payload is raw f32
-                // bits whose top byte can look like any opcode.
-                if let Some(act) = fused_activation(opcode).map(|(act, _)| act)
-                    && !used_acts.iter().any(|(_, n)| *n == name)
-                {
-                    used_acts.push((act, name));
-                }
-                ((opcode, a as u64, 0), format!("{name}(v{a})"))
-            }
             _ => {
-                let b = stack.pop().ok_or(FusionError::StackUnderflow)?;
-                let a = stack.pop().ok_or(FusionError::StackUnderflow)?;
-                let expr = binary_expr(opcode, a, b).ok_or(FusionError::UnknownOpcode(opcode))?;
-                let (ka, kb) = if commutative(opcode) { (a.min(b), a.max(b)) } else { (a, b) };
-                ((opcode, ka as u64, kb as u64), expr)
+                if let Some(name) = unary_fn(opcode) {
+                    let a = stack.pop().ok_or(FusionError::StackUnderflow)?;
+                    // Activations are not built-ins: note which helpers the
+                    // generated shader has to define. Collected here rather than
+                    // by scanning the program, since a CONST payload is raw f32
+                    // bits whose top byte can look like any opcode.
+                    if let Some(act) = fused_activation(opcode).map(|(act, _)| act)
+                        && !used_acts.iter().any(|(_, n)| *n == name)
+                    {
+                        used_acts.push((act, name));
+                    }
+                    ((opcode, a as u64, 0), format!("{name}(v{a})"))
+                } else {
+                    let b = stack.pop().ok_or(FusionError::StackUnderflow)?;
+                    let a = stack.pop().ok_or(FusionError::StackUnderflow)?;
+                    let expr = binary_expr(opcode, a, b).ok_or(FusionError::UnknownOpcode(opcode))?;
+                    let (ka, kb) = if commutative(opcode) { (a.min(b), a.max(b)) } else { (a, b) };
+                    ((opcode, ka as u64, kb as u64), expr)
+                }
             }
         };
         let id = *numbering.entry(key).or_insert_with(|| {

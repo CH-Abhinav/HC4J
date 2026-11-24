@@ -69,6 +69,8 @@ public final class NativeLoader {
     public static final String DEFAULT_URL_TEMPLATE =
             "https://github.com/CH-Abhinav/HC4J/releases/download/v{version}/hc4j-{version}-{classifier}.jar";
 
+    public static final String PINNED_CHECKSUMS_RESOURCE = "META-INF/hc4j/natives-checksums.properties";
+
     private NativeLoader() {
         throw new AssertionError("No instances of NativeLoader");
     }
@@ -236,9 +238,13 @@ public final class NativeLoader {
         }
 
         // Stage 5: Auto On-Demand Download (Mode 3)
-        boolean isDownloadEnabled = (downloadEnabled == null || downloadEnabled);
-        if (!isDownloadEnabled) {
+        String pinnedChecksum = getPinnedChecksum(classLoader, classifier);
+
+        if (Boolean.FALSE.equals(downloadEnabled)) {
             diagnostics.add("Stage 5 (auto-download): disabled via -D" + PROPERTY_DOWNLOAD + "=false or env");
+        } else if (downloadEnabled == null && pinnedChecksum == null) {
+            diagnostics.add("Stage 5 (auto-download): skipped (no pinned release checksum in JAR; set -D"
+                    + PROPERTY_DOWNLOAD + "=true to allow unpinned download)");
         } else {
             Path platformCache = cacheDir.resolve(version).resolve(classifier);
             Path previouslyDownloaded = findExistingCachedBinary(platformCache, libName);
@@ -258,7 +264,7 @@ public final class NativeLoader {
 
             boolean shouldVerify = (verifyChecksum == null || verifyChecksum);
             try {
-                Path downloaded = downloadAndExtract(targetUrl, cacheDir, version, classifier, libName, platform, shouldVerify, diagnostics);
+                Path downloaded = downloadAndExtract(targetUrl, cacheDir, version, classifier, libName, platform, shouldVerify, pinnedChecksum, diagnostics);
                 diagnostics.add("Stage 5 (auto-download): successfully downloaded and cached to " + downloaded);
                 return downloaded;
             } catch (Exception e) {
@@ -294,6 +300,7 @@ public final class NativeLoader {
             String libName,
             Platform platform,
             boolean verifyChecksum,
+            String pinnedChecksum,
             List<String> diagnostics) throws IOException {
 
         byte[] artifactBytes;
@@ -305,22 +312,29 @@ public final class NativeLoader {
         }
 
         if (verifyChecksum) {
-            String checksumUrl = artifactUrl + ".sha256";
-            String expectedSha;
-            try {
-                HttpURLConnection checkConn = openConnectionWithRedirects(checksumUrl, 5);
-                try (InputStream checkIn = checkConn.getInputStream()) {
-                    expectedSha = parseSha256(new String(checkIn.readAllBytes(), StandardCharsets.UTF_8));
-                } finally {
-                    checkConn.disconnect();
-                }
-            } catch (Exception e) {
-                throw new IOException("Failed to download SHA-256 sidecar checksum from " + checksumUrl + ": " + e.getMessage(), e);
-            }
-
             String actualSha = sha256Hex(artifactBytes);
-            if (expectedSha.isBlank() || !actualSha.equalsIgnoreCase(expectedSha)) {
-                throw new IOException("Downloaded artifact SHA-256 mismatch from " + artifactUrl + ": expected " + expectedSha + " but computed " + actualSha);
+            if (pinnedChecksum != null && !pinnedChecksum.isBlank()) {
+                if (!actualSha.equalsIgnoreCase(pinnedChecksum)) {
+                    throw new IOException("Downloaded artifact SHA-256 mismatch against JAR pinned digest for "
+                            + classifier + ": expected " + pinnedChecksum + " but computed " + actualSha);
+                }
+            } else {
+                String checksumUrl = artifactUrl + ".sha256";
+                String expectedSha;
+                try {
+                    HttpURLConnection checkConn = openConnectionWithRedirects(checksumUrl, 5);
+                    try (InputStream checkIn = checkConn.getInputStream()) {
+                        expectedSha = parseSha256(new String(checkIn.readAllBytes(), StandardCharsets.UTF_8));
+                    } finally {
+                        checkConn.disconnect();
+                    }
+                } catch (Exception e) {
+                    throw new IOException("Failed to download SHA-256 sidecar checksum from " + checksumUrl + ": " + e.getMessage(), e);
+                }
+
+                if (expectedSha.isBlank() || !actualSha.equalsIgnoreCase(expectedSha)) {
+                    throw new IOException("Downloaded artifact SHA-256 mismatch from " + artifactUrl + ": expected " + expectedSha + " but computed " + actualSha);
+                }
             }
         }
 
@@ -335,6 +349,23 @@ public final class NativeLoader {
         String nativeSha256 = sha256Hex(nativeBytes);
         Path target = cacheDir.resolve(version).resolve(classifier).resolve(nativeSha256).resolve(libName);
         return extractAtomically(nativeBytes, nativeSha256, target, platform);
+    }
+
+    public static String getPinnedChecksum(ClassLoader classLoader, String classifier) {
+        if (classLoader == null || classifier == null) {
+            return null;
+        }
+        try (InputStream in = classLoader.getResourceAsStream(PINNED_CHECKSUMS_RESOURCE)) {
+            if (in != null) {
+                Properties props = new Properties();
+                props.load(in);
+                String sha = props.getProperty(classifier);
+                if (sha != null && !sha.isBlank()) {
+                    return sha.trim().toLowerCase();
+                }
+            }
+        } catch (Throwable ignored) {}
+        return null;
     }
 
     private static boolean isZip(byte[] bytes) {

@@ -59,6 +59,12 @@ public final class MathOps {
         ValidUtil.requireOperandF32(opName, input.getDType());
         ValidUtil.requireResultDType(DType.f32, out.getDType());
 
+        if (access.getVramId(input) == access.getVramId(out) && !access.hasIdenticalLayout(input, out)) {
+            try (Tensor copy = input.copy()) {
+                return applyUnaryF32(opIndex, opName, copy, out);
+            }
+        }
+
         if (access.elementOffset(input) > 0) {
             try (Tensor contig = input.contiguous()) {
                 return applyUnaryF32(opIndex, opName, contig, out);
@@ -102,6 +108,12 @@ public final class MathOps {
 
         ValidUtil.requireOperandF32("clamp", input.getDType());
         ValidUtil.requireResultDType(DType.f32, out.getDType());
+
+        if (access.getVramId(input) == access.getVramId(out) && !access.hasIdenticalLayout(input, out)) {
+            try (Tensor copy = input.copy()) {
+                return clampF32(copy, lo, hi, out);
+            }
+        }
 
         if (access.elementOffset(input) > 0) {
             try (Tensor contig = input.contiguous()) {
@@ -153,6 +165,12 @@ public final class MathOps {
         }
         ValidUtil.requireResultDType(DType.i32, out.getDType());
 
+        if (access.getVramId(input) == access.getVramId(out) && !access.hasIdenticalLayout(input, out)) {
+            try (Tensor copy = input.copy()) {
+                return applyUnaryI32(opCode, opName, copy, out, pZ, pW);
+            }
+        }
+
         if (access.elementOffset(input) > 0) {
             try (Tensor contig = input.contiguous()) {
                 return applyUnaryI32(opCode, opName, contig, out, pZ, pW);
@@ -203,6 +221,17 @@ public final class MathOps {
         ValidUtil.requireOperandF32("pow", a.getDType());
         ValidUtil.requireOperandF32("pow", b.getDType());
         ValidUtil.requireResultDType(DType.f32, res.getDType());
+
+        if (access.getVramId(a) == access.getVramId(res) && !access.hasIdenticalLayout(a, res)) {
+            try (Tensor copyA = a.copy()) {
+                return pow(copyA, b, res);
+            }
+        }
+        if (access.getVramId(b) == access.getVramId(res) && !access.hasIdenticalLayout(b, res)) {
+            try (Tensor copyB = b.copy()) {
+                return pow(a, copyB, res);
+            }
+        }
 
         if (access.elementOffset(a) > 0) {
             try (Tensor contigA = a.contiguous()) {
@@ -270,6 +299,17 @@ public final class MathOps {
 
         ValidUtil.requireSameDType(a.getDType(), b.getDType());
         ValidUtil.requireResultDType(a.getDType(), res.getDType());
+
+        if (access.getVramId(a) == access.getVramId(res) && !access.hasIdenticalLayout(a, res)) {
+            try (Tensor copyA = a.copy()) {
+                return maxMin(isMax, copyA, b, res);
+            }
+        }
+        if (access.getVramId(b) == access.getVramId(res) && !access.hasIdenticalLayout(b, res)) {
+            try (Tensor copyB = b.copy()) {
+                return maxMin(isMax, a, copyB, res);
+            }
+        }
 
         if (access.elementOffset(a) > 0) {
             try (Tensor contigA = a.contiguous()) {
@@ -348,6 +388,17 @@ public final class MathOps {
         ValidUtil.requireSameDType(a.getDType(), b.getDType());
         ValidUtil.requireResultDType(DType.i32, res.getDType());
 
+        if (access.getVramId(a) == access.getVramId(res) && !access.hasIdenticalLayout(a, res)) {
+            try (Tensor copyA = a.copy()) {
+                return compare(cmpOp, opName, copyA, b, res);
+            }
+        }
+        if (access.getVramId(b) == access.getVramId(res) && !access.hasIdenticalLayout(b, res)) {
+            try (Tensor copyB = b.copy()) {
+                return compare(cmpOp, opName, a, copyB, res);
+            }
+        }
+
         if (access.elementOffset(a) > 0) {
             try (Tensor contigA = a.contiguous()) {
                 return compare(cmpOp, opName, contigA, b, res);
@@ -421,6 +472,22 @@ public final class MathOps {
 
         ValidUtil.requireSameDType(x.getDType(), y.getDType());
         ValidUtil.requireResultDType(x.getDType(), res.getDType());
+
+        if (access.getVramId(cond) == access.getVramId(res) && !access.hasIdenticalLayout(cond, res)) {
+            try (Tensor copyCond = cond.copy()) {
+                return where(copyCond, x, y, res);
+            }
+        }
+        if (access.getVramId(x) == access.getVramId(res) && !access.hasIdenticalLayout(x, res)) {
+            try (Tensor copyX = x.copy()) {
+                return where(cond, copyX, y, res);
+            }
+        }
+        if (access.getVramId(y) == access.getVramId(res) && !access.hasIdenticalLayout(y, res)) {
+            try (Tensor copyY = y.copy()) {
+                return where(cond, x, copyY, res);
+            }
+        }
 
         if (access.elementOffset(cond) > 0) {
             try (Tensor contigCond = cond.contiguous()) {

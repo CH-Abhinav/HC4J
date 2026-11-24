@@ -21,7 +21,6 @@ vulkan-p2p = []
 [dependencies]
 pollster = "1.0.0"
 bytemuck = "1.25.2"
-rayon = "1.10.0"
 
 # common wgpu config
 [dependencies.wgpu]

@@ -66,6 +66,93 @@ impl TransportTier {
 
 // ── RAII Resource Guards (Fix #5) ───────────────────────────────────────────
 
+pub(crate) struct ScopedBuf<'a> {
+    node: &'a GpuNode,
+    buf: Option<BufMem>,
+}
+
+impl<'a> ScopedBuf<'a> {
+    pub fn new(node: &'a GpuNode, buf: BufMem) -> Self {
+        Self {
+            node,
+            buf: Some(buf),
+        }
+    }
+
+    pub fn buffer(&self) -> vk::Buffer {
+        self.buf.as_ref().unwrap().buffer
+    }
+
+    pub fn memory(&self) -> vk::DeviceMemory {
+        self.buf.as_ref().unwrap().memory
+    }
+
+    pub fn size(&self) -> vk::DeviceSize {
+        self.buf.as_ref().unwrap().size
+    }
+}
+
+impl<'a> Drop for ScopedBuf<'a> {
+    fn drop(&mut self) {
+        if let Some(buf) = self.buf.take() {
+            destroy_buf(self.node, &buf);
+        }
+    }
+}
+
+pub(crate) struct ScopedSemaphore<'a> {
+    node: &'a GpuNode,
+    sem: vk::Semaphore,
+}
+
+impl<'a> ScopedSemaphore<'a> {
+    pub fn new(node: &'a GpuNode, sem: vk::Semaphore) -> Self {
+        Self { node, sem }
+    }
+
+    pub fn handle(&self) -> vk::Semaphore {
+        self.sem
+    }
+}
+
+impl<'a> Drop for ScopedSemaphore<'a> {
+    fn drop(&mut self) {
+        if self.sem != vk::Semaphore::null() {
+            unsafe {
+                self.node.device.destroy_semaphore(self.sem, None);
+            }
+            self.sem = vk::Semaphore::null();
+        }
+    }
+}
+
+pub(crate) struct ScopedCmdBuf<'a> {
+    node: &'a GpuNode,
+    cmd_pool: vk::CommandPool,
+    cmd_buf: vk::CommandBuffer,
+}
+
+impl<'a> ScopedCmdBuf<'a> {
+    pub fn new(node: &'a GpuNode, cmd_pool: vk::CommandPool, cmd_buf: vk::CommandBuffer) -> Self {
+        Self { node, cmd_pool, cmd_buf }
+    }
+
+    pub fn handle(&self) -> vk::CommandBuffer {
+        self.cmd_buf
+    }
+}
+
+impl<'a> Drop for ScopedCmdBuf<'a> {
+    fn drop(&mut self) {
+        if self.cmd_buf != vk::CommandBuffer::null() {
+            unsafe {
+                self.node.device.free_command_buffers(self.cmd_pool, &[self.cmd_buf]);
+            }
+            self.cmd_buf = vk::CommandBuffer::null();
+        }
+    }
+}
+
 #[cfg(target_os = "windows")]
 pub(crate) struct Win32HandleGuard(pub vk::HANDLE);
 
@@ -475,68 +562,60 @@ pub(crate) fn transfer_tier1(
 
     #[cfg(target_os = "linux")]
     {
-        let export_buf = alloc_exportable_dmabuf(src, size, usage)
-            .ok_or_else(|| Hc4jError::Device("Tier 1 export allocation failed".to_string()))?;
+        let export_buf = ScopedBuf::new(
+            src,
+            alloc_exportable_dmabuf(src, size, usage)
+                .ok_or_else(|| Hc4jError::Device("Tier 1 export allocation failed".to_string()))?,
+        );
 
         one_shot_submit(src, |cb| {
             let region = vk::BufferCopy { src_offset, dst_offset: 0, size };
-            unsafe { src.device.cmd_copy_buffer(cb, src_buf, export_buf.buffer, &[region]) };
+            unsafe { src.device.cmd_copy_buffer(cb, src_buf, export_buf.buffer(), &[region]) };
         })?;
 
-        let fd = export_dma_buf_fd(src, export_buf.memory)
-            .ok_or_else(|| {
-                destroy_buf(src, &export_buf);
-                Hc4jError::Device("Tier 1 FD export failed".to_string())
-            })?;
+        let fd = export_dma_buf_fd(src, export_buf.memory())
+            .ok_or_else(|| Hc4jError::Device("Tier 1 FD export failed".to_string()))?;
 
-        let imported = import_dma_buf_fd(dst, size, fd, usage)
-            .ok_or_else(|| {
-                destroy_buf(src, &export_buf);
-                Hc4jError::Device("Tier 1 FD import failed".to_string())
-            })?;
+        let imported = ScopedBuf::new(
+            dst,
+            import_dma_buf_fd(dst, size, fd, usage)
+                .ok_or_else(|| Hc4jError::Device("Tier 1 FD import failed".to_string()))?,
+        );
 
-        let res = one_shot_submit(dst, |cb| {
+        one_shot_submit(dst, |cb| {
             let region = vk::BufferCopy { src_offset: 0, dst_offset, size };
-            unsafe { dst.device.cmd_copy_buffer(cb, imported.buffer, dst_recv, &[region]) };
-        });
-
-        destroy_buf(dst, &imported);
-        destroy_buf(src, &export_buf);
-        res
+            unsafe { dst.device.cmd_copy_buffer(cb, imported.buffer(), dst_recv, &[region]) };
+        })
     }
 
     #[cfg(target_os = "windows")]
     {
-        let export_buf = alloc_exportable_win32(src, size, usage)
-            .ok_or_else(|| Hc4jError::Device("Tier 1 Win32 export allocation failed".to_string()))?;
+        let export_buf = ScopedBuf::new(
+            src,
+            alloc_exportable_win32(src, size, usage)
+                .ok_or_else(|| Hc4jError::Device("Tier 1 Win32 export allocation failed".to_string()))?,
+        );
 
         one_shot_submit(src, |cb| {
             let region = vk::BufferCopy { src_offset, dst_offset: 0, size };
-            unsafe { src.device.cmd_copy_buffer(cb, src_buf, export_buf.buffer, &[region]) };
+            unsafe { src.device.cmd_copy_buffer(cb, src_buf, export_buf.buffer(), &[region]) };
         })?;
 
-        let handle = export_win32_handle(src, export_buf.memory)
-            .ok_or_else(|| {
-                destroy_buf(src, &export_buf);
-                Hc4jError::Device("Tier 1 Win32 handle export failed".to_string())
-            })?;
+        let handle = export_win32_handle(src, export_buf.memory())
+            .ok_or_else(|| Hc4jError::Device("Tier 1 Win32 handle export failed".to_string()))?;
 
         let _guard = Win32HandleGuard(handle);
 
-        let imported = import_win32_handle(dst, size, handle, usage)
-            .ok_or_else(|| {
-                destroy_buf(src, &export_buf);
-                Hc4jError::Device("Tier 1 Win32 handle import failed".to_string())
-            })?;
+        let imported = ScopedBuf::new(
+            dst,
+            import_win32_handle(dst, size, handle, usage)
+                .ok_or_else(|| Hc4jError::Device("Tier 1 Win32 handle import failed".to_string()))?,
+        );
 
-        let res = one_shot_submit(dst, |cb| {
+        one_shot_submit(dst, |cb| {
             let region = vk::BufferCopy { src_offset: 0, dst_offset, size };
-            unsafe { dst.device.cmd_copy_buffer(cb, imported.buffer, dst_recv, &[region]) };
-        });
-
-        destroy_buf(dst, &imported);
-        destroy_buf(src, &export_buf);
-        res
+            unsafe { dst.device.cmd_copy_buffer(cb, imported.buffer(), dst_recv, &[region]) };
+        })
     }
 
     #[cfg(not(any(target_os = "windows", target_os = "linux")))]
@@ -581,27 +660,26 @@ pub(crate) fn transfer_tier1_5_host(
 
     let usage = vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST;
 
-    let host_buf_src = alloc_host_imported(src, host_ptr, aligned_size, usage)
-        .ok_or_else(|| Hc4jError::Device("Tier 1.5 import on source GPU failed".to_string()))?;
-    let host_buf_dst = alloc_host_imported(dst, host_ptr, aligned_size, usage)
-        .ok_or_else(|| {
-            destroy_buf(src, &host_buf_src);
-            Hc4jError::Device("Tier 1.5 import on destination GPU failed".to_string())
-        })?;
+    let host_buf_src = ScopedBuf::new(
+        src,
+        alloc_host_imported(src, host_ptr, aligned_size, usage)
+            .ok_or_else(|| Hc4jError::Device("Tier 1.5 import on source GPU failed".to_string()))?,
+    );
+    let host_buf_dst = ScopedBuf::new(
+        dst,
+        alloc_host_imported(dst, host_ptr, aligned_size, usage)
+            .ok_or_else(|| Hc4jError::Device("Tier 1.5 import on destination GPU failed".to_string()))?,
+    );
 
     one_shot_submit(src, |cb| {
         let region = vk::BufferCopy { src_offset, dst_offset: 0, size };
-        unsafe { src.device.cmd_copy_buffer(cb, src_buf, host_buf_src.buffer, &[region]) };
+        unsafe { src.device.cmd_copy_buffer(cb, src_buf, host_buf_src.buffer(), &[region]) };
     })?;
 
-    let res = one_shot_submit(dst, |cb| {
+    one_shot_submit(dst, |cb| {
         let region = vk::BufferCopy { src_offset: 0, dst_offset, size };
-        unsafe { dst.device.cmd_copy_buffer(cb, host_buf_dst.buffer, dst_recv, &[region]) };
-    });
-
-    destroy_buf(src, &host_buf_src);
-    destroy_buf(dst, &host_buf_dst);
-    res
+        unsafe { dst.device.cmd_copy_buffer(cb, host_buf_dst.buffer(), dst_recv, &[region]) };
+    })
 }
 
 /// Execute a Tier 2 staged transfer using HOST_VISIBLE staging buffers + Timeline Semaphore.
@@ -623,65 +701,65 @@ pub(crate) fn transfer_tier2(
 
     // Fix #1: Always allocate staging buffer on src.device for src, and staging buffer on dst.device for dst.
     // NEVER pass a buffer from src.device to dst.device!
-    let staging_src = alloc_staging(src, size, usage)?;
-    let staging_dst = alloc_staging(dst, size, usage)?;
+    let staging_src = ScopedBuf::new(src, alloc_staging(src, size, usage)?);
+    let staging_dst = ScopedBuf::new(dst, alloc_staging(dst, size, usage)?);
 
-    let tl_sem = create_timeline_semaphore(&src.device)?;
+    let tl_sem = ScopedSemaphore::new(src, create_timeline_semaphore(&src.device)?);
 
     let alloc_info = vk::CommandBufferAllocateInfo::default()
         .command_pool(src.cmd_pool)
         .level(vk::CommandBufferLevel::PRIMARY)
         .command_buffer_count(1);
-    let cb_a = unsafe { src.device.allocate_command_buffers(&alloc_info) }
+    let cb_a_raw = unsafe { src.device.allocate_command_buffers(&alloc_info) }
         .map_err(|e| Hc4jError::Device(format!("allocate_command_buffers failed: {e}")))? [0];
+    let cb_a = ScopedCmdBuf::new(src, src.cmd_pool, cb_a_raw);
 
     let begin = vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
     unsafe {
-        src.device.begin_command_buffer(cb_a, &begin)
+        src.device.begin_command_buffer(cb_a.handle(), &begin)
             .map_err(|e| Hc4jError::Device(format!("begin_command_buffer failed: {e}")))?;
         let region = vk::BufferCopy { src_offset, dst_offset: 0, size };
-        src.device.cmd_copy_buffer(cb_a, src_buf, staging_src.buffer, &[region]);
-        src.device.end_command_buffer(cb_a)
+        src.device.cmd_copy_buffer(cb_a.handle(), src_buf, staging_src.buffer(), &[region]);
+        src.device.end_command_buffer(cb_a.handle())
             .map_err(|e| Hc4jError::Device(format!("end_command_buffer failed: {e}")))?;
 
         let signal_val: u64 = 1;
+        let cb_handle = cb_a.handle();
+        let sem_handle = tl_sem.handle();
         let mut tl_submit_a = vk::TimelineSemaphoreSubmitInfo::default()
             .signal_semaphore_values(std::slice::from_ref(&signal_val));
         let submit_a = vk::SubmitInfo::default()
-            .command_buffers(std::slice::from_ref(&cb_a))
-            .signal_semaphores(std::slice::from_ref(&tl_sem))
+            .command_buffers(std::slice::from_ref(&cb_handle))
+            .signal_semaphores(std::slice::from_ref(&sem_handle))
             .push_next(&mut tl_submit_a);
 
         src.device.queue_submit(src.queue, &[submit_a], vk::Fence::null())
             .map_err(|e| Hc4jError::Device(format!("queue_submit failed: {e}")))?;
 
         let wait_info = vk::SemaphoreWaitInfo::default()
-            .semaphores(std::slice::from_ref(&tl_sem))
+            .semaphores(std::slice::from_ref(&sem_handle))
             .values(std::slice::from_ref(&signal_val));
         src.device.wait_semaphores(&wait_info, u64::MAX)
             .map_err(|e| Hc4jError::Device(format!("wait_semaphores failed: {e}")))?;
 
-        let src_ptr = src.device.map_memory(staging_src.memory, 0, staging_src.size, vk::MemoryMapFlags::empty())
+        let src_ptr = src.device.map_memory(staging_src.memory(), 0, staging_src.size(), vk::MemoryMapFlags::empty())
             .map_err(|e| Hc4jError::Device(format!("map_memory src failed: {e}")))? as *const u8;
-        let dst_ptr = dst.device.map_memory(staging_dst.memory, 0, staging_dst.size, vk::MemoryMapFlags::empty())
-            .map_err(|e| Hc4jError::Device(format!("map_memory dst failed: {e}")))? as *mut u8;
+        let dst_ptr = dst.device.map_memory(staging_dst.memory(), 0, staging_dst.size(), vk::MemoryMapFlags::empty())
+            .map_err(|e| {
+                src.device.unmap_memory(staging_src.memory());
+                Hc4jError::Device(format!("map_memory dst failed: {e}"))
+            })? as *mut u8;
 
         std::ptr::copy_nonoverlapping(src_ptr, dst_ptr, size as usize);
 
-        src.device.unmap_memory(staging_src.memory);
-        dst.device.unmap_memory(staging_dst.memory);
-        src.device.free_command_buffers(src.cmd_pool, &[cb_a]);
-        src.device.destroy_semaphore(tl_sem, None);
+        src.device.unmap_memory(staging_src.memory());
+        dst.device.unmap_memory(staging_dst.memory());
     }
 
-    let res = one_shot_submit(dst, |cb| {
+    one_shot_submit(dst, |cb| {
         let region = vk::BufferCopy { src_offset: 0, dst_offset, size };
-        unsafe { dst.device.cmd_copy_buffer(cb, staging_dst.buffer, dst_recv, &[region]) };
-    });
-
-    destroy_buf(src, &staging_src);
-    destroy_buf(dst, &staging_dst);
-    res
+        unsafe { dst.device.cmd_copy_buffer(cb, staging_dst.buffer(), dst_recv, &[region]) };
+    })
 }
 
 #[allow(clippy::too_many_arguments)]

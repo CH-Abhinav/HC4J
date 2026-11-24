@@ -40,10 +40,11 @@ pub(crate) fn query_vram_bytes(node: &GpuNode) -> u64 {
 
 /// Measures sustained compute throughput (GFLOP/s) using the compiled FMA benchmark shader.
 pub(crate) fn measure_compute_gflops(node: &GpuNode) -> Hc4jResult<f64> {
-    const WORKGROUPS: u32 = 128;
     const WORKGROUP_SIZE: u32 = 256;
-    const TOTAL_THREADS: u32 = WORKGROUPS * WORKGROUP_SIZE; // 32,768 threads
-    const OUT_BYTES: vk::DeviceSize = (TOTAL_THREADS as vk::DeviceSize) * 4; // 128 KiB
+    let is_discrete = node.props.device_type == vk::PhysicalDeviceType::DISCRETE_GPU;
+    let workgroups: u32 = if is_discrete { 512 } else { 128 };
+    let total_threads: u32 = workgroups * WORKGROUP_SIZE; // 131,072 threads on discrete, 32,768 on other
+    let out_bytes: vk::DeviceSize = (total_threads as vk::DeviceSize) * 4; // 512 KiB on discrete, 128 KiB on other
 
     let spv_bytes = include_bytes!(concat!(env!("OUT_DIR"), "/collective_bench_fma.spv"));
     let spv_words: &[u32] = bytemuck::cast_slice(spv_bytes);
@@ -53,7 +54,7 @@ pub(crate) fn measure_compute_gflops(node: &GpuNode) -> Hc4jResult<f64> {
         .map_err(|e| Hc4jError::Device(format!("create_shader_module bench_fma failed: {e}")))?;
 
     // Allocate resources
-    let out_buf = match alloc_device_local(node, OUT_BYTES, vk::BufferUsageFlags::STORAGE_BUFFER) {
+    let out_buf = match alloc_device_local(node, out_bytes, vk::BufferUsageFlags::STORAGE_BUFFER) {
         Ok(b) => b,
         Err(e) => {
             unsafe { node.device.destroy_shader_module(shader_module, None) };
@@ -74,7 +75,14 @@ pub(crate) fn measure_compute_gflops(node: &GpuNode) -> Hc4jResult<f64> {
         }
     };
 
-    let result = run_fma_benchmark(node, shader_module, &out_buf, &uniform_buf, TOTAL_THREADS);
+    let result = run_fma_benchmark(
+        node,
+        shader_module,
+        &out_buf,
+        &uniform_buf,
+        total_threads,
+        workgroups,
+    );
 
     // Cleanup all profiling resources cleanly
     destroy_buf(node, &uniform_buf);
@@ -106,6 +114,7 @@ fn run_fma_benchmark(
     out_buf: &BufMem,
     uniform_buf: &BufMem,
     total_threads: u32,
+    workgroups: u32,
 ) -> Hc4jResult<f64> {
     let bindings = [
         vk::DescriptorSetLayoutBinding {
@@ -252,22 +261,32 @@ fn run_fma_benchmark(
 
     // 1. Warm-up dispatch (64 iterations)
     write_iterations(node, uniform_buf, 64)?;
-    dispatch(128)?;
+    dispatch(workgroups)?;
 
     // 2. Initial timed run (256 iterations)
     write_iterations(node, uniform_buf, 256)?;
     let t0 = Instant::now();
-    dispatch(128)?;
+    dispatch(workgroups)?;
     let elapsed0 = t0.elapsed();
 
     let (total_flops, elapsed_secs) = if elapsed0.as_secs_f64() < 0.003 {
-        // Fast discrete GPU: scale up to 2048 iterations (~536 MFLOPs)
+        // Fast GPU: scale up to 2048 iterations (~536 MFLOPs)
         write_iterations(node, uniform_buf, 2048)?;
         let t1 = Instant::now();
-        dispatch(128)?;
+        dispatch(workgroups)?;
         let elapsed1 = t1.elapsed();
-        let flops = (total_threads as f64) * 2048.0 * 8.0;
-        (flops, elapsed1.as_secs_f64())
+        if elapsed1.as_secs_f64() < 0.003 {
+            // Ultra-fast discrete GPU: scale up to 8192 iterations
+            write_iterations(node, uniform_buf, 8192)?;
+            let t2 = Instant::now();
+            dispatch(workgroups)?;
+            let elapsed2 = t2.elapsed();
+            let flops = (total_threads as f64) * 8192.0 * 8.0;
+            (flops, elapsed2.as_secs_f64())
+        } else {
+            let flops = (total_threads as f64) * 2048.0 * 8.0;
+            (flops, elapsed1.as_secs_f64())
+        }
     } else {
         let flops = (total_threads as f64) * 256.0 * 8.0;
         (flops, elapsed0.as_secs_f64())

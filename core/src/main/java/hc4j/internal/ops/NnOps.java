@@ -54,6 +54,12 @@ public final class NnOps {
         access.ensureOpen(a);
         access.ensureOpen(res);
 
+        if (access.getVramId(a) == access.getVramId(res) && !access.hasIdenticalLayout(a, res)) {
+            try (Tensor copyA = a.copy()) {
+                return activation(act, copyA, res, alpha);
+            }
+        }
+
         if (access.elementOffset(a) > 0) {
             try (Tensor contigA = a.contiguous()) {
                 return activation(act, contigA, res, alpha);

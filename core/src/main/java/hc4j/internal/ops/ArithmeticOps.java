@@ -57,6 +57,18 @@ public final class ArithmeticOps {
         ValidUtil.requireSameDType(a.getDType(), b.getDType());
         ValidUtil.requireResultDType(a.getDType(), res.getDType());
 
+        // Auto-materialize independent copies if aliased with mismatched layout
+        if (access.getVramId(a) == access.getVramId(res) && !access.hasIdenticalLayout(a, res)) {
+            try (Tensor copyA = a.copy()) {
+                return execute(opIndex, opName, copyA, b, res);
+            }
+        }
+        if (access.getVramId(b) == access.getVramId(res) && !access.hasIdenticalLayout(b, res)) {
+            try (Tensor copyB = b.copy()) {
+                return execute(opIndex, opName, a, copyB, res);
+            }
+        }
+
         // Materialize non-zero offsets
         if (access.elementOffset(a) > 0) {
             try (Tensor contigA = a.contiguous()) {

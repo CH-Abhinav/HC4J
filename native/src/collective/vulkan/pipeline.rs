@@ -264,9 +264,11 @@ impl ReducePipeline {
                 &[],
             );
 
-            // Fix #4: WG_SIZE = 256
+            // Fold groups into 2D grid to avoid max_compute_work_group_count[0] limit
             let groups = count.div_ceil(WG_SIZE);
-            node.device.cmd_dispatch(cb, groups, 1, 1);
+            let max_x = node.props.limits.max_compute_work_group_count[0];
+            let (gx, gy) = crate::ops::elementwise::grid_2d(groups, max_x);
+            node.device.cmd_dispatch(cb, gx, gy, 1);
         })
     }
 

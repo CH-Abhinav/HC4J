@@ -17,6 +17,8 @@
 package hc4j.internal.layout;
 
 import hc4j.DType;
+import hc4j.Tensor;
+import hc4j.internal.ffi.TensorAccess;
 import java.util.Arrays;
 
 /**
@@ -32,6 +34,10 @@ public final class ValidUtil {
         if (expected != actual) {
             throw new IllegalArgumentException("Result dtype must be " + expected + " but was " + actual);
         }
+    }
+
+    public static boolean hasIdenticalLayout(Tensor input, Tensor out) {
+        return TensorAccess.getInstance().hasIdenticalLayout(input, out);
     }
 
     public static void requireOperandF32(String op, DType actual) {

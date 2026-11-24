@@ -46,6 +46,7 @@ import java.util.Map;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipOutputStream;
+import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -269,6 +270,124 @@ class NativeLoaderTest {
     }
 
     @Test
+    @DisplayName("Stage 5: Default mode without pinned checksum makes 0 HTTP requests and reports clear diagnostic")
+    void testStage5DefaultUnpinnedSkipsDownload(@TempDir Path tempDir) throws IOException {
+        Platform platform = Platform.detect("Linux", "x86_64");
+        AtomicInteger requestCount = new AtomicInteger(0);
+
+        HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext("/", exchange -> {
+            requestCount.incrementAndGet();
+            exchange.sendResponseHeaders(500, 0);
+            exchange.close();
+        });
+        server.start();
+
+        try {
+            int port = server.getAddress().getPort();
+            String urlTemplate = "http://127.0.0.1:" + port + "/release/hc4j-{version}-{classifier}.jar";
+
+            List<String> diagnostics = new ArrayList<>();
+            // downloadEnabled = null (default), no pinned checksum
+            UnsatisfiedLinkError err = assertThrows(UnsatisfiedLinkError.class, () ->
+                    NativeLoader.resolve(platform, null, tempDir, null, urlTemplate, null, true, false, diagnostics));
+
+            assertEquals(0, requestCount.get(), "Default unpinned mode must not make HTTP requests");
+            assertTrue(err.getMessage().contains("no pinned release checksum in JAR; set -Dhc4j.native.download=true to allow unpinned download"),
+                    err.getMessage());
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    @DisplayName("Stage 5: Default mode with pinned checksum allows download and strictly verifies against JAR pinned hash")
+    void testStage5DefaultWithPinnedChecksumHappyPath(@TempDir Path tempDir) throws IOException {
+        Platform platform = Platform.detect("Linux", "x86_64");
+        byte[] nativePayload = "pinned-verified-native-binary".getBytes(StandardCharsets.UTF_8);
+        byte[] jarBytes = createJarBytes(platform.resourcePath(), nativePayload);
+        String jarSha256 = NativeLoader.sha256Hex(jarBytes);
+
+        MockClassLoader cl = new MockClassLoader();
+        String pinnedProps = platform.classifier() + "=" + jarSha256 + "\n";
+        cl.put(NativeLoader.PINNED_CHECKSUMS_RESOURCE, pinnedProps.getBytes(StandardCharsets.UTF_8));
+
+        AtomicInteger requestCount = new AtomicInteger(0);
+        HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext("/release/hc4j-0.1.0-linux-x86_64.jar", exchange -> {
+            requestCount.incrementAndGet();
+            exchange.sendResponseHeaders(200, jarBytes.length);
+            try (OutputStream os = exchange.getResponseBody()) {
+                os.write(jarBytes);
+            }
+        });
+        server.start();
+
+        try {
+            int port = server.getAddress().getPort();
+            String urlTemplate = "http://127.0.0.1:" + port + "/release/hc4j-{version}-{classifier}.jar";
+
+            List<String> diagnostics = new ArrayList<>();
+            // downloadEnabled = null (default), but pinned checksum present in JAR!
+            Path resolved = NativeLoader.resolve(platform, cl, tempDir, null, urlTemplate, null, true, false, diagnostics);
+
+            assertNotNull(resolved);
+            assertTrue(Files.isRegularFile(resolved));
+            assertArrayEquals(nativePayload, Files.readAllBytes(resolved));
+            assertEquals(1, requestCount.get());
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    @DisplayName("Stage 5: Pinned checksum in JAR rejects tampered remote binary even if remote .sha256 matches tampered binary")
+    void testStage5PinnedChecksumRejectsTamperedRemoteEvenWithMatchingRemoteSidecar(@TempDir Path tempDir) throws IOException {
+        Platform platform = Platform.detect("Linux", "x86_64");
+        byte[] tamperedNativePayload = "tampered-attacker-binary".getBytes(StandardCharsets.UTF_8);
+        byte[] tamperedJarBytes = createJarBytes(platform.resourcePath(), tamperedNativePayload);
+        String tamperedJarSha256 = NativeLoader.sha256Hex(tamperedJarBytes);
+
+        // Honest release hash pinned in JAR
+        String genuinePinnedSha256 = "1111222233334444555566667777888899990000aaaabbbbccccddddeeeeffff";
+        MockClassLoader cl = new MockClassLoader();
+        String pinnedProps = platform.classifier() + "=" + genuinePinnedSha256 + "\n";
+        cl.put(NativeLoader.PINNED_CHECKSUMS_RESOURCE, pinnedProps.getBytes(StandardCharsets.UTF_8));
+
+        HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        // Attacker serves tampered JAR
+        server.createContext("/release/hc4j-0.1.0-linux-x86_64.jar", exchange -> {
+            exchange.sendResponseHeaders(200, tamperedJarBytes.length);
+            try (OutputStream os = exchange.getResponseBody()) {
+                os.write(tamperedJarBytes);
+            }
+        });
+        // Attacker also serves matching tampered .sha256
+        server.createContext("/release/hc4j-0.1.0-linux-x86_64.jar.sha256", exchange -> {
+            byte[] response = (tamperedJarSha256 + "\n").getBytes(StandardCharsets.UTF_8);
+            exchange.sendResponseHeaders(200, response.length);
+            try (OutputStream os = exchange.getResponseBody()) {
+                os.write(response);
+            }
+        });
+        server.start();
+
+        try {
+            int port = server.getAddress().getPort();
+            String urlTemplate = "http://127.0.0.1:" + port + "/release/hc4j-{version}-{classifier}.jar";
+
+            List<String> diagnostics = new ArrayList<>();
+            UnsatisfiedLinkError err = assertThrows(UnsatisfiedLinkError.class, () ->
+                    NativeLoader.resolve(platform, cl, tempDir, null, urlTemplate, null, true, false, diagnostics));
+
+            assertTrue(err.getMessage().contains("mismatch against JAR pinned digest") || err.getMessage().contains("Could not load HC4J native library"),
+                    err.getMessage());
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
     @DisplayName("Packaged classifier JAR extraction via URLClassLoader")
     void testPackagedClassifierJarExtraction(@TempDir Path tempDir) throws IOException {
         Platform platform = Platform.current();
@@ -281,10 +400,8 @@ class NativeLoaderTest {
             }
         }
 
-        if (!Files.isRegularFile(candidateJar)) {
-            // Skip gracefully if nativeJar has not been run yet
-            return;
-        }
+        Assumptions.assumeTrue(Files.isRegularFile(candidateJar),
+                "Run :core:nativeJar first to test packaged classifier JAR extraction");
 
         try (URLClassLoader ucl = new URLClassLoader(new URL[] {candidateJar.toUri().toURL()}, null)) {
             List<String> diagnostics = new ArrayList<>();

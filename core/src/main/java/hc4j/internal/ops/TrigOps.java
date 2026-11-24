@@ -76,6 +76,13 @@ public final class TrigOps {
         access.ensureOpen(input);
         access.ensureOpen(out);
 
+        // Auto-materialize independent copy if aliased with mismatched layout
+        if (access.getVramId(input) == access.getVramId(out) && !access.hasIdenticalLayout(input, out)) {
+            try (Tensor copy = input.copy()) {
+                return apply(fn, copy, out);
+            }
+        }
+
         if (access.elementOffset(input) > 0) {
             try (Tensor contig = input.contiguous()) {
                 return apply(fn, contig, out);

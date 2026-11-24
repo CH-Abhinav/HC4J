@@ -94,7 +94,7 @@ public final class NativeEngine {
         throw new AssertionError("No instances of NativeEngine");
     }
 
-    public static synchronized boolean isGpuAvailable() {
+    public static boolean isGpuAvailable() {
         try {
             ensureInitialized();
             return true;
@@ -103,7 +103,7 @@ public final class NativeEngine {
         }
     }
 
-    public static synchronized void initialize() {
+    public static void initialize() {
         ensureInitialized();
     }
 
@@ -127,7 +127,14 @@ public final class NativeEngine {
         return loadResult.platform();
     }
 
-    public static synchronized void ensureInitialized() {
+    public static void ensureInitialized() {
+        if (initialized) {
+            return;
+        }
+        initializeLocked();
+    }
+
+    private static synchronized void initializeLocked() {
         if (initialized) {
             return;
         }
@@ -284,13 +291,16 @@ public final class NativeEngine {
 
     public static long allocVram(long totalElements) {
         ensureInitialized();
+        long id;
         try {
-            long id = (long) gpuAllocHandle.invokeExact(totalElements);
-            if (id == 0) throw new OutOfMemoryError("Rust failed to allocate VRAM buffer.");
-            return id;
+            id = (long) gpuAllocHandle.invokeExact(totalElements);
         } catch (Throwable t) {
+            if (t instanceof RuntimeException re) throw re;
+            if (t instanceof Error err) throw err;
             throw new RuntimeException("HC4J VRAM Allocation Exception", t);
         }
+        if (id == 0) throw new OutOfMemoryError("Rust failed to allocate VRAM buffer.");
+        return id;
     }
 
     public static long allocVramUninit(long totalElements) {
@@ -299,6 +309,8 @@ public final class NativeEngine {
         try {
             id = (long) gpuAllocUninitHandle.invokeExact(totalElements);
         } catch (Throwable t) {
+            if (t instanceof RuntimeException re) throw re;
+            if (t instanceof Error err) throw err;
             throw new RuntimeException("HC4J VRAM Allocation Exception", t);
         }
         if (id == 0) {
@@ -309,22 +321,28 @@ public final class NativeEngine {
 
     public static void writeVram(long vramId, MemorySegment hostData, long totalElements) {
         ensureInitialized();
+        int status;
         try {
-            int status = (int) gpuWriteHandle.invokeExact(vramId, hostData, totalElements);
-            checkStatus(status, "writeVram");
+            status = (int) gpuWriteHandle.invokeExact(vramId, hostData, totalElements);
         } catch (Throwable t) {
+            if (t instanceof RuntimeException re) throw re;
+            if (t instanceof Error err) throw err;
             throw new RuntimeException("HC4J VRAM Write Exception", t);
         }
+        checkStatus(status, "writeVram");
     }
 
     public static void downloadVram(long vramId, MemorySegment hostData, long totalElements) {
         ensureInitialized();
+        int status;
         try {
-            int status = (int) gpuDownloadHandle.invokeExact(vramId, hostData, totalElements);
-            checkStatus(status, "downloadVram");
+            status = (int) gpuDownloadHandle.invokeExact(vramId, hostData, totalElements);
         } catch (Throwable t) {
+            if (t instanceof RuntimeException re) throw re;
+            if (t instanceof Error err) throw err;
             throw new RuntimeException("HC4J VRAM Download Exception", t);
         }
+        checkStatus(status, "downloadVram");
     }
 
     public static void freeVram(long vramId) {
@@ -346,6 +364,8 @@ public final class NativeEngine {
         try {
             status = (int) memConfigureHandle.invokeExact(vramBudgetBytes, hostBudgetBytes);
         } catch (Throwable t) {
+            if (t instanceof RuntimeException re) throw re;
+            if (t instanceof Error err) throw err;
             throw new RuntimeException("HC4J memory configure failed", t);
         }
         checkStatus(status, "configureMemory");
@@ -359,6 +379,8 @@ public final class NativeEngine {
             try {
                 status = (int) memStatsHandle.invokeExact(out);
             } catch (Throwable t) {
+                if (t instanceof RuntimeException re) throw re;
+                if (t instanceof Error err) throw err;
                 throw new RuntimeException("HC4J memory stats failed", t);
             }
             checkStatus(status, "memoryStats");
@@ -372,6 +394,8 @@ public final class NativeEngine {
         try {
             code = (int) memResidencyHandle.invokeExact(vramId);
         } catch (Throwable t) {
+            if (t instanceof RuntimeException re) throw re;
+            if (t instanceof Error err) throw err;
             throw new RuntimeException("HC4J residency query failed", t);
         }
         if (code < 0) checkStatus(code, "residency");
@@ -389,6 +413,8 @@ public final class NativeEngine {
         try {
             status = (int) memEvictHandle.invokeExact(vramId);
         } catch (Throwable t) {
+            if (t instanceof RuntimeException re) throw re;
+            if (t instanceof Error err) throw err;
             throw new RuntimeException("HC4J evict failed", t);
         }
         checkStatus(status, "evict");
@@ -406,6 +432,8 @@ public final class NativeEngine {
                     status = (int) batchBeginHandle.invokeExact();
                 } catch (Throwable t) {
                     batchDepth--;
+                    if (t instanceof RuntimeException re) throw re;
+                    if (t instanceof Error err) throw err;
                     throw new RuntimeException("HC4J batch begin failed", t);
                 }
                 checkStatus(status, "batchBegin");
@@ -424,6 +452,8 @@ public final class NativeEngine {
                 try {
                     status = (int) batchEndHandle.invokeExact();
                 } catch (Throwable t) {
+                    if (t instanceof RuntimeException re) throw re;
+                    if (t instanceof Error err) throw err;
                     throw new RuntimeException("HC4J batch end failed", t);
                 }
                 checkStatus(status, "batchEnd");
@@ -434,20 +464,32 @@ public final class NativeEngine {
     public static void writeVramSegment(long vramId, MemorySegment hostData, long totalElements) {
         ensureInitialized();
         if (hostData.isNative()) {
+            int status;
             try {
-                int status = (int) gpuWriteHandle.invokeExact(vramId, hostData, totalElements);
-                checkStatus(status, "writeVramSegment");
+                status = (int) gpuWriteHandle.invokeExact(vramId, hostData, totalElements);
             } catch (Throwable t) {
+                if (t instanceof RuntimeException re) throw re;
+                if (t instanceof Error err) throw err;
                 throw new RuntimeException("HC4J VRAM Write Exception", t);
             }
+            checkStatus(status, "writeVramSegment");
         } else {
             long bytes = totalElements * 4L;
             try (Arena arena = Arena.ofConfined()) {
                 MemorySegment nativeBuf = arena.allocate(bytes, 16);
                 MemorySegment.copy(hostData, 0, nativeBuf, 0, bytes);
-                int status = (int) gpuWriteHandle.invokeExact(vramId, nativeBuf, totalElements);
+                int status;
+                try {
+                    status = (int) gpuWriteHandle.invokeExact(vramId, nativeBuf, totalElements);
+                } catch (Throwable t) {
+                    if (t instanceof RuntimeException re) throw re;
+                    if (t instanceof Error err) throw err;
+                    throw new RuntimeException("HC4J VRAM Write Exception", t);
+                }
                 checkStatus(status, "writeVramSegment");
             } catch (Throwable t) {
+                if (t instanceof RuntimeException re) throw re;
+                if (t instanceof Error err) throw err;
                 throw new RuntimeException("HC4J VRAM Write Exception", t);
             }
         }
@@ -456,20 +498,32 @@ public final class NativeEngine {
     public static void downloadVramSegment(long vramId, MemorySegment destination, long totalElements) {
         ensureInitialized();
         if (destination.isNative()) {
+            int status;
             try {
-                int status = (int) gpuDownloadHandle.invokeExact(vramId, destination, totalElements);
-                checkStatus(status, "downloadVramSegment");
+                status = (int) gpuDownloadHandle.invokeExact(vramId, destination, totalElements);
             } catch (Throwable t) {
+                if (t instanceof RuntimeException re) throw re;
+                if (t instanceof Error err) throw err;
                 throw new RuntimeException("HC4J VRAM Download Exception", t);
             }
+            checkStatus(status, "downloadVramSegment");
         } else {
             long bytes = totalElements * 4L;
             try (Arena arena = Arena.ofConfined()) {
                 MemorySegment nativeBuf = arena.allocate(bytes, 16);
-                int status = (int) gpuDownloadHandle.invokeExact(vramId, nativeBuf, totalElements);
+                int status;
+                try {
+                    status = (int) gpuDownloadHandle.invokeExact(vramId, nativeBuf, totalElements);
+                } catch (Throwable t) {
+                    if (t instanceof RuntimeException re) throw re;
+                    if (t instanceof Error err) throw err;
+                    throw new RuntimeException("HC4J VRAM Download Exception", t);
+                }
                 checkStatus(status, "downloadVramSegment");
                 MemorySegment.copy(nativeBuf, 0, destination, 0, bytes);
             } catch (Throwable t) {
+                if (t instanceof RuntimeException re) throw re;
+                if (t instanceof Error err) throw err;
                 throw new RuntimeException("HC4J VRAM Download Exception", t);
             }
         }
@@ -485,6 +539,7 @@ public final class NativeEngine {
             checkStatus(status, "copyStrided");
         } catch (Throwable t) {
             if (t instanceof RuntimeException re) throw re;
+            if (t instanceof Error err) throw err;
             throw new RuntimeException("HC4J copyStrided failed", t);
         }
     }
@@ -497,6 +552,8 @@ public final class NativeEngine {
             try {
                 status = (int) engineStatsHandle.invokeExact(out);
             } catch (Throwable t) {
+                if (t instanceof RuntimeException re) throw re;
+                if (t instanceof Error err) throw err;
                 throw new RuntimeException("HC4J engine stats failed", t);
             }
             checkStatus(status, "engineStats");
@@ -512,6 +569,8 @@ public final class NativeEngine {
             try {
                 status = (int) adapterInfoHandle.invokeExact(seg);
             } catch (Throwable t) {
+                if (t instanceof RuntimeException re) throw re;
+                if (t instanceof Error err) throw err;
                 throw new RuntimeException("HC4J adapter info query failed", t);
             }
             checkStatus(status, "adapterInfo");
@@ -563,6 +622,8 @@ public final class NativeEngine {
         try {
             status = (int) synchronizeHandle.invokeExact();
         } catch (Throwable t) {
+            if (t instanceof RuntimeException re) throw re;
+            if (t instanceof Error err) throw err;
             throw new RuntimeException("HC4J synchronize failed", t);
         }
         checkStatus(status, "synchronize");
@@ -579,6 +640,7 @@ public final class NativeEngine {
             return out.get(ValueLayout.JAVA_LONG, 0);
         } catch (Throwable t) {
             if (t instanceof RuntimeException re) throw re;
+            if (t instanceof Error err) throw err;
             throw new RuntimeException("HC4J collective creation failed", t);
         }
     }
@@ -601,6 +663,7 @@ public final class NativeEngine {
             return ranks;
         } catch (Throwable t) {
             if (t instanceof RuntimeException re) throw re;
+            if (t instanceof Error err) throw err;
             throw new RuntimeException("HC4J collective ranks query failed", t);
         }
     }
@@ -613,6 +676,7 @@ public final class NativeEngine {
             return count;
         } catch (Throwable t) {
             if (t instanceof RuntimeException re) throw re;
+            if (t instanceof Error err) throw err;
             throw new RuntimeException("HC4J collective link count query failed", t);
         }
     }
@@ -624,6 +688,7 @@ public final class NativeEngine {
             checkStatus(status, "Collective.topology");
         } catch (Throwable t) {
             if (t instanceof RuntimeException re) throw re;
+            if (t instanceof Error err) throw err;
             throw new RuntimeException("HC4J collective link query failed", t);
         }
     }
@@ -636,6 +701,7 @@ public final class NativeEngine {
             return len;
         } catch (Throwable t) {
             if (t instanceof RuntimeException re) throw re;
+            if (t instanceof Error err) throw err;
             throw new RuntimeException("HC4J collective device name query failed", t);
         }
     }
@@ -648,6 +714,7 @@ public final class NativeEngine {
             return len;
         } catch (Throwable t) {
             if (t instanceof RuntimeException re) throw re;
+            if (t instanceof Error err) throw err;
             throw new RuntimeException("HC4J collective backend name query failed", t);
         }
     }
@@ -661,6 +728,7 @@ public final class NativeEngine {
             return out.get(ValueLayout.JAVA_LONG, 0);
         } catch (Throwable t) {
             if (t instanceof RuntimeException re) throw re;
+            if (t instanceof Error err) throw err;
             throw new RuntimeException("HC4J collective alloc failed", t);
         }
     }
@@ -682,6 +750,7 @@ public final class NativeEngine {
             checkStatus(status, "CollectiveBuffer.write");
         } catch (Throwable t) {
             if (t instanceof RuntimeException re) throw re;
+            if (t instanceof Error err) throw err;
             throw new RuntimeException("HC4J collective write failed", t);
         }
     }
@@ -693,6 +762,7 @@ public final class NativeEngine {
             checkStatus(status, "CollectiveBuffer.read");
         } catch (Throwable t) {
             if (t instanceof RuntimeException re) throw re;
+            if (t instanceof Error err) throw err;
             throw new RuntimeException("HC4J collective read failed", t);
         }
     }
@@ -704,6 +774,7 @@ public final class NativeEngine {
             checkStatus(status, "Collective.allReduceSum");
         } catch (Throwable t) {
             if (t instanceof RuntimeException re) throw re;
+            if (t instanceof Error err) throw err;
             throw new RuntimeException("HC4J collective allReduceSum failed", t);
         }
     }
@@ -715,6 +786,7 @@ public final class NativeEngine {
             checkStatus(status, "Collective.deviceProfiles");
         } catch (Throwable t) {
             if (t instanceof RuntimeException re) throw re;
+            if (t instanceof Error err) throw err;
             throw new RuntimeException("HC4J collective device profile query failed", t);
         }
     }
@@ -727,6 +799,7 @@ public final class NativeEngine {
             return count;
         } catch (Throwable t) {
             if (t instanceof RuntimeException re) throw re;
+            if (t instanceof Error err) throw err;
             throw new RuntimeException("HC4J collective ring order query failed", t);
         }
     }
@@ -739,6 +812,7 @@ public final class NativeEngine {
             return count;
         } catch (Throwable t) {
             if (t instanceof RuntimeException re) throw re;
+            if (t instanceof Error err) throw err;
             throw new RuntimeException("HC4J collective island count query failed", t);
         }
     }
@@ -751,6 +825,7 @@ public final class NativeEngine {
             return written;
         } catch (Throwable t) {
             if (t instanceof RuntimeException re) throw re;
+            if (t instanceof Error err) throw err;
             throw new RuntimeException("HC4J collective island query failed", t);
         }
     }
@@ -763,6 +838,7 @@ public final class NativeEngine {
                 checkStatus(status, "CollectiveBuffer.write");
             } catch (Throwable t) {
                 if (t instanceof RuntimeException re) throw re;
+                if (t instanceof Error err) throw err;
                 throw new RuntimeException("HC4J collective write failed", t);
             }
         } else {
@@ -774,6 +850,7 @@ public final class NativeEngine {
                 checkStatus(status, "CollectiveBuffer.write");
             } catch (Throwable t) {
                 if (t instanceof RuntimeException re) throw re;
+                if (t instanceof Error err) throw err;
                 throw new RuntimeException("HC4J collective write failed", t);
             }
         }
@@ -787,6 +864,7 @@ public final class NativeEngine {
                 checkStatus(status, "CollectiveBuffer.read");
             } catch (Throwable t) {
                 if (t instanceof RuntimeException re) throw re;
+                if (t instanceof Error err) throw err;
                 throw new RuntimeException("HC4J collective read failed", t);
             }
         } else {
@@ -798,6 +876,7 @@ public final class NativeEngine {
                 MemorySegment.copy(nativeBuf, 0, destination, 0, bytes);
             } catch (Throwable t) {
                 if (t instanceof RuntimeException re) throw re;
+                if (t instanceof Error err) throw err;
                 throw new RuntimeException("HC4J collective read failed", t);
             }
         }
@@ -810,6 +889,7 @@ public final class NativeEngine {
             checkStatus(status, "Collective.allReduceSumSubset");
         } catch (Throwable t) {
             if (t instanceof RuntimeException re) throw re;
+            if (t instanceof Error err) throw err;
             throw new RuntimeException("HC4J collective allReduceSumSubset failed", t);
         }
     }
@@ -821,6 +901,7 @@ public final class NativeEngine {
             checkStatus(status, "Collective.gemmBiasAct");
         } catch (Throwable t) {
             if (t instanceof RuntimeException re) throw re;
+            if (t instanceof Error err) throw err;
             throw new RuntimeException("HC4J collective gemmBiasAct failed", t);
         }
     }
@@ -834,6 +915,7 @@ public final class NativeEngine {
             checkStatus(status, "Collective.splitKvAttention");
         } catch (Throwable t) {
             if (t instanceof RuntimeException re) throw re;
+            if (t instanceof Error err) throw err;
             throw new RuntimeException("HC4J collective splitKvAttention failed", t);
         }
     }

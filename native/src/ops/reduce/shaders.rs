@@ -68,7 +68,7 @@ fn main(
     }}
 
     if (lid.x == 0u) {{
-        OUT[group] = finalize(scratch[0]);
+        OUT[p.params.z + group] = finalize(scratch[0]);
     }}
 }}
 "
@@ -331,5 +331,11 @@ mod tests {
         for src in sources {
             assert!(!src.contains("storage, read>"), "found a read-only storage binding");
         }
+    }
+
+    #[test]
+    fn flat_kernel_uses_partial_offset_param() {
+        let src = flat_kernel_wgsl(ReduceOp::Sum, Load::Value, false);
+        assert!(src.contains("OUT[p.params.z + group] = finalize(scratch[0]);"));
     }
 }

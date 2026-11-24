@@ -110,6 +110,7 @@ class CollectiveTest {
     void testTopologyLinkDetails() {
         try (Collective ring = Collective.open(4)) {
             List<Link> links = ring.topology();
+            List<Island> islands = ring.islands();
             assertEquals(12, links.size(), "4 ranks give 12 directed edges");
             for (Link link : links) {
                 assertTrue(link.src() >= 0 && link.src() < 4);
@@ -118,9 +119,24 @@ class CollectiveTest {
                 assertTrue(link.gbps() > 0.0, "Link bandwidth must be strictly positive");
                 assertTrue(link.latencyUs() > 0.0, "Link latency must be strictly positive");
                 assertNotNull(link.transport());
-                assertTrue(link.loopback() || !link.loopback()); // boolean valid
+                int srcIsland = findIsland(islands, link.src());
+                int dstIsland = findIsland(islands, link.dst());
+                if (srcIsland == dstIsland) {
+                    assertTrue(link.loopback(), "Same-island link must be marked loopback");
+                } else {
+                    assertFalse(link.loopback(), "Cross-island link must not be marked loopback");
+                }
             }
         }
+    }
+
+    private static int findIsland(List<Island> islands, int rank) {
+        for (Island island : islands) {
+            if (island.ranks().contains(rank)) {
+                return island.id();
+            }
+        }
+        return -1;
     }
 
     @Test

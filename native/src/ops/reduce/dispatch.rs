@@ -100,10 +100,15 @@ pub fn run_full(op: ReduceOp, load: Load, id_a: TensorId, id_b: TensorId, id_out
         for (tile, &groups) in partial_counts.iter().enumerate() {
             let offset = tile as u64 * tile_bytes;
             let bytes = tile_bytes.min(total_bytes - offset);
-            let uniform = rec.uniform(&params_bytes([u32::try_from(bytes / 4).unwrap_or(u32::MAX), 0, 0, 0]))?;
+            let uniform = rec.uniform(&params_bytes([
+                u32::try_from(bytes / 4).unwrap_or(u32::MAX),
+                0,
+                u32::try_from(written).unwrap_or(u32::MAX),
+                0,
+            ]))?;
             let mut resources: Vec<wgpu::BindingResource<'_>> =
                 inputs.iter().map(|span| span.sub_binding(offset, bytes)).collect();
-            resources.push(partials_span.sub_binding(written * 4, u64::from(groups) * 4));
+            resources.push(partials_span.binding());
             resources.push(uniform);
             let bg = bind_group(engine, &pass1, resources);
             rec.dispatch(&pass1, &bg, (groups, 1, 1), bytes * inputs.len() as u64);

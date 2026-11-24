@@ -527,4 +527,51 @@ class TensorViewsAndBroadcastTest {
             executor.shutdown();
         }
     }
+
+    @Test
+    @DisplayName("In-place operations with aliased transposed view avoid data races")
+    void testInPlaceTransposedAliasing() {
+        int n = 32;
+        float[] nonSymmetric = new float[n * n];
+        for (int i = 0; i < n; i++) {
+            for (int j = 0; j < n; j++) {
+                nonSymmetric[i * n + j] = (float) (i * 1.5 + j * 0.7 + 0.1);
+            }
+        }
+
+        float[] expectedAdd = new float[n * n];
+        for (int i = 0; i < n; i++) {
+            for (int j = 0; j < n; j++) {
+                expectedAdd[i * n + j] = nonSymmetric[i * n + j] + nonSymmetric[j * n + i];
+            }
+        }
+
+        // 1. a.add(a.T(), a) -> in-place destination aliasing a with different layout
+        try (Tensor a = Tensor.fromArray(nonSymmetric, n, n);
+             Tensor at = a.T()) {
+            a.add(at, a);
+            assertArrayEquals(expectedAdd, a.toArray(), 1e-4f);
+        }
+
+        // 2. a.addi(a.T())
+        try (Tensor a = Tensor.fromArray(nonSymmetric, n, n);
+             Tensor at = a.T()) {
+            a.addi(at);
+            assertArrayEquals(expectedAdd, a.toArray(), 1e-4f);
+        }
+
+        float[] expectedSinAt = new float[n * n];
+        for (int i = 0; i < n; i++) {
+            for (int j = 0; j < n; j++) {
+                expectedSinAt[i * n + j] = (float) Math.sin(nonSymmetric[j * n + i]);
+            }
+        }
+
+        // 3. a.T().sin(a) -> writing sin(a.T()) in-place into a
+        try (Tensor a = Tensor.fromArray(nonSymmetric, n, n);
+             Tensor at = a.T()) {
+            at.sin(a);
+            assertArrayEquals(expectedSinAt, a.toArray(), 1e-4f);
+        }
+    }
 }

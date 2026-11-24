@@ -114,6 +114,14 @@ public final class FusedExpr {
     public FusedExpr max(Tensor t) { return binary(MAX, of(t)); }
     public FusedExpr min(Tensor t) { return binary(MIN, of(t)); }
 
+    /**
+     * Elementwise power with another tensor {@code this ^ t}.
+     *
+     * @param t exponent tensor
+     * @return fused power expression
+     */
+    public FusedExpr pow(Tensor t) { return binary(POW, of(t)); }
+
     public FusedExpr add(float c) { return scalar(ADD, c); }
     public FusedExpr rsub(float c) { return reverseScalar(SUB, c); }
     public FusedExpr rdiv(float c) { return reverseScalar(DIV, c); }
@@ -207,7 +215,10 @@ public final class FusedExpr {
                     case Load(Tensor t) -> {
                         access.ensureOpen(t);
                         Tensor effective = t;
-                        if (!effective.isContiguous() || access.elementOffset(effective) != 0) {
+                        if (access.getVramId(effective) == access.getVramId(res) && !access.hasIdenticalLayout(effective, res)) {
+                            effective = effective.copy();
+                            temporaryCopies.add(effective);
+                        } else if (!effective.isContiguous() || access.elementOffset(effective) != 0) {
                             effective = effective.contiguous();
                             temporaryCopies.add(effective);
                         }

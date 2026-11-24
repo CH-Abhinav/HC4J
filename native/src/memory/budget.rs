@@ -60,13 +60,17 @@ impl Budget {
         }
     }
 
-    #[allow(clippy::incompatible_msrv)]
     fn release(&self, bytes: u64) {
         // Saturating so a bookkeeping bug can never wrap `used` to ~u64::MAX
         // and wedge every future allocation.
-        let _ = self.used.try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
-            Some(used.saturating_sub(bytes))
-        });
+        let mut current = self.used.load(Ordering::Acquire);
+        loop {
+            let next = current.saturating_sub(bytes);
+            match self.used.compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => break,
+                Err(actual) => current = actual,
+            }
+        }
     }
 }
 

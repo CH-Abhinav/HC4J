@@ -93,4 +93,22 @@ class FusedExprTest {
             }
         }
     }
+
+    @Test
+    @DisplayName("FusedExpr pow(Tensor) eval on real GPU")
+    void testGpuEvaluationPow() {
+        GpuTestSupport.assumeGpuAvailable();
+
+        float[] aData = {2f, 3f, 4f, 5f};
+        float[] bData = {3f, 2f, 0.5f, 1.5f};
+        try (Tensor a = Tensor.fromArray(aData, 2, 2);
+             Tensor b = Tensor.fromArray(bData, 2, 2);
+             Tensor r = a.lazy().pow(b).eval()) {
+            float[] got = r.toFloatArray();
+            for (int i = 0; i < aData.length; i++) {
+                float want = (float) Math.pow(aData[i], bData[i]);
+                TestAssertions.assertClose(want, got[i], 1e-4f, 1e-4f);
+            }
+        }
+    }
 }

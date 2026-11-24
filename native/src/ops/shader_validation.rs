@@ -262,4 +262,9 @@ fn collective_split_kv_attn_shader() {
     validate("collective_split_kv_attn", include_str!("../collective/vulkan/split_kv_attn.wgsl"));
 }
 
+#[test]
+fn collective_reduce_shader() {
+    validate("collective_reduce", include_str!("../collective/vulkan/reduce.wgsl"));
+}
+
 
