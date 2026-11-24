@@ -569,6 +569,22 @@ pub fn detect_islands_for_payload(
         .collect()
 }
 
+/// Balanced chunk partitioning for arbitrary lengths and rank counts.
+///
+/// Divides `total` elements across `ranks` into balanced, non-overlapping contiguous slices.
+/// The first `total % ranks` chunks have length `total / ranks + 1`, and the remaining chunks
+/// have length `total / ranks`.
+pub fn chunk_range(total: usize, ranks: usize, chunk_idx: usize) -> (usize, usize) {
+    if ranks == 0 || chunk_idx >= ranks {
+        return (0, 0);
+    }
+    let base = total / ranks;
+    let rem = total % ranks;
+    let len = base + usize::from(chunk_idx < rem);
+    let start = chunk_idx * base + chunk_idx.min(rem);
+    (start, len)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

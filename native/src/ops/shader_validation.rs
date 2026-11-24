@@ -252,3 +252,14 @@ fn axis_reductions_suite() {
     validate("axis_argmin", &axis_argmax_wgsl(false));
 }
 
+#[test]
+fn collective_gemm_bias_act_shader() {
+    validate("collective_gemm_bias_act", include_str!("../collective/vulkan/gemm_bias_act.wgsl"));
+}
+
+#[test]
+fn collective_split_kv_attn_shader() {
+    validate("collective_split_kv_attn", include_str!("../collective/vulkan/split_kv_attn.wgsl"));
+}
+
+

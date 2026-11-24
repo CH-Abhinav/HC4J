@@ -5,7 +5,7 @@ use std::time::Instant;
 use crate::error::{Hc4jError, Hc4jResult};
 
 use super::backend::{is_peer_class, CollectiveBackend, DeviceProfileC, LinkInfo, Transport};
-use super::planner::{detect_islands, solve_optimal_ring, IslandInfo};
+use super::planner::{chunk_range, detect_islands, solve_optimal_ring, IslandInfo};
 
 /// Elements each invocation of the reduction kernel handles.
 const WORKGROUP_SIZE: u32 = 256;
@@ -28,6 +28,9 @@ pub struct Node {
     /// Index into the adapter list, so loopback ranks can be recognised.
     pub adapter_index: usize,
     add: wgpu::ComputePipeline,
+    pub(crate) gemm_bias_act: wgpu::ComputePipeline,
+    pub(crate) split_kv_attn: wgpu::ComputePipeline,
+    pub(crate) dummy_bias: wgpu::Buffer,
     max_workgroups: u32,
 }
 
@@ -94,6 +97,45 @@ impl Node {
             cache: None,
         });
 
+        let gemm_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("HC4J Collective Gemm"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("vulkan/gemm_bias_act.wgsl").into()),
+        });
+        let gemm_bias_act = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("HC4J Collective Gemm"),
+            layout: None,
+            module: &gemm_module,
+            entry_point: Some("main"),
+            compilation_options: wgpu::PipelineCompilationOptions {
+                zero_initialize_workgroup_memory: false,
+                ..Default::default()
+            },
+            cache: None,
+        });
+
+        let split_kv_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("HC4J Collective Split-KV"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("vulkan/split_kv_attn.wgsl").into()),
+        });
+        let split_kv_attn = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("HC4J Collective Split-KV"),
+            layout: None,
+            module: &split_kv_module,
+            entry_point: Some("main"),
+            compilation_options: wgpu::PipelineCompilationOptions {
+                zero_initialize_workgroup_memory: false,
+                ..Default::default()
+            },
+            cache: None,
+        });
+
+        let dummy_bias = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("HC4J Dummy Bias"),
+            size: 16,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
         Ok(Self {
             rank,
             device,
@@ -101,6 +143,9 @@ impl Node {
             info: adapter.get_info(),
             adapter_index,
             add,
+            gemm_bias_act,
+            split_kv_attn,
+            dummy_bias,
             max_workgroups: limits.max_compute_workgroups_per_dimension,
         })
     }
@@ -453,39 +498,115 @@ impl WgpuStagedBackend {
         if !total.is_multiple_of(n as u64) {
             return Err(Hc4jError::InvalidParam("element count must divide by the rank count"));
         }
-        let chunk = total / n as u64;
-        let chunk_bytes = chunk * 4;
+        drop(guard);
+        self.allreduce_sum_subset(ids)
+    }
 
-        let recv: Vec<wgpu::Buffer> = self
-            .nodes
+    pub fn allreduce_sum_subset(&self, ids: &[u64]) -> Hc4jResult<()> {
+        let k = ids.len();
+        if k == 0 {
+            return Err(Hc4jError::InvalidParam("allreduce_sum_subset requires at least 1 buffer"));
+        }
+        if k == 1 {
+            let guard = self.buffers.lock().unwrap_or_else(|p| p.into_inner());
+            if !guard.contains_key(&ids[0]) {
+                return Err(Hc4jError::NotFound);
+            }
+            return Ok(());
+        }
+
+        let guard = self.buffers.lock().unwrap_or_else(|p| p.into_inner());
+        let bufs: Vec<&Buf> = ids
             .iter()
-            .map(|node| node.storage(chunk, "HC4J Collective Recv"))
-            .collect();
-        let staging: Vec<wgpu::Buffer> = self.nodes.iter().map(|node| node.readback(chunk_bytes)).collect();
-        let mut hop = vec![0u8; chunk_bytes as usize];
+            .map(|id| guard.get(id).ok_or(Hc4jError::NotFound))
+            .collect::<Hc4jResult<_>>()?;
 
-        // Scatter-reduce
-        for round in 0..n - 1 {
-            for i in 0..n {
-                let next = (i + 1) % n;
-                let send = (i + n - round) % n;
-                self.hop(&bufs, &staging, &recv, &mut hop, i, next, send as u64 * chunk, chunk_bytes)?;
-                self.nodes[next].add_into(&bufs[next].buffer, send as u64 * chunk, &recv[next], chunk)?;
+        let mut seen_ranks = std::collections::HashSet::new();
+        for buf in &bufs {
+            if !seen_ranks.insert(buf.rank) {
+                return Err(Hc4jError::InvalidParam("duplicate rank in subset"));
+            }
+            if buf.elements != bufs[0].elements {
+                return Err(Hc4jError::InvalidParam("every rank must contribute the same length"));
+            }
+        }
+        let total = bufs[0].elements;
+        let sub_ranks: Vec<usize> = bufs.iter().map(|b| b.rank).collect();
+
+        let max_chunk_len = (total as usize / k) + usize::from(!total.is_multiple_of(k as u64));
+        let max_chunk_bytes = (max_chunk_len * 4) as u64;
+
+        let recv: HashMap<usize, wgpu::Buffer> = sub_ranks
+            .iter()
+            .map(|&r| (r, self.nodes[r].storage(max_chunk_len as u64, "HC4J Collective Recv")))
+            .collect();
+        let staging: HashMap<usize, wgpu::Buffer> = sub_ranks
+            .iter()
+            .map(|&r| (r, self.nodes[r].readback(max_chunk_bytes)))
+            .collect();
+        let mut hop = vec![0u8; max_chunk_bytes as usize];
+
+        // Scatter-reduce (k - 1 rounds)
+        for round in 0..k - 1 {
+            for idx in 0..k {
+                let i = sub_ranks[idx];
+                let next = sub_ranks[(idx + 1) % k];
+                let send_chunk_idx = (idx + k - round) % k;
+                let (chunk_start, chunk_len) = chunk_range(total as usize, k, send_chunk_idx);
+                if chunk_len == 0 {
+                    continue;
+                }
+                let chunk_bytes = (chunk_len * 4) as u64;
+
+                self.nodes[i].download_into(
+                    &bufs[idx].buffer,
+                    (chunk_start * 4) as u64,
+                    &staging[&i],
+                    chunk_bytes,
+                    &mut hop[..chunk_bytes as usize],
+                )?;
+                self.nodes[next].upload(&recv[&next], 0, &hop[..chunk_bytes as usize])?;
+                self.nodes[next].add_into(
+                    &bufs[(idx + 1) % k].buffer,
+                    chunk_start as u64,
+                    &recv[&next],
+                    chunk_len as u64,
+                )?;
             }
         }
 
-        // Allgather
-        for round in 0..n - 1 {
-            for i in 0..n {
-                let next = (i + 1) % n;
-                let send = (i + 1 + n - round) % n;
-                let offset = send as u64 * chunk;
-                self.hop(&bufs, &staging, &recv, &mut hop, i, next, offset, chunk_bytes)?;
+        // Allgather (k - 1 rounds)
+        for round in 0..k - 1 {
+            for idx in 0..k {
+                let i = sub_ranks[idx];
+                let next = sub_ranks[(idx + 1) % k];
+                let send_chunk_idx = (idx + 1 + k - round) % k;
+                let (chunk_start, chunk_len) = chunk_range(total as usize, k, send_chunk_idx);
+                if chunk_len == 0 {
+                    continue;
+                }
+                let chunk_bytes = (chunk_len * 4) as u64;
+
+                self.nodes[i].download_into(
+                    &bufs[idx].buffer,
+                    (chunk_start * 4) as u64,
+                    &staging[&i],
+                    chunk_bytes,
+                    &mut hop[..chunk_bytes as usize],
+                )?;
+                self.nodes[next].upload(&recv[&next], 0, &hop[..chunk_bytes as usize])?;
+
                 let node = &self.nodes[next];
                 let mut encoder = node
                     .device
                     .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("HC4J Collective Copy") });
-                encoder.copy_buffer_to_buffer(&recv[next], 0, &bufs[next].buffer, offset * 4, chunk_bytes);
+                encoder.copy_buffer_to_buffer(
+                    &recv[&next],
+                    0,
+                    &bufs[(idx + 1) % k].buffer,
+                    (chunk_start * 4) as u64,
+                    chunk_bytes,
+                );
                 node.queue.submit(Some(encoder.finish()));
                 node.wait()?;
             }
@@ -494,25 +615,182 @@ impl WgpuStagedBackend {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn hop(
+    pub fn gemm_bias_act(
         &self,
-        bufs: &[&Buf],
-        staging: &[wgpu::Buffer],
-        recv: &[wgpu::Buffer],
-        hop: &mut [u8],
-        src: usize,
-        dst: usize,
-        offset_elems: u64,
-        chunk_bytes: u64,
+        rank: usize,
+        buf_a: u64,
+        buf_b: u64,
+        buf_bias: u64,
+        buf_c: u64,
+        m: u32,
+        n: u32,
+        k: u32,
+        flags: u32,
     ) -> Hc4jResult<()> {
-        self.nodes[src].download_into(
-            &bufs[src].buffer,
-            offset_elems * 4,
-            &staging[src],
-            chunk_bytes,
-            hop,
-        )?;
-        self.nodes[dst].upload(&recv[dst], 0, hop)
+        if rank >= self.nodes.len() {
+            return Err(Hc4jError::InvalidParam("rank out of range"));
+        }
+        if m == 0 || n == 0 || k == 0 {
+            return Ok(());
+        }
+
+        let node = &self.nodes[rank];
+        let guard = self.buffers.lock().unwrap_or_else(|p| p.into_inner());
+        let b_a = guard.get(&buf_a).ok_or(Hc4jError::InvalidParam("invalid buf_a"))?;
+        let b_b = guard.get(&buf_b).ok_or(Hc4jError::InvalidParam("invalid buf_b"))?;
+        let b_c = guard.get(&buf_c).ok_or(Hc4jError::InvalidParam("invalid buf_c"))?;
+
+        if b_a.rank != rank || b_b.rank != rank || b_c.rank != rank {
+            return Err(Hc4jError::InvalidParam("buffers must belong to specified rank"));
+        }
+        if b_a.elements < (m * k) as u64 || b_b.elements < (k * n) as u64 || b_c.elements < (m * n) as u64 {
+            return Err(Hc4jError::InvalidParam("buffer size too small for gemm shape"));
+        }
+
+        let bias_buffer = if buf_bias != 0 {
+            let b_bias = guard.get(&buf_bias).ok_or(Hc4jError::InvalidParam("invalid buf_bias"))?;
+            if b_bias.rank != rank {
+                return Err(Hc4jError::InvalidParam("bias buffer must belong to specified rank"));
+            }
+            if b_bias.elements < n as u64 {
+                return Err(Hc4jError::InvalidParam("bias buffer size too small"));
+            }
+            &b_bias.buffer
+        } else {
+            &node.dummy_bias
+        };
+
+        let params: [u32; 4] = [m, n, k, flags];
+        let uniform = node.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("HC4J Gemm Params"),
+            size: 16,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        node.queue.write_buffer(&uniform, 0, bytemuck::bytes_of(&params));
+
+        let bind_group = node.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("HC4J Gemm BindGroup"),
+            layout: &node.gemm_bias_act.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: b_a.buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: b_b.buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: bias_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: b_c.buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: uniform.as_entire_binding() },
+            ],
+        });
+
+        let gx = n.div_ceil(16);
+        let gy = m.div_ceil(16);
+
+        let mut encoder = node
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("HC4J Gemm Encoder") });
+        {
+            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("HC4J Gemm Pass"),
+                timestamp_writes: None,
+            });
+            cpass.set_pipeline(&node.gemm_bias_act);
+            cpass.set_bind_group(0, &bind_group, &[]);
+            cpass.dispatch_workgroups(gx, gy, 1);
+        }
+        node.queue.submit(Some(encoder.finish()));
+        node.wait()?;
+
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn split_kv_attn(
+        &self,
+        rank: usize,
+        buf_q: u64,
+        buf_k: u64,
+        buf_v: u64,
+        buf_out_o: u64,
+        buf_out_stats: u64,
+        num_heads: u32,
+        num_kv_heads: u32,
+        head_dim: u32,
+        local_tokens: u32,
+        scale: f32,
+    ) -> Hc4jResult<()> {
+        if rank >= self.nodes.len() {
+            return Err(Hc4jError::InvalidParam("rank out of range"));
+        }
+        if num_heads == 0 || head_dim == 0 {
+            return Ok(());
+        }
+
+        let node = &self.nodes[rank];
+        let guard = self.buffers.lock().unwrap_or_else(|p| p.into_inner());
+        let b_q = guard.get(&buf_q).ok_or(Hc4jError::InvalidParam("invalid buf_q"))?;
+        let b_k = guard.get(&buf_k).ok_or(Hc4jError::InvalidParam("invalid buf_k"))?;
+        let b_v = guard.get(&buf_v).ok_or(Hc4jError::InvalidParam("invalid buf_v"))?;
+        let b_o = guard.get(&buf_out_o).ok_or(Hc4jError::InvalidParam("invalid buf_out_o"))?;
+        let b_s = guard.get(&buf_out_stats).ok_or(Hc4jError::InvalidParam("invalid buf_out_stats"))?;
+
+        if b_q.rank != rank || b_k.rank != rank || b_v.rank != rank || b_o.rank != rank || b_s.rank != rank {
+            return Err(Hc4jError::InvalidParam("buffers must belong to specified rank"));
+        }
+        if b_q.elements < (num_heads * head_dim) as u64
+            || b_k.elements < (num_kv_heads * local_tokens * head_dim) as u64
+            || b_v.elements < (num_kv_heads * local_tokens * head_dim) as u64
+            || b_o.elements < (num_heads * head_dim) as u64
+            || b_s.elements < (num_heads * 2) as u64
+        {
+            return Err(Hc4jError::InvalidParam("buffer size too small for split_kv"));
+        }
+
+        let params: [u32; 8] = [
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            local_tokens,
+            scale.to_bits(),
+            0,
+            0,
+            0,
+        ];
+        let uniform = node.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("HC4J Split-KV Params"),
+            size: 32,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        node.queue.write_buffer(&uniform, 0, bytemuck::cast_slice(&params));
+
+        let bind_group = node.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("HC4J Split-KV BindGroup"),
+            layout: &node.split_kv_attn.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: b_q.buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: b_k.buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: b_v.buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: b_o.buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: b_s.buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 5, resource: uniform.as_entire_binding() },
+            ],
+        });
+
+        let mut encoder = node
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("HC4J Split-KV Encoder") });
+        {
+            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("HC4J Split-KV Pass"),
+                timestamp_writes: None,
+            });
+            cpass.set_pipeline(&node.split_kv_attn);
+            cpass.set_bind_group(0, &bind_group, &[]);
+            cpass.dispatch_workgroups(num_heads, 1, 1);
+        }
+        node.queue.submit(Some(encoder.finish()));
+        node.wait()?;
+
+        Ok(())
     }
 }
 
@@ -551,6 +829,54 @@ impl CollectiveBackend for WgpuStagedBackend {
 
     fn allreduce_sum(&self, buffers: &[u64]) -> Hc4jResult<()> {
         self.all_reduce_sum(buffers)
+    }
+
+    fn allreduce_sum_subset(&self, buffers: &[u64]) -> Hc4jResult<()> {
+        self.allreduce_sum_subset(buffers)
+    }
+
+    fn gemm_bias_act(
+        &self,
+        rank: usize,
+        buf_a: u64,
+        buf_b: u64,
+        buf_bias: u64,
+        buf_c: u64,
+        m: u32,
+        n: u32,
+        k: u32,
+        flags: u32,
+    ) -> Hc4jResult<()> {
+        self.gemm_bias_act(rank, buf_a, buf_b, buf_bias, buf_c, m, n, k, flags)
+    }
+
+    fn split_kv_attn(
+        &self,
+        rank: usize,
+        buf_q: u64,
+        buf_k: u64,
+        buf_v: u64,
+        buf_out_o: u64,
+        buf_out_stats: u64,
+        num_heads: u32,
+        num_kv_heads: u32,
+        head_dim: u32,
+        local_tokens: u32,
+        scale: f32,
+    ) -> Hc4jResult<()> {
+        self.split_kv_attn(
+            rank,
+            buf_q,
+            buf_k,
+            buf_v,
+            buf_out_o,
+            buf_out_stats,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            local_tokens,
+            scale,
+        )
     }
 
     fn device_profiles(&self) -> &[DeviceProfileC] {
@@ -813,6 +1139,379 @@ mod tests {
             for (r, row) in seen.iter().enumerate() {
                 assert!(row.iter().all(|&s| s), "n={n}: rank {r} is missing a chunk after allgather");
             }
+        }
+    }
+
+    fn cpu_gemm_bias_act(
+        a: &[f32],
+        b: &[f32],
+        bias: Option<&[f32]>,
+        m: usize,
+        n: usize,
+        k: usize,
+        act: u32,
+    ) -> Vec<f32> {
+        let mut c = vec![0.0f32; m * n];
+        for row in 0..m {
+            for col in 0..n {
+                let mut acc = 0.0f64;
+                for i in 0..k {
+                    acc += a[row * k + i] as f64 * b[i * n + col] as f64;
+                }
+                if let Some(bias_slice) = bias {
+                    acc += bias_slice[col] as f64;
+                }
+                let x = acc as f32;
+                let val = match act {
+                    0 => x,
+                    1 => {
+                        let cubic = 0.7978845608028654 * (x as f64 + 0.044715 * (x as f64).powi(3));
+                        let inner = cubic.clamp(-10.0, 10.0);
+                        (0.5 * x as f64 * (1.0 + inner.tanh())) as f32
+                    }
+                    2 => {
+                        let x_f64 = x as f64;
+                        let e = (-x_f64.abs()).exp();
+                        let num = if x_f64 >= 0.0 { 1.0 } else { e };
+                        (x_f64 * num / (1.0 + e)) as f32
+                    }
+                    3 => x.max(0.0),
+                    _ => x,
+                };
+                c[row * n + col] = val;
+            }
+        }
+        c
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn cpu_split_kv_attn(
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        local_tokens: usize,
+        scale: f32,
+    ) -> (Vec<f32>, Vec<f32>) {
+        let mut out_o = vec![0.0f32; num_heads * head_dim];
+        let mut out_stats = vec![0.0f32; num_heads * 2];
+        let group_size = num_heads / num_kv_heads;
+
+        for h in 0..num_heads {
+            let kv_h = h / group_size;
+            let mut scores = Vec::with_capacity(local_tokens);
+            let mut m_h = -f64::INFINITY;
+
+            for t in 0..local_tokens {
+                let mut dot = 0.0f64;
+                for d in 0..head_dim {
+                    dot += q[h * head_dim + d] as f64 * k[(kv_h * local_tokens + t) * head_dim + d] as f64;
+                }
+                let score = dot * scale as f64;
+                if score > m_h {
+                    m_h = score;
+                }
+                scores.push(score);
+            }
+
+            let mut l_h = 0.0f64;
+            let mut weights = Vec::with_capacity(local_tokens);
+            for &s in &scores {
+                let w = (s - m_h).exp();
+                weights.push(w);
+                l_h += w;
+            }
+
+            out_stats[2 * h] = m_h as f32;
+            out_stats[2 * h + 1] = l_h as f32;
+
+            for d in 0..head_dim {
+                let mut acc = 0.0f64;
+                for t in 0..local_tokens {
+                    acc += weights[t] * v[(kv_h * local_tokens + t) * head_dim + d] as f64;
+                }
+                out_o[h * head_dim + d] = (acc / l_h) as f32;
+            }
+        }
+
+        (out_o, out_stats)
+    }
+
+    #[test]
+    fn test_wgpu_staged_allreduce_sum_subset() {
+        let backend = match Collective::create(4) {
+            Ok(b) => b,
+            Err(_) => return,
+        };
+
+        let len = 1003;
+        let b0 = backend.alloc(0, len as u64).unwrap();
+        let b1 = backend.alloc(1, len as u64).unwrap();
+        let b2 = backend.alloc(2, len as u64).unwrap();
+        let b3 = backend.alloc(3, len as u64).unwrap();
+
+        let data0: Vec<f32> = (0..len).map(|i| (i + 1) as f32).collect();
+        let data1: Vec<f32> = (0..len).map(|i| (i * 2 + 3) as f32).collect();
+        let data2: Vec<f32> = (0..len).map(|i| (i * 3 + 5) as f32).collect();
+        let data3: Vec<f32> = (0..len).map(|i| (i * 4 + 7) as f32).collect();
+
+        backend.write(b0, &data0).unwrap();
+        backend.write(b1, &data1).unwrap();
+        backend.write(b2, &data2).unwrap();
+        backend.write(b3, &data3).unwrap();
+
+        // 1-rank is valid no-op
+        backend.allreduce_sum_subset(&[b0]).unwrap();
+        let mut check_b0 = vec![0.0f32; len];
+        backend.read(b0, &mut check_b0).unwrap();
+        assert_eq!(check_b0, data0);
+
+        // 2-of-4 subset: {0, 2}
+        backend.allreduce_sum_subset(&[b0, b2]).unwrap();
+
+        let mut res0 = vec![0.0f32; len];
+        let mut res1 = vec![0.0f32; len];
+        let mut res2 = vec![0.0f32; len];
+        let mut res3 = vec![0.0f32; len];
+
+        backend.read(b0, &mut res0).unwrap();
+        backend.read(b1, &mut res1).unwrap();
+        backend.read(b2, &mut res2).unwrap();
+        backend.read(b3, &mut res3).unwrap();
+
+        for i in 0..len {
+            let expected_sum = data0[i] + data2[i];
+            assert!((res0[i] - expected_sum).abs() < 1e-4);
+            assert!((res2[i] - expected_sum).abs() < 1e-4);
+            assert_eq!(res1[i], data1[i]);
+            assert_eq!(res3[i], data3[i]);
+        }
+
+        // 3-of-4 subset: {0, 1, 3}
+        backend.allreduce_sum_subset(&[b0, b1, b3]).unwrap();
+        backend.read(b0, &mut res0).unwrap();
+        backend.read(b1, &mut res1).unwrap();
+        backend.read(b2, &mut res2).unwrap();
+        backend.read(b3, &mut res3).unwrap();
+
+        for i in 0..len {
+            let expected_sum = (data0[i] + data2[i]) + data1[i] + data3[i];
+            assert!((res0[i] - expected_sum).abs() < 1e-3);
+            assert!((res1[i] - expected_sum).abs() < 1e-3);
+            assert!((res3[i] - expected_sum).abs() < 1e-3);
+            assert!((res2[i] - (data0[i] + data2[i])).abs() < 1e-4);
+        }
+
+        backend.free(b0).unwrap();
+        backend.free(b1).unwrap();
+        backend.free(b2).unwrap();
+        backend.free(b3).unwrap();
+    }
+
+    #[test]
+    fn test_wgpu_staged_gemm_bias_act_ragged() {
+        let backend = match Collective::create(2) {
+            Ok(b) => b,
+            Err(_) => return,
+        };
+
+        let m = 17usize;
+        let k = 29usize;
+        let n = 13usize;
+
+        let a_data: Vec<f32> = (0..m * k).map(|i| ((i % 7) as f32 - 3.0) * 0.25).collect();
+        let b_data: Vec<f32> = (0..k * n).map(|i| ((i % 5) as f32 - 2.0) * 0.25).collect();
+        let bias_data: Vec<f32> = (0..n).map(|i| (i as f32 + 1.0) * 0.1).collect();
+
+        let buf_a = backend.alloc(0, (m * k) as u64).unwrap();
+        let buf_b = backend.alloc(0, (k * n) as u64).unwrap();
+        let buf_bias = backend.alloc(0, n as u64).unwrap();
+        let buf_c = backend.alloc(0, (m * n) as u64).unwrap();
+
+        backend.write(buf_a, &a_data).unwrap();
+        backend.write(buf_b, &b_data).unwrap();
+        backend.write(buf_bias, &bias_data).unwrap();
+
+        // 1. NONE, no bias
+        backend.gemm_bias_act(0, buf_a, buf_b, 0, buf_c, m as u32, n as u32, k as u32, 0).unwrap();
+        let mut c_res = vec![0.0f32; m * n];
+        backend.read(buf_c, &mut c_res).unwrap();
+        let cpu_ref = cpu_gemm_bias_act(&a_data, &b_data, None, m, n, k, 0);
+        for i in 0..m * n {
+            assert!((c_res[i] - cpu_ref[i]).abs() <= 1e-4);
+        }
+
+        // 2. BIAS + GELU (flags = 1 | (1 << 1) = 3)
+        backend.gemm_bias_act(0, buf_a, buf_b, buf_bias, buf_c, m as u32, n as u32, k as u32, 3).unwrap();
+        backend.read(buf_c, &mut c_res).unwrap();
+        let cpu_ref = cpu_gemm_bias_act(&a_data, &b_data, Some(&bias_data), m, n, k, 1);
+        for i in 0..m * n {
+            assert!((c_res[i] - cpu_ref[i]).abs() <= 1e-4);
+        }
+
+        // 3. BIAS + SILU (flags = 1 | (2 << 1) = 5)
+        backend.gemm_bias_act(0, buf_a, buf_b, buf_bias, buf_c, m as u32, n as u32, k as u32, 5).unwrap();
+        backend.read(buf_c, &mut c_res).unwrap();
+        let cpu_ref = cpu_gemm_bias_act(&a_data, &b_data, Some(&bias_data), m, n, k, 2);
+        for i in 0..m * n {
+            assert!((c_res[i] - cpu_ref[i]).abs() <= 1e-4);
+        }
+
+        // 4. BIAS + RELU (flags = 1 | (3 << 1) = 7)
+        backend.gemm_bias_act(0, buf_a, buf_b, buf_bias, buf_c, m as u32, n as u32, k as u32, 7).unwrap();
+        backend.read(buf_c, &mut c_res).unwrap();
+        let cpu_ref = cpu_gemm_bias_act(&a_data, &b_data, Some(&bias_data), m, n, k, 3);
+        for i in 0..m * n {
+            assert!((c_res[i] - cpu_ref[i]).abs() <= 1e-4);
+        }
+
+        backend.free(buf_a).unwrap();
+        backend.free(buf_b).unwrap();
+        backend.free(buf_bias).unwrap();
+        backend.free(buf_c).unwrap();
+    }
+
+    #[test]
+    fn test_wgpu_staged_split_kv_attn_mha_and_gqa() {
+        let backend = match Collective::create(2) {
+            Ok(b) => b,
+            Err(_) => return,
+        };
+
+        // Test MHA
+        {
+            let num_heads = 4usize;
+            let num_kv_heads = 4usize;
+            let head_dim = 64usize;
+            let local_tokens = 300usize;
+            let scale = 0.125f32;
+
+            let q_data: Vec<f32> = (0..num_heads * head_dim).map(|i| ((i % 11) as f32 - 5.0) * 0.1).collect();
+            let k_data: Vec<f32> = (0..num_kv_heads * local_tokens * head_dim).map(|i| ((i % 13) as f32 - 6.0) * 0.1).collect();
+            let v_data: Vec<f32> = (0..num_kv_heads * local_tokens * head_dim).map(|i| ((i % 17) as f32 - 8.0) * 0.1).collect();
+
+            let buf_q = backend.alloc(0, (num_heads * head_dim) as u64).unwrap();
+            let buf_k = backend.alloc(0, (num_kv_heads * local_tokens * head_dim) as u64).unwrap();
+            let buf_v = backend.alloc(0, (num_kv_heads * local_tokens * head_dim) as u64).unwrap();
+            let buf_o = backend.alloc(0, (num_heads * head_dim) as u64).unwrap();
+            let buf_stats = backend.alloc(0, (num_heads * 2) as u64).unwrap();
+
+            backend.write(buf_q, &q_data).unwrap();
+            backend.write(buf_k, &k_data).unwrap();
+            backend.write(buf_v, &v_data).unwrap();
+
+            backend.split_kv_attn(
+                0,
+                buf_q,
+                buf_k,
+                buf_v,
+                buf_o,
+                buf_stats,
+                num_heads as u32,
+                num_kv_heads as u32,
+                head_dim as u32,
+                local_tokens as u32,
+                scale,
+            ).unwrap();
+
+            let mut out_o = vec![0.0f32; num_heads * head_dim];
+            let mut out_stats = vec![0.0f32; num_heads * 2];
+            backend.read(buf_o, &mut out_o).unwrap();
+            backend.read(buf_stats, &mut out_stats).unwrap();
+
+            let (ref_o, ref_stats) = cpu_split_kv_attn(
+                &q_data,
+                &k_data,
+                &v_data,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                local_tokens,
+                scale,
+            );
+
+            for h in 0..num_heads {
+                assert!((out_stats[2 * h] - ref_stats[2 * h]).abs() <= 1e-4);
+                assert!((out_stats[2 * h + 1] - ref_stats[2 * h + 1]).abs() / ref_stats[2 * h + 1] <= 1e-3);
+            }
+            for i in 0..num_heads * head_dim {
+                assert!((out_o[i] - ref_o[i]).abs() <= 1e-4);
+            }
+
+            backend.free(buf_q).unwrap();
+            backend.free(buf_k).unwrap();
+            backend.free(buf_v).unwrap();
+            backend.free(buf_o).unwrap();
+            backend.free(buf_stats).unwrap();
+        }
+
+        // Test GQA
+        {
+            let num_heads = 8usize;
+            let num_kv_heads = 2usize;
+            let head_dim = 64usize;
+            let local_tokens = 513usize;
+            let scale = 0.125f32;
+
+            let q_data: Vec<f32> = (0..num_heads * head_dim).map(|i| ((i % 11) as f32 - 5.0) * 0.1).collect();
+            let k_data: Vec<f32> = (0..num_kv_heads * local_tokens * head_dim).map(|i| ((i % 13) as f32 - 6.0) * 0.1).collect();
+            let v_data: Vec<f32> = (0..num_kv_heads * local_tokens * head_dim).map(|i| ((i % 17) as f32 - 8.0) * 0.1).collect();
+
+            let buf_q = backend.alloc(0, (num_heads * head_dim) as u64).unwrap();
+            let buf_k = backend.alloc(0, (num_kv_heads * local_tokens * head_dim) as u64).unwrap();
+            let buf_v = backend.alloc(0, (num_kv_heads * local_tokens * head_dim) as u64).unwrap();
+            let buf_o = backend.alloc(0, (num_heads * head_dim) as u64).unwrap();
+            let buf_stats = backend.alloc(0, (num_heads * 2) as u64).unwrap();
+
+            backend.write(buf_q, &q_data).unwrap();
+            backend.write(buf_k, &k_data).unwrap();
+            backend.write(buf_v, &v_data).unwrap();
+
+            backend.split_kv_attn(
+                0,
+                buf_q,
+                buf_k,
+                buf_v,
+                buf_o,
+                buf_stats,
+                num_heads as u32,
+                num_kv_heads as u32,
+                head_dim as u32,
+                local_tokens as u32,
+                scale,
+            ).unwrap();
+
+            let mut out_o = vec![0.0f32; num_heads * head_dim];
+            let mut out_stats = vec![0.0f32; num_heads * 2];
+            backend.read(buf_o, &mut out_o).unwrap();
+            backend.read(buf_stats, &mut out_stats).unwrap();
+
+            let (ref_o, ref_stats) = cpu_split_kv_attn(
+                &q_data,
+                &k_data,
+                &v_data,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                local_tokens,
+                scale,
+            );
+
+            for h in 0..num_heads {
+                assert!((out_stats[2 * h] - ref_stats[2 * h]).abs() <= 1e-4);
+                assert!((out_stats[2 * h + 1] - ref_stats[2 * h + 1]).abs() / ref_stats[2 * h + 1] <= 1e-3);
+            }
+            for i in 0..num_heads * head_dim {
+                assert!((out_o[i] - ref_o[i]).abs() <= 1e-4);
+            }
+
+            backend.free(buf_q).unwrap();
+            backend.free(buf_k).unwrap();
+            backend.free(buf_v).unwrap();
+            backend.free(buf_o).unwrap();
+            backend.free(buf_stats).unwrap();
         }
     }
 }

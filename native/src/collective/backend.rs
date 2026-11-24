@@ -100,6 +100,39 @@ pub(crate) trait CollectiveBackend: Send + Sync {
     fn read(&self, buffer_id: u64, out: &mut [f32]) -> Hc4jResult<()>;
     fn allreduce_sum(&self, buffers: &[u64]) -> Hc4jResult<()>;
 
+    // Step 4C-2: Multi-GPU Execution Bridge
+    fn allreduce_sum_subset(&self, buffers: &[u64]) -> Hc4jResult<()>;
+
+    #[allow(clippy::too_many_arguments)]
+    fn gemm_bias_act(
+        &self,
+        rank: usize,
+        buf_a: u64,
+        buf_b: u64,
+        buf_bias: u64, // 0 = no bias
+        buf_c: u64,
+        m: u32,
+        n: u32,
+        k: u32,
+        flags: u32,
+    ) -> Hc4jResult<()>;
+
+    #[allow(clippy::too_many_arguments)]
+    fn split_kv_attn(
+        &self,
+        rank: usize,
+        buf_q: u64,
+        buf_k: u64,
+        buf_v: u64,
+        buf_out_o: u64,
+        buf_out_stats: u64,
+        num_heads: u32,
+        num_kv_heads: u32,
+        head_dim: u32,
+        local_tokens: u32,
+        scale: f32,
+    ) -> Hc4jResult<()>;
+
     // Step 3D: Profiling, Ring Order & Islands
     fn device_profiles(&self) -> &[DeviceProfileC];
     fn ring_order(&self) -> &[u32];

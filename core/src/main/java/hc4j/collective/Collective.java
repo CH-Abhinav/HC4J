@@ -22,6 +22,7 @@ import static java.lang.foreign.ValueLayout.JAVA_LONG;
 
 import hc4j.internal.ffi.NativeCleaner;
 import hc4j.internal.ffi.NativeEngine;
+import hc4j.nn.Activation;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemoryLayout;
 import java.lang.foreign.MemorySegment;
@@ -368,6 +369,241 @@ public final class Collective implements AutoCloseable {
             MemorySegment list = arena.allocateFrom(JAVA_LONG, ids);
             NativeEngine.allReduceSum(handle, list, ids.length);
         }
+    }
+
+    /**
+     * Performs an active-subset ring AllReduce sum strictly across the provided collective buffers.
+     * <p>
+     * Participating buffers may sit on any non-empty subset of ranks. If exactly one buffer is passed,
+     * this operation is a zero-cost no-op. Pruned straggler ranks not present in {@code activeBuffers}
+     * are never locked, synchronized, or accessed.
+     *
+     * @param activeBuffers non-empty array of distinct active buffers belonging to this collective
+     * @throws NullPointerException if {@code activeBuffers} or any buffer is null
+     * @throws IllegalArgumentException if {@code activeBuffers} is empty, or if buffers reside on duplicate ranks
+     *         or have differing element counts
+     * @throws IllegalStateException if the collective is closed
+     */
+    public void allReduceSumSubset(CollectiveBuffer... activeBuffers) {
+        Objects.requireNonNull(activeBuffers, "activeBuffers must not be null");
+        if (activeBuffers.length == 0) {
+            throw new IllegalArgumentException("activeBuffers must not be empty");
+        }
+        allReduceSumSubset(List.of(activeBuffers));
+    }
+
+    /**
+     * Performs an active-subset ring AllReduce sum strictly across the provided collective buffers.
+     * <p>
+     * Participating buffers may sit on any non-empty subset of ranks. If exactly one buffer is passed,
+     * this operation is a zero-cost no-op. Pruned straggler ranks not present in {@code activeBuffers}
+     * are never locked, synchronized, or accessed.
+     *
+     * @param activeBuffers non-empty list of distinct active buffers belonging to this collective
+     * @throws NullPointerException if {@code activeBuffers} or any buffer is null
+     * @throws IllegalArgumentException if {@code activeBuffers} is empty, or if buffers reside on duplicate ranks
+     *         or have differing element counts
+     * @throws IllegalStateException if the collective is closed
+     */
+    public void allReduceSumSubset(List<CollectiveBuffer> activeBuffers) {
+        ensureOpen();
+        Objects.requireNonNull(activeBuffers, "activeBuffers must not be null");
+        if (activeBuffers.isEmpty()) {
+            throw new IllegalArgumentException("activeBuffers must not be empty");
+        }
+        int count = activeBuffers.size();
+        long[] ids = new long[count];
+        long expectedElements = -1;
+        boolean[] seenRanks = new boolean[ranks];
+
+        for (int i = 0; i < count; i++) {
+            CollectiveBuffer buf = Objects.requireNonNull(activeBuffers.get(i), "buffer at index " + i + " must not be null");
+            buf.ensureOpen();
+            if (buf.collective() != this) {
+                throw new IllegalArgumentException("buffer at index " + i + " belongs to a different collective");
+            }
+            int r = buf.rank();
+            if (r < 0 || r >= ranks) {
+                throw new IllegalArgumentException("buffer rank " + r + " is out of bounds");
+            }
+            if (seenRanks[r]) {
+                throw new IllegalArgumentException("duplicate rank " + r + " in activeBuffers");
+            }
+            seenRanks[r] = true;
+            if (i == 0) {
+                expectedElements = buf.elements();
+            } else if (buf.elements() != expectedElements) {
+                throw new IllegalArgumentException("mismatched element counts: buffer 0 has " + expectedElements
+                        + " but buffer " + i + " has " + buf.elements());
+            }
+            ids[i] = buf.handleUnsafe();
+        }
+
+        if (count == 1) {
+            return;
+        }
+
+        try (Arena arena = Arena.ofConfined()) {
+            MemorySegment list = arena.allocateFrom(JAVA_LONG, ids);
+            NativeEngine.allReduceSumSubset(handle, list, ids.length);
+        }
+    }
+
+    /**
+     * Executes a fused matrix multiplication with optional row-vector bias and activation on a designated rank:
+     * {@code C[M, N] = act(A[M, K] * B[K, N] + bias[N])}.
+     *
+     * @param rank target rank index (0 .. ranks - 1)
+     * @param a input matrix A with shape [M, K] row-major resident on {@code rank}
+     * @param b input matrix B with shape [K, N] row-major resident on {@code rank}
+     * @param bias optional bias vector with length N resident on {@code rank} (may be null if {@code !applyBias})
+     * @param c output matrix C with shape [M, N] row-major resident on {@code rank}
+     * @param m number of rows in A and C
+     * @param n number of columns in B and C, and length of bias
+     * @param k number of columns in A and rows in B
+     * @param applyBias whether to add {@code bias}
+     * @param activation activation function to apply (null for none, or GELU, SILU, RELU)
+     * @throws NullPointerException if {@code a}, {@code b}, or {@code c} is null, or if {@code applyBias} is true and {@code bias} is null
+     * @throws IllegalArgumentException if {@code rank} is invalid, buffer ranks don't match, or buffer sizes are insufficient
+     * @throws UnsupportedOperationException if {@code activation} is not supported by the fused kernel
+     * @throws IllegalStateException if the collective is closed
+     */
+    public void gemmBiasAct(int rank, CollectiveBuffer a, CollectiveBuffer b, CollectiveBuffer bias, CollectiveBuffer c,
+                            int m, int n, int k, boolean applyBias, Activation activation) {
+        ensureOpen();
+        checkRank(rank);
+        Objects.requireNonNull(a, "buffer a must not be null");
+        Objects.requireNonNull(b, "buffer b must not be null");
+        Objects.requireNonNull(c, "buffer c must not be null");
+        a.ensureOpen();
+        b.ensureOpen();
+        c.ensureOpen();
+        if (a.collective() != this || b.collective() != this || c.collective() != this) {
+            throw new IllegalArgumentException("buffers must belong to this collective");
+        }
+        if (a.rank() != rank || b.rank() != rank || c.rank() != rank) {
+            throw new IllegalArgumentException("all buffers must reside on target rank " + rank);
+        }
+        if (m <= 0 || n <= 0 || k <= 0) {
+            throw new IllegalArgumentException("dimensions m, n, k must be positive, got m=" + m + ", n=" + n + ", k=" + k);
+        }
+        if (a.elements() < (long) m * k) {
+            throw new IllegalArgumentException("buffer a has insufficient elements: " + a.elements() + " < " + ((long) m * k));
+        }
+        if (b.elements() < (long) k * n) {
+            throw new IllegalArgumentException("buffer b has insufficient elements: " + b.elements() + " < " + ((long) k * n));
+        }
+        if (c.elements() < (long) m * n) {
+            throw new IllegalArgumentException("buffer c has insufficient elements: " + c.elements() + " < " + ((long) m * n));
+        }
+        long biasHandle = 0L;
+        if (applyBias) {
+            Objects.requireNonNull(bias, "bias buffer must not be null when applyBias is true");
+            bias.ensureOpen();
+            if (bias.collective() != this) {
+                throw new IllegalArgumentException("bias buffer must belong to this collective");
+            }
+            if (bias.rank() != rank) {
+                throw new IllegalArgumentException("bias buffer must reside on target rank " + rank);
+            }
+            if (bias.elements() < n) {
+                throw new IllegalArgumentException("bias buffer has insufficient elements: " + bias.elements() + " < " + n);
+            }
+            biasHandle = bias.handleUnsafe();
+        } else if (bias != null) {
+            biasHandle = bias.handleUnsafe();
+        }
+
+        int actCode;
+        if (activation == null) {
+            actCode = 0;
+        } else {
+            actCode = switch (activation) {
+                case GELU -> 1;
+                case SILU -> 2;
+                case RELU -> 3;
+                default -> throw new UnsupportedOperationException("Unsupported collective GEMM activation: " + activation);
+            };
+        }
+        int flags = (applyBias ? 1 : 0) | (actCode << 1);
+
+        NativeEngine.gemmBiasAct(handle, rank, a.handleUnsafe(), b.handleUnsafe(), biasHandle, c.handleUnsafe(),
+                m, n, k, flags);
+    }
+
+    /**
+     * Executes a single-query local FlashDecoding-style Decode Attention pass on a designated rank:
+     * computes unnormalized or normalized partial output and exact online-softmax reduction statistics
+     * for a local KV cache shard.
+     *
+     * @param rank target rank index (0 .. ranks - 1)
+     * @param q query tensor [numHeads, headDim] resident on {@code rank}
+     * @param kCache local key cache shard [numKvHeads, localTokens, headDim] resident on {@code rank}
+     * @param vCache local value cache shard [numKvHeads, localTokens, headDim] resident on {@code rank}
+     * @param outO output attention tensor [numHeads, headDim] resident on {@code rank}
+     * @param outStats output online-softmax statistics tensor [numHeads * 2] resident on {@code rank}
+     * @param numHeads number of query attention heads
+     * @param numKvHeads number of key/value attention heads (where {@code numHeads % numKvHeads == 0})
+     * @param headDim dimension of each head
+     * @param localTokens number of tokens in the local KV cache shard
+     * @param scale query scaling factor (typically {@code 1.0f / Math.sqrt(headDim)})
+     * @throws NullPointerException if any buffer is null
+     * @throws IllegalArgumentException if dimensions are non-positive, head ratios are invalid, or buffers are insufficient
+     * @throws IllegalStateException if the collective is closed
+     */
+    public void splitKvAttention(int rank, CollectiveBuffer q, CollectiveBuffer kCache, CollectiveBuffer vCache,
+                                 CollectiveBuffer outO, CollectiveBuffer outStats,
+                                 int numHeads, int numKvHeads, int headDim, int localTokens, float scale) {
+        ensureOpen();
+        checkRank(rank);
+        Objects.requireNonNull(q, "q buffer must not be null");
+        Objects.requireNonNull(kCache, "kCache buffer must not be null");
+        Objects.requireNonNull(vCache, "vCache buffer must not be null");
+        Objects.requireNonNull(outO, "outO buffer must not be null");
+        Objects.requireNonNull(outStats, "outStats buffer must not be null");
+
+        q.ensureOpen();
+        kCache.ensureOpen();
+        vCache.ensureOpen();
+        outO.ensureOpen();
+        outStats.ensureOpen();
+
+        if (q.collective() != this || kCache.collective() != this || vCache.collective() != this
+                || outO.collective() != this || outStats.collective() != this) {
+            throw new IllegalArgumentException("all buffers must belong to this collective");
+        }
+        if (q.rank() != rank || kCache.rank() != rank || vCache.rank() != rank
+                || outO.rank() != rank || outStats.rank() != rank) {
+            throw new IllegalArgumentException("all buffers must reside on target rank " + rank);
+        }
+        if (numHeads <= 0 || numKvHeads <= 0 || headDim <= 0 || localTokens < 0) {
+            throw new IllegalArgumentException("invalid attention dimensions: numHeads=" + numHeads
+                    + ", numKvHeads=" + numKvHeads + ", headDim=" + headDim + ", localTokens=" + localTokens);
+        }
+        if (numHeads % numKvHeads != 0) {
+            throw new IllegalArgumentException("numHeads (" + numHeads + ") must be divisible by numKvHeads (" + numKvHeads + ")");
+        }
+
+        if (q.elements() < (long) numHeads * headDim) {
+            throw new IllegalArgumentException("buffer q too small: " + q.elements() + " < " + ((long) numHeads * headDim));
+        }
+        long kvElements = (long) numKvHeads * localTokens * headDim;
+        if (kCache.elements() < kvElements) {
+            throw new IllegalArgumentException("buffer kCache too small: " + kCache.elements() + " < " + kvElements);
+        }
+        if (vCache.elements() < kvElements) {
+            throw new IllegalArgumentException("buffer vCache too small: " + vCache.elements() + " < " + kvElements);
+        }
+        if (outO.elements() < (long) numHeads * headDim) {
+            throw new IllegalArgumentException("buffer outO too small: " + outO.elements() + " < " + ((long) numHeads * headDim));
+        }
+        if (outStats.elements() < (long) numHeads * 2) {
+            throw new IllegalArgumentException("buffer outStats too small: " + outStats.elements() + " < " + ((long) numHeads * 2));
+        }
+
+        int scaleBits = Float.floatToRawIntBits(scale);
+        NativeEngine.splitKvAttn(handle, rank, q.handleUnsafe(), kCache.handleUnsafe(), vCache.handleUnsafe(),
+                outO.handleUnsafe(), outStats.handleUnsafe(), numHeads, numKvHeads, headDim, localTokens, scaleBits);
     }
 
     @Override

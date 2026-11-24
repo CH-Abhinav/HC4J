@@ -10,26 +10,12 @@ use crate::collective::vulkan::topology::TopoGraph;
 use crate::collective::vulkan::transport::transfer_route;
 use crate::error::{Hc4jError, Hc4jResult};
 
-/// Balanced chunk partitioning for arbitrary lengths and rank counts.
-///
-/// Divides `total` elements across `ranks` into balanced, non-overlapping contiguous slices.
-/// The first `total % ranks` chunks have length `total / ranks + 1`, and the remaining chunks
-/// have length `total / ranks`.
-pub(crate) fn chunk_range(total: usize, ranks: usize, chunk_idx: usize) -> (usize, usize) {
-    if ranks == 0 || chunk_idx >= ranks {
-        return (0, 0);
-    }
-    let base = total / ranks;
-    let rem = total % ranks;
-    let len = base + usize::from(chunk_idx < rem);
-    let start = chunk_idx * base + chunk_idx.min(rem);
-    (start, len)
-}
+pub(crate) use crate::collective::planner::chunk_range;
 
 /// Executes an ordered Ring AllReduce (sum) across participating ranks in `order`.
 pub(crate) fn ring_allreduce_ordered(
     nodes: &[GpuNode],
-    pipelines: &mut [ReducePipeline],
+    pipelines: &mut [Option<&mut ReducePipeline>],
     graph: &TopoGraph,
     user_buffers: &[vk::Buffer],
     total_elements: usize,
@@ -44,7 +30,7 @@ pub(crate) fn ring_allreduce_ordered(
     let max_chunk_bytes = (max_chunk_len * 4) as vk::DeviceSize;
 
     for &rank in order {
-        pipelines[rank].ensure_scratch(&nodes[rank], max_chunk_bytes)?;
+        pipelines[rank].as_deref_mut().unwrap().ensure_scratch(&nodes[rank], max_chunk_bytes)?;
     }
 
     // ═══ Phase 1: Scatter-Reduce (k_len − 1 rounds) ══════════════════════════
@@ -62,8 +48,8 @@ pub(crate) fn ring_allreduce_ordered(
             let chunk_bytes = (chunk_len * 4) as vk::DeviceSize;
             let chunk_offset_bytes = (chunk_start * 4) as vk::DeviceSize;
 
-            let send_buf = pipelines[i].send_chunk_buf.as_ref().unwrap().buffer;
-            let recv_buf = pipelines[next].recv_chunk_buf.as_ref().unwrap().buffer;
+            let send_buf = pipelines[i].as_deref().unwrap().send_chunk_buf.as_ref().unwrap().buffer;
+            let recv_buf = pipelines[next].as_deref().unwrap().recv_chunk_buf.as_ref().unwrap().buffer;
 
             // GPU i: copy slice from user buffer -> send_chunk_buf
             one_shot_submit(&nodes[i], |cb| unsafe {
@@ -89,7 +75,7 @@ pub(crate) fn ring_allreduce_ordered(
             )?;
 
             // GPU next: accumulate recv_chunk_buf into user_buffers[next] at chunk_offset_bytes
-            pipelines[next].dispatch_reduce(
+            pipelines[next].as_deref().unwrap().dispatch_reduce(
                 &nodes[next],
                 user_buffers[next],
                 chunk_offset_bytes,
@@ -114,8 +100,8 @@ pub(crate) fn ring_allreduce_ordered(
             let chunk_bytes = (chunk_len * 4) as vk::DeviceSize;
             let chunk_offset_bytes = (chunk_start * 4) as vk::DeviceSize;
 
-            let send_buf = pipelines[i].send_chunk_buf.as_ref().unwrap().buffer;
-            let recv_buf = pipelines[next].recv_chunk_buf.as_ref().unwrap().buffer;
+            let send_buf = pipelines[i].as_deref().unwrap().send_chunk_buf.as_ref().unwrap().buffer;
+            let recv_buf = pipelines[next].as_deref().unwrap().recv_chunk_buf.as_ref().unwrap().buffer;
 
             // GPU i: copy fully reduced slice from user buffer -> send_chunk_buf
             one_shot_submit(&nodes[i], |cb| unsafe {
@@ -161,7 +147,7 @@ pub(crate) fn ring_allreduce_ordered(
 /// Phase 3: Intra-Island Broadcast from Leader
 pub(crate) fn hierarchical_allreduce(
     nodes: &[GpuNode],
-    pipelines: &mut [ReducePipeline],
+    pipelines: &mut [Option<&mut ReducePipeline>],
     graph: &TopoGraph,
     user_buffers: &[vk::Buffer],
     total_elements: usize,
@@ -177,8 +163,8 @@ pub(crate) fn hierarchical_allreduce(
     for isl in islands {
         if isl.members.len() > 1 {
             let leader = isl.leader_rank as usize;
-            pipelines[leader].ensure_scratch(&nodes[leader], total_bytes)?;
-            let leader_recv_buf = pipelines[leader].recv_chunk_buf.as_ref().unwrap().buffer;
+            pipelines[leader].as_deref_mut().unwrap().ensure_scratch(&nodes[leader], total_bytes)?;
+            let leader_recv_buf = pipelines[leader].as_deref().unwrap().recv_chunk_buf.as_ref().unwrap().buffer;
 
             for &m in &isl.members {
                 let member = m as usize;
@@ -196,7 +182,7 @@ pub(crate) fn hierarchical_allreduce(
                     0,
                     total_bytes,
                 )?;
-                pipelines[leader].dispatch_reduce(
+                pipelines[leader].as_deref().unwrap().dispatch_reduce(
                     &nodes[leader],
                     user_buffers[leader],
                     0,
@@ -279,7 +265,7 @@ pub(crate) fn hierarchical_allreduce(
 /// (auto, ring, or hierarchical) based on `HC4J_COLLECTIVE_ALGO`.
 pub(crate) fn execute_allreduce(
     nodes: &[GpuNode],
-    pipelines: &mut [ReducePipeline],
+    pipelines: &mut [Option<&mut ReducePipeline>],
     graph: &TopoGraph,
     user_buffers: &[vk::Buffer],
     total_elements: usize,

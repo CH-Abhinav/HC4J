@@ -18,7 +18,9 @@ package hc4j.collective;
 
 import hc4j.internal.ffi.NativeCleaner;
 import hc4j.internal.ffi.NativeEngine;
+import java.lang.foreign.MemorySegment;
 import java.lang.ref.Cleaner;
+import java.util.Objects;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
@@ -96,12 +98,59 @@ public final class CollectiveBuffer implements AutoCloseable {
         collective.writeBuffer(handle, data);
     }
 
+    /**
+     * Writes elements from a Panama {@link MemorySegment} into this collective buffer.
+     * <p>
+     * If the source segment is native off-heap memory, this transfer is performed with zero
+     * JVM heap allocation.
+     *
+     * @param source source memory segment containing at least {@code elements() * 4L} bytes
+     * @throws NullPointerException if {@code source} is null
+     * @throws IllegalStateException if this buffer or its collective is closed
+     * @throws IllegalArgumentException if {@code source.byteSize() < elements() * 4L}
+     */
+    public void write(MemorySegment source) {
+        Objects.requireNonNull(source, "source MemorySegment must not be null");
+        ensureOpen();
+        long requiredBytes = elements * 4L;
+        if (source.byteSize() < requiredBytes) {
+            throw new IllegalArgumentException(
+                    "source byteSize must be at least " + requiredBytes + ", got " + source.byteSize());
+        }
+        NativeEngine.writeCollectiveBufferSegment(collective.handle(), handle, source, elements);
+    }
+
     public float[] read() {
         ensureOpen();
         if (elements > Integer.MAX_VALUE) {
             throw new IllegalStateException("buffer is larger than a Java array can hold");
         }
         return collective.readBuffer(handle, elements);
+    }
+
+    /**
+     * Reads elements from this collective buffer into a Panama {@link MemorySegment}.
+     * <p>
+     * If the destination segment is native off-heap memory, this readback is performed with
+     * zero JVM heap allocation.
+     *
+     * @param destination destination memory segment with at least {@code elements() * 4L} bytes
+     * @throws NullPointerException if {@code destination} is null
+     * @throws IllegalStateException if this buffer or its collective is closed
+     * @throws IllegalArgumentException if {@code destination.byteSize() < elements() * 4L} or if destination is read-only
+     */
+    public void read(MemorySegment destination) {
+        Objects.requireNonNull(destination, "destination MemorySegment must not be null");
+        if (destination.isReadOnly()) {
+            throw new IllegalArgumentException("destination MemorySegment must not be read-only");
+        }
+        ensureOpen();
+        long requiredBytes = elements * 4L;
+        if (destination.byteSize() < requiredBytes) {
+            throw new IllegalArgumentException(
+                    "destination byteSize must be at least " + requiredBytes + ", got " + destination.byteSize());
+        }
+        NativeEngine.readCollectiveBufferSegment(collective.handle(), handle, destination, elements);
     }
 
     @Override

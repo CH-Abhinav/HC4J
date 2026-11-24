@@ -53,6 +53,7 @@ pub(crate) struct ExtSupport {
 }
 
 /// Holds a VkBuffer + its backing VkDeviceMemory and memory allocation size.
+#[derive(Clone, Copy)]
 pub(crate) struct BufMem {
     pub buffer: vk::Buffer,
     pub memory: vk::DeviceMemory,

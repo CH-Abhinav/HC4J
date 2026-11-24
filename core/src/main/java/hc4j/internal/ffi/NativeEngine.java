@@ -86,6 +86,9 @@ public final class NativeEngine {
     private static MethodHandle collRingOrderHandle;
     private static MethodHandle collIslandCountHandle;
     private static MethodHandle collIslandHandle;
+    private static MethodHandle collAllReduceSubsetHandle;
+    private static MethodHandle collGemmBiasActHandle;
+    private static MethodHandle collSplitKvAttnHandle;
 
     private NativeEngine() {
         throw new AssertionError("No instances of NativeEngine");
@@ -249,6 +252,19 @@ public final class NativeEngine {
 
         collIslandHandle = linker.downcallHandle(lookup.find("hc4j_collective_island").orElseThrow(),
                 FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.JAVA_LONG, ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.JAVA_INT));
+
+        collAllReduceSubsetHandle = linker.downcallHandle(lookup.find("hc4j_collective_allreduce_sum_subset").orElseThrow(),
+                FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.JAVA_LONG, ValueLayout.ADDRESS, ValueLayout.JAVA_INT));
+
+        collGemmBiasActHandle = linker.downcallHandle(lookup.find("hc4j_collective_gemm_bias_act").orElseThrow(),
+                FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.JAVA_LONG, ValueLayout.JAVA_INT,
+                        ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG,
+                        ValueLayout.JAVA_INT, ValueLayout.JAVA_INT, ValueLayout.JAVA_INT, ValueLayout.JAVA_INT));
+
+        collSplitKvAttnHandle = linker.downcallHandle(lookup.find("hc4j_collective_split_kv_attn").orElseThrow(),
+                FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.JAVA_LONG, ValueLayout.JAVA_INT,
+                        ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG,
+                        ValueLayout.JAVA_INT, ValueLayout.JAVA_INT, ValueLayout.JAVA_INT, ValueLayout.JAVA_INT, ValueLayout.JAVA_INT));
     }
 
     public static void checkStatus(int statusCode, String context) {
@@ -736,6 +752,89 @@ public final class NativeEngine {
         } catch (Throwable t) {
             if (t instanceof RuntimeException re) throw re;
             throw new RuntimeException("HC4J collective island query failed", t);
+        }
+    }
+
+    public static void writeCollectiveBufferSegment(long handle, long buffer, MemorySegment data, long elements) {
+        ensureInitialized();
+        if (data.isNative()) {
+            try {
+                int status = (int) collWriteHandle.invokeExact(handle, buffer, data, elements);
+                checkStatus(status, "CollectiveBuffer.write");
+            } catch (Throwable t) {
+                if (t instanceof RuntimeException re) throw re;
+                throw new RuntimeException("HC4J collective write failed", t);
+            }
+        } else {
+            long bytes = elements * 4L;
+            try (Arena arena = Arena.ofConfined()) {
+                MemorySegment nativeBuf = arena.allocate(bytes, 16);
+                MemorySegment.copy(data, 0, nativeBuf, 0, bytes);
+                int status = (int) collWriteHandle.invokeExact(handle, buffer, nativeBuf, elements);
+                checkStatus(status, "CollectiveBuffer.write");
+            } catch (Throwable t) {
+                if (t instanceof RuntimeException re) throw re;
+                throw new RuntimeException("HC4J collective write failed", t);
+            }
+        }
+    }
+
+    public static void readCollectiveBufferSegment(long handle, long buffer, MemorySegment destination, long elements) {
+        ensureInitialized();
+        if (destination.isNative()) {
+            try {
+                int status = (int) collReadHandle.invokeExact(handle, buffer, destination, elements);
+                checkStatus(status, "CollectiveBuffer.read");
+            } catch (Throwable t) {
+                if (t instanceof RuntimeException re) throw re;
+                throw new RuntimeException("HC4J collective read failed", t);
+            }
+        } else {
+            long bytes = elements * 4L;
+            try (Arena arena = Arena.ofConfined()) {
+                MemorySegment nativeBuf = arena.allocate(bytes, 16);
+                int status = (int) collReadHandle.invokeExact(handle, buffer, nativeBuf, elements);
+                checkStatus(status, "CollectiveBuffer.read");
+                MemorySegment.copy(nativeBuf, 0, destination, 0, bytes);
+            } catch (Throwable t) {
+                if (t instanceof RuntimeException re) throw re;
+                throw new RuntimeException("HC4J collective read failed", t);
+            }
+        }
+    }
+
+    public static void allReduceSumSubset(long handle, MemorySegment buffers, int count) {
+        ensureInitialized();
+        try {
+            int status = (int) collAllReduceSubsetHandle.invokeExact(handle, buffers, count);
+            checkStatus(status, "Collective.allReduceSumSubset");
+        } catch (Throwable t) {
+            if (t instanceof RuntimeException re) throw re;
+            throw new RuntimeException("HC4J collective allReduceSumSubset failed", t);
+        }
+    }
+
+    public static void gemmBiasAct(long handle, int rank, long bufA, long bufB, long bufBias, long bufC, int m, int n, int k, int flags) {
+        ensureInitialized();
+        try {
+            int status = (int) collGemmBiasActHandle.invokeExact(handle, rank, bufA, bufB, bufBias, bufC, m, n, k, flags);
+            checkStatus(status, "Collective.gemmBiasAct");
+        } catch (Throwable t) {
+            if (t instanceof RuntimeException re) throw re;
+            throw new RuntimeException("HC4J collective gemmBiasAct failed", t);
+        }
+    }
+
+    public static void splitKvAttn(long handle, int rank, long bufQ, long bufK, long bufV, long bufOutO, long bufOutStats,
+                                   int numHeads, int numKvHeads, int headDim, int localTokens, int scaleBits) {
+        ensureInitialized();
+        try {
+            int status = (int) collSplitKvAttnHandle.invokeExact(handle, rank, bufQ, bufK, bufV, bufOutO, bufOutStats,
+                    numHeads, numKvHeads, headDim, localTokens, scaleBits);
+            checkStatus(status, "Collective.splitKvAttention");
+        } catch (Throwable t) {
+            if (t instanceof RuntimeException re) throw re;
+            throw new RuntimeException("HC4J collective splitKvAttention failed", t);
         }
     }
 }

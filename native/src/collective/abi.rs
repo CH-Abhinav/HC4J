@@ -191,6 +191,85 @@ pub unsafe extern "C" fn hc4j_collective_allreduce_sum(handle: u64, ptr_buffers:
     })
 }
 
+/// Reduces `buffers` in place by element-wise sum across the specified active ranks.
+/// If `count == 1`, it is a valid zero-cost no-op.
+///
+/// # Safety
+/// `ptr_buffers` must point to `count` readable `u64` buffer IDs.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn hc4j_collective_allreduce_sum_subset(
+    handle: u64,
+    ptr_buffers: *const u64,
+    count: u32,
+) -> i32 {
+    error::ffi_guard("hc4j_collective_allreduce_sum_subset", || {
+        if ptr_buffers.is_null() && count > 0 {
+            return Err(Hc4jError::InvalidParam("null buffers pointer"));
+        }
+        let slice = unsafe { std::slice::from_raw_parts(ptr_buffers, count as usize) };
+        super::with_backend(handle, |b| b.allreduce_sum_subset(slice))
+    })
+}
+
+/// Computes C = act(A * B + bias) on the given rank.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn hc4j_collective_gemm_bias_act(
+    handle: u64,
+    rank: u32,
+    buf_a: u64,
+    buf_b: u64,
+    buf_bias: u64,
+    buf_c: u64,
+    m: u32,
+    n: u32,
+    k: u32,
+    flags: u32,
+) -> i32 {
+    error::ffi_guard("hc4j_collective_gemm_bias_act", || {
+        super::with_backend(handle, |b| {
+            b.gemm_bias_act(rank as usize, buf_a, buf_b, buf_bias, buf_c, m, n, k, flags)
+        })
+    })
+}
+
+/// Computes local Decode Attention for one query token against a local shard of KV pairs.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn hc4j_collective_split_kv_attn(
+    handle: u64,
+    rank: u32,
+    buf_q: u64,
+    buf_k: u64,
+    buf_v: u64,
+    buf_out_o: u64,
+    buf_out_stats: u64,
+    num_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    local_tokens: u32,
+    scale_bits: u32,
+) -> i32 {
+    error::ffi_guard("hc4j_collective_split_kv_attn", || {
+        let scale = f32::from_bits(scale_bits);
+        super::with_backend(handle, |b| {
+            b.split_kv_attn(
+                rank as usize,
+                buf_q,
+                buf_k,
+                buf_v,
+                buf_out_o,
+                buf_out_stats,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                local_tokens,
+                scale,
+            )
+        })
+    })
+}
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct IslandHeaderC {
