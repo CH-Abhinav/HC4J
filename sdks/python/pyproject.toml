@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hc4py"
+version = "0.1.0"
+description = "Thin, zero-logic Python SDK over hc4x-ffi GPU engine and Exact Theorems 1-4 collective optimizer"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Abhinav Chinnala", email = "chinnala.abhinav5@gmail.com" }]
+requires-python = ">=3.11"
+dependencies = []
+classifiers = [
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+[project.optional-dependencies]
+numpy = ["numpy>=1.24"]
+
+[tool.setuptools.packages.find]
+include = ["hc4py*"]

@@ -24,12 +24,17 @@ import hc4j.internal.ffi.VramHandle;
 import hc4j.internal.layout.Dims;
 import hc4j.internal.layout.Rows;
 import hc4j.internal.layout.ValidUtil;
-import hc4j.internal.ops.ArithmeticOps;
-import hc4j.internal.ops.ExponentialOps;
-import hc4j.internal.ops.MathOps;
-import hc4j.internal.ops.MatmulOps;
-import hc4j.internal.ops.NnOps;
-import hc4j.internal.ops.TrigOps;
+import hc4j.internal.linalg.BatchedMatmulOps;
+import hc4j.internal.linalg.MatmulOps;
+import hc4j.internal.math.ArithmeticOps;
+import hc4j.internal.math.CastOps;
+import hc4j.internal.math.CompareMaskOps;
+import hc4j.internal.math.ExponentialOps;
+import hc4j.internal.math.TrigOps;
+import hc4j.internal.math.UnaryMathOps;
+import hc4j.internal.nn.ActivationOps;
+import hc4j.internal.nn.NormAndSoftmaxOps;
+import hc4j.internal.nn.ReduceOps;
 import hc4j.linalg.Linalg;
 import hc4j.nn.Activation;
 import hc4j.nn.Nn;
@@ -1524,8 +1529,8 @@ public class Tensor implements AutoCloseable {
     public Tensor abs(Tensor res) {
         ensureOpen();
         return dtype == DType.f32
-                ? MathOps.applyUnaryF32(0, "abs", this, res)
-                : MathOps.applyUnaryI32(0, "abs", this, res, 0, 0);
+                ? UnaryMathOps.applyUnaryF32(0, "abs", this, res)
+                : UnaryMathOps.applyUnaryI32(0, "abs", this, res, 0, 0);
     }
 
     /**
@@ -1564,8 +1569,8 @@ public class Tensor implements AutoCloseable {
     public Tensor neg(Tensor res) {
         ensureOpen();
         return dtype == DType.f32
-                ? MathOps.applyUnaryF32(1, "neg", this, res)
-                : MathOps.applyUnaryI32(1, "neg", this, res, 0, 0);
+                ? UnaryMathOps.applyUnaryF32(1, "neg", this, res)
+                : UnaryMathOps.applyUnaryI32(1, "neg", this, res, 0, 0);
     }
 
     /**
@@ -1605,7 +1610,7 @@ public class Tensor implements AutoCloseable {
     public Tensor rsqrt(Tensor res) {
         ensureOpen();
         ValidUtil.requireOperandF32("rsqrt", dtype);
-        return MathOps.applyUnaryF32(2, "rsqrt", this, res);
+        return UnaryMathOps.applyUnaryF32(2, "rsqrt", this, res);
     }
 
     /**
@@ -1634,7 +1639,7 @@ public class Tensor implements AutoCloseable {
     public Tensor floor(Tensor res) {
         ensureOpen();
         ValidUtil.requireOperandF32("floor", dtype);
-        return MathOps.applyUnaryF32(3, "floor", this, res);
+        return UnaryMathOps.applyUnaryF32(3, "floor", this, res);
     }
 
     /**
@@ -1663,7 +1668,7 @@ public class Tensor implements AutoCloseable {
     public Tensor ceil(Tensor res) {
         ensureOpen();
         ValidUtil.requireOperandF32("ceil", dtype);
-        return MathOps.applyUnaryF32(4, "ceil", this, res);
+        return UnaryMathOps.applyUnaryF32(4, "ceil", this, res);
     }
 
     /**
@@ -1692,7 +1697,7 @@ public class Tensor implements AutoCloseable {
     public Tensor round(Tensor res) {
         ensureOpen();
         ValidUtil.requireOperandF32("round", dtype);
-        return MathOps.applyUnaryF32(5, "round", this, res);
+        return UnaryMathOps.applyUnaryF32(5, "round", this, res);
     }
 
     /**
@@ -1720,8 +1725,8 @@ public class Tensor implements AutoCloseable {
     public Tensor sign(Tensor res) {
         ensureOpen();
         return dtype == DType.f32
-                ? MathOps.applyUnaryF32(6, "sign", this, res)
-                : MathOps.applyUnaryI32(2, "sign", this, res, 0, 0);
+                ? UnaryMathOps.applyUnaryF32(6, "sign", this, res)
+                : UnaryMathOps.applyUnaryI32(2, "sign", this, res, 0, 0);
     }
 
     /**
@@ -1765,7 +1770,7 @@ public class Tensor implements AutoCloseable {
     public Tensor clamp(float min, float max, Tensor res) {
         ensureOpen();
         ValidUtil.requireOperandF32("clamp", dtype);
-        return MathOps.clampF32(this, min, max, res);
+        return UnaryMathOps.clampF32(this, min, max, res);
     }
 
     /**
@@ -1815,7 +1820,7 @@ public class Tensor implements AutoCloseable {
         if (dtype != DType.i32) {
             throw new IllegalArgumentException("clamp(int, int) requires an i32 tensor, got " + dtype);
         }
-        return MathOps.applyUnaryI32(3, "clamp", this, res, min, max);
+        return UnaryMathOps.applyUnaryI32(3, "clamp", this, res, min, max);
     }
 
     /**
@@ -1919,7 +1924,7 @@ public class Tensor implements AutoCloseable {
      */
     public Tensor pow(Tensor other, Tensor res) {
         ensureOpen();
-        return MathOps.pow(this, other, res);
+        return CompareMaskOps.pow(this, other, res);
     }
 
     /**
@@ -1961,7 +1966,7 @@ public class Tensor implements AutoCloseable {
      */
     public Tensor maximum(Tensor other, Tensor res) {
         ensureOpen();
-        return MathOps.maxMin(true, this, other, res);
+        return CompareMaskOps.maxMin(true, this, other, res);
     }
 
     /**
@@ -2015,7 +2020,7 @@ public class Tensor implements AutoCloseable {
      */
     public Tensor minimum(Tensor other, Tensor res) {
         ensureOpen();
-        return MathOps.maxMin(false, this, other, res);
+        return CompareMaskOps.maxMin(false, this, other, res);
     }
 
     /**
@@ -2051,7 +2056,7 @@ public class Tensor implements AutoCloseable {
         int[] outShape = ValidUtil.broadcastShape(shape, other.getShape());
         Tensor res = empty(DType.i32, outShape);
         try {
-            return MathOps.compare(cmpOp, opName, this, other, res);
+            return CompareMaskOps.compare(cmpOp, opName, this, other, res);
         } catch (RuntimeException | Error e) {
             res.close();
             throw e;
@@ -2073,7 +2078,7 @@ public class Tensor implements AutoCloseable {
      * @param res destination i32 tensor
      * @return {@code res}
      */
-    public Tensor eq(Tensor other, Tensor res) { ensureOpen(); return MathOps.compare(0, "eq", this, other, res); }
+    public Tensor eq(Tensor other, Tensor res) { ensureOpen(); return CompareMaskOps.compare(0, "eq", this, other, res); }
 
     /**
      * Elementwise equal-to comparison with float scalar.
@@ -2110,7 +2115,7 @@ public class Tensor implements AutoCloseable {
      * @param res destination i32 tensor
      * @return {@code res}
      */
-    public Tensor ne(Tensor other, Tensor res) { ensureOpen(); return MathOps.compare(1, "ne", this, other, res); }
+    public Tensor ne(Tensor other, Tensor res) { ensureOpen(); return CompareMaskOps.compare(1, "ne", this, other, res); }
 
     /**
      * Elementwise not-equal comparison with float scalar.
@@ -2147,7 +2152,7 @@ public class Tensor implements AutoCloseable {
      * @param res destination i32 tensor
      * @return {@code res}
      */
-    public Tensor gt(Tensor other, Tensor res) { ensureOpen(); return MathOps.compare(2, "gt", this, other, res); }
+    public Tensor gt(Tensor other, Tensor res) { ensureOpen(); return CompareMaskOps.compare(2, "gt", this, other, res); }
 
     /**
      * Elementwise greater-than comparison with float scalar.
@@ -2184,7 +2189,7 @@ public class Tensor implements AutoCloseable {
      * @param res destination i32 tensor
      * @return {@code res}
      */
-    public Tensor ge(Tensor other, Tensor res) { ensureOpen(); return MathOps.compare(3, "ge", this, other, res); }
+    public Tensor ge(Tensor other, Tensor res) { ensureOpen(); return CompareMaskOps.compare(3, "ge", this, other, res); }
 
     /**
      * Elementwise greater-or-equal comparison with float scalar.
@@ -2221,7 +2226,7 @@ public class Tensor implements AutoCloseable {
      * @param res destination i32 tensor
      * @return {@code res}
      */
-    public Tensor lt(Tensor other, Tensor res) { ensureOpen(); return MathOps.compare(4, "lt", this, other, res); }
+    public Tensor lt(Tensor other, Tensor res) { ensureOpen(); return CompareMaskOps.compare(4, "lt", this, other, res); }
 
     /**
      * Elementwise less-than comparison with float scalar.
@@ -2258,7 +2263,7 @@ public class Tensor implements AutoCloseable {
      * @param res destination i32 tensor
      * @return {@code res}
      */
-    public Tensor le(Tensor other, Tensor res) { ensureOpen(); return MathOps.compare(5, "le", this, other, res); }
+    public Tensor le(Tensor other, Tensor res) { ensureOpen(); return CompareMaskOps.compare(5, "le", this, other, res); }
 
     /**
      * Elementwise less-or-equal comparison with float scalar.
@@ -2313,7 +2318,7 @@ public class Tensor implements AutoCloseable {
      */
     public Tensor where(Tensor x, Tensor y, Tensor res) {
         ensureOpen();
-        return MathOps.where(this, x, y, res);
+        return CompareMaskOps.where(this, x, y, res);
     }
 
     /**
@@ -2400,7 +2405,7 @@ public class Tensor implements AutoCloseable {
         }
         Tensor res = empty(targetDType, shape.clone());
         try {
-            return MathOps.cast(this, targetDType, res);
+            return CastOps.cast(this, targetDType, res);
         } catch (RuntimeException | Error e) {
             res.close();
             throw e;
@@ -2452,7 +2457,7 @@ public class Tensor implements AutoCloseable {
         if (this.dim() <= 2 && other.dim() <= 2) {
             return MatmulOps.matmul(this, other, res, false, false);
         } else {
-            return MatmulOps.batchedMatmul(this, other, res, false, false);
+            return BatchedMatmulOps.batchedMatmul(this, other, res, false, false);
         }
     }
 
@@ -2509,20 +2514,20 @@ public class Tensor implements AutoCloseable {
     public Tensor leakyRelu(float slope) { return activation(Activation.LEAKY_RELU, slope); }
     public Tensor elu(float alpha) { return activation(Activation.ELU, alpha); }
 
-    public Tensor relu(Tensor res) { ensureOpen(); return NnOps.activation(Activation.RELU, this, res, 0f); }
-    public Tensor gelu(Tensor res) { ensureOpen(); return NnOps.activation(Activation.GELU, this, res, 0f); }
-    public Tensor silu(Tensor res) { ensureOpen(); return NnOps.activation(Activation.SILU, this, res, 0f); }
-    public Tensor sigmoid(Tensor res) { ensureOpen(); return NnOps.activation(Activation.SIGMOID, this, res, 0f); }
-    public Tensor softplus(Tensor res) { ensureOpen(); return NnOps.activation(Activation.SOFTPLUS, this, res, 0f); }
-    public Tensor leakyRelu(float slope, Tensor res) { ensureOpen(); return NnOps.activation(Activation.LEAKY_RELU, this, res, slope); }
-    public Tensor elu(float alpha, Tensor res) { ensureOpen(); return NnOps.activation(Activation.ELU, this, res, alpha); }
+    public Tensor relu(Tensor res) { ensureOpen(); return ActivationOps.activation(Activation.RELU, this, res, 0f); }
+    public Tensor gelu(Tensor res) { ensureOpen(); return ActivationOps.activation(Activation.GELU, this, res, 0f); }
+    public Tensor silu(Tensor res) { ensureOpen(); return ActivationOps.activation(Activation.SILU, this, res, 0f); }
+    public Tensor sigmoid(Tensor res) { ensureOpen(); return ActivationOps.activation(Activation.SIGMOID, this, res, 0f); }
+    public Tensor softplus(Tensor res) { ensureOpen(); return ActivationOps.activation(Activation.SOFTPLUS, this, res, 0f); }
+    public Tensor leakyRelu(float slope, Tensor res) { ensureOpen(); return ActivationOps.activation(Activation.LEAKY_RELU, this, res, slope); }
+    public Tensor elu(float alpha, Tensor res) { ensureOpen(); return ActivationOps.activation(Activation.ELU, this, res, alpha); }
 
     private Tensor activation(Activation act, float alpha) {
         ensureOpen();
         ValidUtil.requireOperandF32(act.name(), dtype);
         Tensor res = empty(dtype, shape);
         try {
-            return NnOps.activation(act, this, res, alpha);
+            return ActivationOps.activation(act, this, res, alpha);
         } catch (RuntimeException | Error e) {
             res.close();
             throw e;
@@ -2538,7 +2543,7 @@ public class Tensor implements AutoCloseable {
     public float sumSquares() {
         ensureOpen();
         try (Tensor r = empty(DType.f32, 1)) {
-            NnOps.reduceSquare(Reduction.SUM, this, r);
+            ReduceOps.reduceSquare(Reduction.SUM, this, r);
             return r.toFloatArray()[0];
         }
     }
@@ -2546,20 +2551,20 @@ public class Tensor implements AutoCloseable {
     public float mse(Tensor target) {
         ensureOpen();
         try (Tensor r = empty(DType.f32, 1)) {
-            NnOps.reduceDiffSquared(Reduction.MEAN, this, target, r);
+            ReduceOps.reduceDiffSquared(Reduction.MEAN, this, target, r);
             return r.toFloatArray()[0];
         }
     }
 
-    public Tensor sum(Tensor res) { ensureOpen(); return NnOps.reduce(Reduction.SUM, this, res); }
-    public Tensor mean(Tensor res) { ensureOpen(); return NnOps.reduce(Reduction.MEAN, this, res); }
-    public Tensor maxValue(Tensor res) { ensureOpen(); return NnOps.reduce(Reduction.MAX, this, res); }
-    public Tensor minValue(Tensor res) { ensureOpen(); return NnOps.reduce(Reduction.MIN, this, res); }
+    public Tensor sum(Tensor res) { ensureOpen(); return ReduceOps.reduce(Reduction.SUM, this, res); }
+    public Tensor mean(Tensor res) { ensureOpen(); return ReduceOps.reduce(Reduction.MEAN, this, res); }
+    public Tensor maxValue(Tensor res) { ensureOpen(); return ReduceOps.reduce(Reduction.MAX, this, res); }
+    public Tensor minValue(Tensor res) { ensureOpen(); return ReduceOps.reduce(Reduction.MIN, this, res); }
 
     private float reduceToScalar(Reduction op) {
         ensureOpen();
         try (Tensor r = empty(DType.f32, 1)) {
-            NnOps.reduce(op, this, r);
+            ReduceOps.reduce(op, this, r);
             return r.toFloatArray()[0];
         }
     }
@@ -2569,23 +2574,23 @@ public class Tensor implements AutoCloseable {
     public Tensor maxRows() { return reduceRowsFresh(Reduction.MAX); }
     public Tensor minRows() { return reduceRowsFresh(Reduction.MIN); }
 
-    public Tensor sumRows(Tensor res) { ensureOpen(); return NnOps.reduceRows(Reduction.SUM, this, res); }
-    public Tensor meanRows(Tensor res) { ensureOpen(); return NnOps.reduceRows(Reduction.MEAN, this, res); }
-    public Tensor maxRows(Tensor res) { ensureOpen(); return NnOps.reduceRows(Reduction.MAX, this, res); }
-    public Tensor minRows(Tensor res) { ensureOpen(); return NnOps.reduceRows(Reduction.MIN, this, res); }
+    public Tensor sumRows(Tensor res) { ensureOpen(); return ReduceOps.reduceRows(Reduction.SUM, this, res); }
+    public Tensor meanRows(Tensor res) { ensureOpen(); return ReduceOps.reduceRows(Reduction.MEAN, this, res); }
+    public Tensor maxRows(Tensor res) { ensureOpen(); return ReduceOps.reduceRows(Reduction.MAX, this, res); }
+    public Tensor minRows(Tensor res) { ensureOpen(); return ReduceOps.reduceRows(Reduction.MIN, this, res); }
 
     public Tensor argmaxRows() { return argRowsFresh(true); }
     public Tensor argminRows() { return argRowsFresh(false); }
 
-    public Tensor argmaxRows(Tensor res) { ensureOpen(); return NnOps.argmaxRows(this, res, true); }
-    public Tensor argminRows(Tensor res) { ensureOpen(); return NnOps.argmaxRows(this, res, false); }
+    public Tensor argmaxRows(Tensor res) { ensureOpen(); return ReduceOps.argmaxRows(this, res, true); }
+    public Tensor argminRows(Tensor res) { ensureOpen(); return ReduceOps.argmaxRows(this, res, false); }
 
     private Tensor reduceRowsFresh(Reduction op) {
         ensureOpen();
         Rows r = ValidUtil.rows(shape, size);
         Tensor res = empty(DType.f32, r.reducedShape(shape));
         try {
-            return NnOps.reduceRows(op, this, res);
+            return ReduceOps.reduceRows(op, this, res);
         } catch (RuntimeException | Error e) {
             res.close();
             throw e;
@@ -2597,7 +2602,7 @@ public class Tensor implements AutoCloseable {
         Rows r = ValidUtil.rows(shape, size);
         Tensor res = empty(DType.i32, r.reducedShape(shape));
         try {
-            return NnOps.argmaxRows(this, res, largest);
+            return ReduceOps.argmaxRows(this, res, largest);
         } catch (RuntimeException | Error e) {
             res.close();
             throw e;
@@ -2641,7 +2646,7 @@ public class Tensor implements AutoCloseable {
         int[] outShape = computeReducedShape(shape, normAxis, keepDims);
         Tensor res = empty(DType.f32, outShape);
         try {
-            return MathOps.reduceAxis(this, normAxis, 0, res);
+            return ReduceOps.reduceAxis(this, normAxis, 0, res);
         } catch (RuntimeException | Error e) {
             res.close();
             throw e;
@@ -2669,7 +2674,7 @@ public class Tensor implements AutoCloseable {
         int[] outShape = computeReducedShape(shape, normAxis, keepDims);
         Tensor res = empty(DType.f32, outShape);
         try {
-            return MathOps.reduceAxis(this, normAxis, 1, res);
+            return ReduceOps.reduceAxis(this, normAxis, 1, res);
         } catch (RuntimeException | Error e) {
             res.close();
             throw e;
@@ -2697,7 +2702,7 @@ public class Tensor implements AutoCloseable {
         int[] outShape = computeReducedShape(shape, normAxis, keepDims);
         Tensor res = empty(DType.f32, outShape);
         try {
-            return MathOps.reduceAxis(this, normAxis, 2, res);
+            return ReduceOps.reduceAxis(this, normAxis, 2, res);
         } catch (RuntimeException | Error e) {
             res.close();
             throw e;
@@ -2725,7 +2730,7 @@ public class Tensor implements AutoCloseable {
         int[] outShape = computeReducedShape(shape, normAxis, keepDims);
         Tensor res = empty(DType.f32, outShape);
         try {
-            return MathOps.reduceAxis(this, normAxis, 3, res);
+            return ReduceOps.reduceAxis(this, normAxis, 3, res);
         } catch (RuntimeException | Error e) {
             res.close();
             throw e;
@@ -2753,7 +2758,7 @@ public class Tensor implements AutoCloseable {
         int[] outShape = computeReducedShape(shape, normAxis, keepDims);
         Tensor res = empty(DType.f32, outShape);
         try {
-            return MathOps.reduceAxis(this, normAxis, 4, res);
+            return ReduceOps.reduceAxis(this, normAxis, 4, res);
         } catch (RuntimeException | Error e) {
             res.close();
             throw e;
@@ -2781,7 +2786,7 @@ public class Tensor implements AutoCloseable {
         int[] outShape = computeReducedShape(shape, normAxis, keepDims);
         Tensor res = empty(DType.i32, outShape);
         try {
-            return MathOps.argmaxAxis(this, normAxis, true, res);
+            return ReduceOps.argmaxAxis(this, normAxis, true, res);
         } catch (RuntimeException | Error e) {
             res.close();
             throw e;
@@ -2809,7 +2814,7 @@ public class Tensor implements AutoCloseable {
         int[] outShape = computeReducedShape(shape, normAxis, keepDims);
         Tensor res = empty(DType.i32, outShape);
         try {
-            return MathOps.argmaxAxis(this, normAxis, false, res);
+            return ReduceOps.argmaxAxis(this, normAxis, false, res);
         } catch (RuntimeException | Error e) {
             res.close();
             throw e;
@@ -2837,7 +2842,7 @@ public class Tensor implements AutoCloseable {
      * @param res destination tensor of size 1
      * @return {@code res}
      */
-    public Tensor prod(Tensor res) { ensureOpen(); return NnOps.reduce(Reduction.PROD, this, res); }
+    public Tensor prod(Tensor res) { ensureOpen(); return ReduceOps.reduce(Reduction.PROD, this, res); }
 
     /**
      * Computes the product along the rows (axis 0 of a 2-D matrix).
@@ -2852,7 +2857,7 @@ public class Tensor implements AutoCloseable {
      * @param res destination tensor
      * @return {@code res}
      */
-    public Tensor prodRows(Tensor res) { ensureOpen(); return NnOps.reduceRows(Reduction.PROD, this, res); }
+    public Tensor prodRows(Tensor res) { ensureOpen(); return ReduceOps.reduceRows(Reduction.PROD, this, res); }
 
     /**
      * Computes the Frobenius (L2) Euclidean norm of this tensor.
@@ -2864,7 +2869,7 @@ public class Tensor implements AutoCloseable {
         ValidUtil.requireOperandF32("norm", dtype);
         Tensor res = empty(DType.f32, 1);
         try {
-            NnOps.reduceSquare(Reduction.SUM, this, res);
+            ReduceOps.reduceSquare(Reduction.SUM, this, res);
             return res.sqrt();
         } finally {
             res.close();
@@ -2944,7 +2949,7 @@ public class Tensor implements AutoCloseable {
         ensureOpen();
         try (Tensor diag = diagonal()) {
             Tensor res = empty(dtype, 1);
-            return NnOps.reduce(Reduction.SUM, diag, res);
+            return ReduceOps.reduce(Reduction.SUM, diag, res);
         }
     }
 
@@ -2961,7 +2966,7 @@ public class Tensor implements AutoCloseable {
         if (shape.length == 1 && other.getShape().length == 1) {
             try (Tensor prod = this.mul(other)) {
                 Tensor res = empty(DType.f32, 1);
-                return NnOps.reduce(Reduction.SUM, prod, res);
+                return ReduceOps.reduce(Reduction.SUM, prod, res);
             }
         }
         return this.matmul(other);
@@ -2988,15 +2993,15 @@ public class Tensor implements AutoCloseable {
     public Tensor softmax() { return softmaxFresh(false); }
     public Tensor logSoftmax() { return softmaxFresh(true); }
 
-    public Tensor softmax(Tensor res) { ensureOpen(); return NnOps.softmaxRows(this, res, false); }
-    public Tensor logSoftmax(Tensor res) { ensureOpen(); return NnOps.softmaxRows(this, res, true); }
+    public Tensor softmax(Tensor res) { ensureOpen(); return NormAndSoftmaxOps.softmaxRows(this, res, false); }
+    public Tensor logSoftmax(Tensor res) { ensureOpen(); return NormAndSoftmaxOps.softmaxRows(this, res, true); }
 
     private Tensor softmaxFresh(boolean logarithmic) {
         ensureOpen();
         ValidUtil.requireOperandF32("softmax", dtype);
         Tensor res = empty(dtype, shape);
         try {
-            return NnOps.softmaxRows(this, res, logarithmic);
+            return NormAndSoftmaxOps.softmaxRows(this, res, logarithmic);
         } catch (RuntimeException | Error e) {
             res.close();
             throw e;
@@ -3007,7 +3012,7 @@ public class Tensor implements AutoCloseable {
     public Tensor layerNorm(Tensor gamma, Tensor beta, float eps) { return layerNormFresh(gamma, beta, eps); }
     public Tensor layerNorm(Tensor gamma, Tensor beta, float eps, Tensor res) {
         ensureOpen();
-        return NnOps.layerNormRows(this, gamma, beta, res, eps);
+        return NormAndSoftmaxOps.layerNormRows(this, gamma, beta, res, eps);
     }
 
     public Tensor rmsNorm(Tensor gamma, float eps) {
@@ -3015,7 +3020,7 @@ public class Tensor implements AutoCloseable {
         ValidUtil.requireOperandF32("rmsNorm", dtype);
         Tensor res = empty(dtype, shape);
         try {
-            return NnOps.rmsNormRows(this, gamma, res, eps);
+            return NormAndSoftmaxOps.rmsNormRows(this, gamma, res, eps);
         } catch (RuntimeException | Error e) {
             res.close();
             throw e;
@@ -3024,7 +3029,7 @@ public class Tensor implements AutoCloseable {
 
     public Tensor rmsNorm(Tensor gamma, float eps, Tensor res) {
         ensureOpen();
-        return NnOps.rmsNormRows(this, gamma, res, eps);
+        return NormAndSoftmaxOps.rmsNormRows(this, gamma, res, eps);
     }
 
     private Tensor layerNormFresh(Tensor gamma, Tensor beta, float eps) {
@@ -3032,7 +3037,7 @@ public class Tensor implements AutoCloseable {
         ValidUtil.requireOperandF32("layerNorm", dtype);
         Tensor res = empty(dtype, shape);
         try {
-            return NnOps.layerNormRows(this, gamma, beta, res, eps);
+            return NormAndSoftmaxOps.layerNormRows(this, gamma, beta, res, eps);
         } catch (RuntimeException | Error e) {
             res.close();
             throw e;
@@ -3044,7 +3049,7 @@ public class Tensor implements AutoCloseable {
         Rows r = ValidUtil.rows(shape, size);
         Tensor res = empty(DType.f32, r.reducedShape(shape));
         try {
-            return NnOps.crossEntropyRows(this, targets, res);
+            return NormAndSoftmaxOps.crossEntropyRows(this, targets, res);
         } catch (RuntimeException | Error e) {
             res.close();
             throw e;
@@ -3053,7 +3058,7 @@ public class Tensor implements AutoCloseable {
 
     public Tensor crossEntropy(Tensor targets, Tensor res) {
         ensureOpen();
-        return NnOps.crossEntropyRows(this, targets, res);
+        return NormAndSoftmaxOps.crossEntropyRows(this, targets, res);
     }
 
     public Tensor addRowBias(Tensor bias) {
@@ -3061,7 +3066,7 @@ public class Tensor implements AutoCloseable {
         ValidUtil.requireOperandF32("addRowBias", dtype);
         Tensor res = empty(dtype, shape);
         try {
-            return NnOps.addRowBias(this, bias, res);
+            return NormAndSoftmaxOps.addRowBias(this, bias, res);
         } catch (RuntimeException | Error e) {
             res.close();
             throw e;
@@ -3070,14 +3075,14 @@ public class Tensor implements AutoCloseable {
 
     public Tensor addRowBias(Tensor bias, Tensor res) {
         ensureOpen();
-        return NnOps.addRowBias(this, bias, res);
+        return NormAndSoftmaxOps.addRowBias(this, bias, res);
     }
 
     public Tensor linear(Tensor weights, Tensor bias) {
         ensureOpen();
         Tensor res = matmul(weights);
         try {
-            return bias == null ? res : NnOps.addRowBias(res, bias, res);
+            return bias == null ? res : NormAndSoftmaxOps.addRowBias(res, bias, res);
         } catch (RuntimeException | Error e) {
             res.close();
             throw e;
@@ -3087,7 +3092,7 @@ public class Tensor implements AutoCloseable {
     public Tensor linear(Tensor weights, Tensor bias, Tensor res) {
         ensureOpen();
         matmul(weights, res);
-        return bias == null ? res : NnOps.addRowBias(res, bias, res);
+        return bias == null ? res : NormAndSoftmaxOps.addRowBias(res, bias, res);
     }
 
     /**

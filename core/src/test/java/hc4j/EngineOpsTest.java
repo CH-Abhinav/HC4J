@@ -155,7 +155,7 @@ class EngineOpsTest {
                      Tensor tbTensor = Tensor.fromArray(b, bShape);
                      Tensor c = Tensor.empty(DType.f32, m, n)) {
 
-                    hc4j.internal.ops.MatmulOps.matmul(taTensor, tbTensor, c, ta, tb);
+                    hc4j.internal.linalg.MatmulOps.matmul(taTensor, tbTensor, c, ta, tb);
                     float[] expected = ReferenceOps.matmul(a, b, m, n, k, ta, tb);
                     TestAssertions.assertArrayClose(expected, c.toFloatArray(), 1e-4f, 1e-4f);
                 }

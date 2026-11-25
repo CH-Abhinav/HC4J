@@ -21,7 +21,10 @@ import hc4j.Tensor;
 import hc4j.internal.ffi.TensorAccess;
 import hc4j.internal.layout.Rows;
 import hc4j.internal.layout.ValidUtil;
-import hc4j.internal.ops.NnOps;
+import hc4j.internal.nn.ActivationOps;
+import hc4j.internal.nn.NormAndSoftmaxOps;
+import hc4j.internal.nn.ReduceOps;
+import hc4j.internal.nn.TransformerOps;
 import hc4j.linalg.Linalg;
 import java.util.Objects;
 
@@ -55,43 +58,43 @@ public final class Nn {
         Tensor res = createLike(a);
         try { return relu(a, res); } catch (RuntimeException | Error e) { res.close(); throw e; }
     }
-    public static Tensor relu(Tensor a, Tensor out) { return NnOps.activation(Activation.RELU, a, out, 0f); }
+    public static Tensor relu(Tensor a, Tensor out) { return ActivationOps.activation(Activation.RELU, a, out, 0f); }
 
     public static Tensor gelu(Tensor a) {
         Tensor res = createLike(a);
         try { return gelu(a, res); } catch (RuntimeException | Error e) { res.close(); throw e; }
     }
-    public static Tensor gelu(Tensor a, Tensor out) { return NnOps.activation(Activation.GELU, a, out, 0f); }
+    public static Tensor gelu(Tensor a, Tensor out) { return ActivationOps.activation(Activation.GELU, a, out, 0f); }
 
     public static Tensor silu(Tensor a) {
         Tensor res = createLike(a);
         try { return silu(a, res); } catch (RuntimeException | Error e) { res.close(); throw e; }
     }
-    public static Tensor silu(Tensor a, Tensor out) { return NnOps.activation(Activation.SILU, a, out, 0f); }
+    public static Tensor silu(Tensor a, Tensor out) { return ActivationOps.activation(Activation.SILU, a, out, 0f); }
 
     public static Tensor sigmoid(Tensor a) {
         Tensor res = createLike(a);
         try { return sigmoid(a, res); } catch (RuntimeException | Error e) { res.close(); throw e; }
     }
-    public static Tensor sigmoid(Tensor a, Tensor out) { return NnOps.activation(Activation.SIGMOID, a, out, 0f); }
+    public static Tensor sigmoid(Tensor a, Tensor out) { return ActivationOps.activation(Activation.SIGMOID, a, out, 0f); }
 
     public static Tensor softplus(Tensor a) {
         Tensor res = createLike(a);
         try { return softplus(a, res); } catch (RuntimeException | Error e) { res.close(); throw e; }
     }
-    public static Tensor softplus(Tensor a, Tensor out) { return NnOps.activation(Activation.SOFTPLUS, a, out, 0f); }
+    public static Tensor softplus(Tensor a, Tensor out) { return ActivationOps.activation(Activation.SOFTPLUS, a, out, 0f); }
 
     public static Tensor leakyRelu(Tensor a, float slope) {
         Tensor res = createLike(a);
         try { return leakyRelu(a, res, slope); } catch (RuntimeException | Error e) { res.close(); throw e; }
     }
-    public static Tensor leakyRelu(Tensor a, Tensor out, float slope) { return NnOps.activation(Activation.LEAKY_RELU, a, out, slope); }
+    public static Tensor leakyRelu(Tensor a, Tensor out, float slope) { return ActivationOps.activation(Activation.LEAKY_RELU, a, out, slope); }
 
     public static Tensor elu(Tensor a, float alpha) {
         Tensor res = createLike(a);
         try { return elu(a, res, alpha); } catch (RuntimeException | Error e) { res.close(); throw e; }
     }
-    public static Tensor elu(Tensor a, Tensor out, float alpha) { return NnOps.activation(Activation.ELU, a, out, alpha); }
+    public static Tensor elu(Tensor a, Tensor out, float alpha) { return ActivationOps.activation(Activation.ELU, a, out, alpha); }
 
     // --- Softmax ---
 
@@ -99,13 +102,13 @@ public final class Nn {
         Tensor res = createLike(a);
         try { return softmax(a, res); } catch (RuntimeException | Error e) { res.close(); throw e; }
     }
-    public static Tensor softmax(Tensor a, Tensor out) { return NnOps.softmaxRows(a, out, false); }
+    public static Tensor softmax(Tensor a, Tensor out) { return NormAndSoftmaxOps.softmaxRows(a, out, false); }
 
     public static Tensor logSoftmax(Tensor a) {
         Tensor res = createLike(a);
         try { return logSoftmax(a, res); } catch (RuntimeException | Error e) { res.close(); throw e; }
     }
-    public static Tensor logSoftmax(Tensor a, Tensor out) { return NnOps.softmaxRows(a, out, true); }
+    public static Tensor logSoftmax(Tensor a, Tensor out) { return NormAndSoftmaxOps.softmaxRows(a, out, true); }
 
     // --- Normalizations ---
 
@@ -117,7 +120,7 @@ public final class Nn {
         try { return layerNorm(a, gamma, beta, eps, res); } catch (RuntimeException | Error e) { res.close(); throw e; }
     }
     public static Tensor layerNorm(Tensor a, Tensor gamma, Tensor beta, float eps, Tensor out) {
-        return NnOps.layerNormRows(a, gamma, beta, out, eps);
+        return NormAndSoftmaxOps.layerNormRows(a, gamma, beta, out, eps);
     }
 
     public static Tensor rmsNorm(Tensor a, Tensor gamma, float eps) {
@@ -125,7 +128,7 @@ public final class Nn {
         try { return rmsNorm(a, gamma, eps, res); } catch (RuntimeException | Error e) { res.close(); throw e; }
     }
     public static Tensor rmsNorm(Tensor a, Tensor gamma, float eps, Tensor out) {
-        return NnOps.rmsNormRows(a, gamma, out, eps);
+        return NormAndSoftmaxOps.rmsNormRows(a, gamma, out, eps);
     }
 
     // --- Losses & Bias & Linear ---
@@ -135,7 +138,7 @@ public final class Nn {
         try { return crossEntropy(logits, targets, res); } catch (RuntimeException | Error e) { res.close(); throw e; }
     }
     public static Tensor crossEntropy(Tensor logits, Tensor targets, Tensor out) {
-        return NnOps.crossEntropyRows(logits, targets, out);
+        return NormAndSoftmaxOps.crossEntropyRows(logits, targets, out);
     }
 
     public static Tensor addRowBias(Tensor a, Tensor bias) {
@@ -143,7 +146,7 @@ public final class Nn {
         try { return addRowBias(a, bias, res); } catch (RuntimeException | Error e) { res.close(); throw e; }
     }
     public static Tensor addRowBias(Tensor a, Tensor bias, Tensor out) {
-        return NnOps.addRowBias(a, bias, out);
+        return NormAndSoftmaxOps.addRowBias(a, bias, out);
     }
 
     public static Tensor linear(Tensor input, Tensor weight, Tensor bias) {
@@ -166,25 +169,25 @@ public final class Nn {
         Tensor res = Tensor.empty(DType.f32, 1);
         try { return sum(a, res); } catch (RuntimeException | Error e) { res.close(); throw e; }
     }
-    public static Tensor sum(Tensor a, Tensor out) { return NnOps.reduce(Reduction.SUM, a, out); }
+    public static Tensor sum(Tensor a, Tensor out) { return ReduceOps.reduce(Reduction.SUM, a, out); }
 
     public static Tensor mean(Tensor a) {
         Tensor res = Tensor.empty(DType.f32, 1);
         try { return mean(a, res); } catch (RuntimeException | Error e) { res.close(); throw e; }
     }
-    public static Tensor mean(Tensor a, Tensor out) { return NnOps.reduce(Reduction.MEAN, a, out); }
+    public static Tensor mean(Tensor a, Tensor out) { return ReduceOps.reduce(Reduction.MEAN, a, out); }
 
     public static Tensor maxValue(Tensor a) {
         Tensor res = Tensor.empty(DType.f32, 1);
         try { return maxValue(a, res); } catch (RuntimeException | Error e) { res.close(); throw e; }
     }
-    public static Tensor maxValue(Tensor a, Tensor out) { return NnOps.reduce(Reduction.MAX, a, out); }
+    public static Tensor maxValue(Tensor a, Tensor out) { return ReduceOps.reduce(Reduction.MAX, a, out); }
 
     public static Tensor minValue(Tensor a) {
         Tensor res = Tensor.empty(DType.f32, 1);
         try { return minValue(a, res); } catch (RuntimeException | Error e) { res.close(); throw e; }
     }
-    public static Tensor minValue(Tensor a, Tensor out) { return NnOps.reduce(Reduction.MIN, a, out); }
+    public static Tensor minValue(Tensor a, Tensor out) { return ReduceOps.reduce(Reduction.MIN, a, out); }
 
     // --- Row Reductions ---
 
@@ -192,37 +195,37 @@ public final class Nn {
         Tensor res = createReduced(a, DType.f32);
         try { return sumRows(a, res); } catch (RuntimeException | Error e) { res.close(); throw e; }
     }
-    public static Tensor sumRows(Tensor a, Tensor out) { return NnOps.reduceRows(Reduction.SUM, a, out); }
+    public static Tensor sumRows(Tensor a, Tensor out) { return ReduceOps.reduceRows(Reduction.SUM, a, out); }
 
     public static Tensor meanRows(Tensor a) {
         Tensor res = createReduced(a, DType.f32);
         try { return meanRows(a, res); } catch (RuntimeException | Error e) { res.close(); throw e; }
     }
-    public static Tensor meanRows(Tensor a, Tensor out) { return NnOps.reduceRows(Reduction.MEAN, a, out); }
+    public static Tensor meanRows(Tensor a, Tensor out) { return ReduceOps.reduceRows(Reduction.MEAN, a, out); }
 
     public static Tensor maxRows(Tensor a) {
         Tensor res = createReduced(a, DType.f32);
         try { return maxRows(a, res); } catch (RuntimeException | Error e) { res.close(); throw e; }
     }
-    public static Tensor maxRows(Tensor a, Tensor out) { return NnOps.reduceRows(Reduction.MAX, a, out); }
+    public static Tensor maxRows(Tensor a, Tensor out) { return ReduceOps.reduceRows(Reduction.MAX, a, out); }
 
     public static Tensor minRows(Tensor a) {
         Tensor res = createReduced(a, DType.f32);
         try { return minRows(a, res); } catch (RuntimeException | Error e) { res.close(); throw e; }
     }
-    public static Tensor minRows(Tensor a, Tensor out) { return NnOps.reduceRows(Reduction.MIN, a, out); }
+    public static Tensor minRows(Tensor a, Tensor out) { return ReduceOps.reduceRows(Reduction.MIN, a, out); }
 
     public static Tensor argmaxRows(Tensor a) {
         Tensor res = createReduced(a, DType.i32);
         try { return argmaxRows(a, res); } catch (RuntimeException | Error e) { res.close(); throw e; }
     }
-    public static Tensor argmaxRows(Tensor a, Tensor out) { return NnOps.argmaxRows(a, out, true); }
+    public static Tensor argmaxRows(Tensor a, Tensor out) { return ReduceOps.argmaxRows(a, out, true); }
 
     public static Tensor argminRows(Tensor a) {
         Tensor res = createReduced(a, DType.i32);
         try { return argminRows(a, res); } catch (RuntimeException | Error e) { res.close(); throw e; }
     }
-    public static Tensor argminRows(Tensor a, Tensor out) { return NnOps.argmaxRows(a, out, false); }
+    public static Tensor argminRows(Tensor a, Tensor out) { return ReduceOps.argmaxRows(a, out, false); }
 
     // --- Linear, Embedding & RoPE ---
 
@@ -289,7 +292,7 @@ public final class Nn {
         outShape[tokenShape.length] = tableShape[1];
         Tensor res = Tensor.empty(DType.f32, outShape);
         try {
-            return NnOps.embedding(table, tokenIds, res);
+            return TransformerOps.embedding(table, tokenIds, res);
         } catch (RuntimeException | Error e) {
             res.close();
             throw e;
@@ -305,7 +308,7 @@ public final class Nn {
      * @return {@code out}
      */
     public static Tensor embedding(Tensor table, Tensor tokenIds, Tensor out) {
-        return NnOps.embedding(table, tokenIds, out);
+        return TransformerOps.embedding(table, tokenIds, out);
     }
 
     /**
@@ -320,7 +323,7 @@ public final class Nn {
         Objects.requireNonNull(x, "x");
         Tensor res = createLike(x);
         try {
-            return NnOps.rope(x, positionOffset, theta, res);
+            return TransformerOps.rope(x, positionOffset, theta, res);
         } catch (RuntimeException | Error e) {
             res.close();
             throw e;
@@ -338,7 +341,7 @@ public final class Nn {
      * @return {@code out}
      */
     public static Tensor rope(Tensor x, int positionOffset, float theta, Tensor out) {
-        return NnOps.rope(x, positionOffset, theta, out);
+        return TransformerOps.rope(x, positionOffset, theta, out);
     }
 
     /**
@@ -353,6 +356,6 @@ public final class Nn {
      * @throws IllegalArgumentException if shapes, dtypes, aliasing, or bounds are invalid
      */
     public static void kvCacheAppend(Tensor cache, Tensor newValues, int posOffset) {
-        NnOps.kvCacheAppend(cache, newValues, posOffset);
+        TransformerOps.kvCacheAppend(cache, newValues, posOffset);
     }
 }

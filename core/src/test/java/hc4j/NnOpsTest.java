@@ -56,7 +56,7 @@ class NnOpsTest {
              Tensor out = Tensor.empty(DType.f32, n)) {
 
             for (Activation act : Activation.values()) {
-                hc4j.internal.ops.NnOps.activation(act, a, out, ALPHA);
+                hc4j.internal.nn.ActivationOps.activation(act, a, out, ALPHA);
                 float[] got = out.toFloatArray();
                 for (int i = 0; i < n; i++) {
                     float expected = (float) ReferenceOps.activation(act, host[i], ALPHA);

@@ -21,7 +21,8 @@ import hc4j.Tensor;
 import hc4j.internal.ffi.TensorAccess;
 import hc4j.internal.layout.Dims;
 import hc4j.internal.layout.ValidUtil;
-import hc4j.internal.ops.MatmulOps;
+import hc4j.internal.linalg.F16MatmulOps;
+import hc4j.internal.linalg.MatmulOps;
 import java.util.Objects;
 
 /**
@@ -115,10 +116,10 @@ public final class Linalg {
     public static Tensor matmulTransposedB(Tensor a, Tensor b) {
         Objects.requireNonNull(a, "a");
         Objects.requireNonNull(b, "b");
-        int[] outShape = MatmulOps.transposedBOutputShape(a, b);
+        int[] outShape = F16MatmulOps.transposedBOutputShape(a, b);
         Tensor res = Tensor.empty(DType.f32, outShape);
         try {
-            return MatmulOps.matmulTransposedB(a, b, res);
+            return F16MatmulOps.matmulTransposedB(a, b, res);
         } catch (RuntimeException | Error e) {
             res.close();
             throw e;
@@ -134,7 +135,7 @@ public final class Linalg {
      * @return {@code out}
      */
     public static Tensor matmulTransposedB(Tensor a, Tensor b, Tensor out) {
-        return MatmulOps.matmulTransposedB(a, b, out);
+        return F16MatmulOps.matmulTransposedB(a, b, out);
     }
 
     /**

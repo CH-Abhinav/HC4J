@@ -18,9 +18,10 @@ package hc4j.collective;
 
 import hc4j.DType;
 import hc4j.Tensor;
+import hc4j.internal.collective.CpuFallbackKernels;
+import hc4j.internal.collective.NativeOptimizerBridge;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
-import java.lang.foreign.ValueLayout;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
@@ -296,44 +297,25 @@ public final class SplitKvSession implements AutoCloseable {
         long computeEnd = System.nanoTime();
         long syncStart = System.nanoTime();
 
-        // Exact Lossless Online-Softmax Merge across all worker outputs
-        MemorySegment outSeg = Arena.ofAuto().allocate((long) numHeads * headDim * 4L, 16);
-        for (int h = 0; h < numHeads; h++) {
-                float mH = -Float.MAX_VALUE;
-                for (WorkerResult r : results) {
-                    if (r.localTokens > 0) {
-                        float mI = r.stats[2 * h];
-                        if (mI > mH) {
-                            mH = mI;
-                        }
-                    }
-                }
-
-                float lH = 0.0f;
-                float[] weights = new float[results.size()];
-                for (int i = 0; i < results.size(); i++) {
-                    WorkerResult r = results.get(i);
-                    if (r.localTokens > 0) {
-                        float mI = r.stats[2 * h];
-                        float lI = r.stats[2 * h + 1];
-                        float wI = lI * (float) Math.exp(mI - mH);
-                        weights[i] = wI;
-                        lH += wI;
-                    }
-                }
-
-                for (int d = 0; d < headDim; d++) {
-                    float acc = 0.0f;
-                    for (int i = 0; i < results.size(); i++) {
-                        WorkerResult r = results.get(i);
-                        if (r.localTokens > 0 && weights[i] > 0.0f) {
-                            acc += weights[i] * r.o[h * headDim + d];
-                        }
-                    }
-                    float val = (lH > 0.0f) ? (acc / lH) : 0.0f;
-                    outSeg.set(ValueLayout.JAVA_FLOAT, ((long) h * headDim + d) * 4L, val);
-                }
+        // Exact Lossless Online-Softmax Merge across all active worker outputs
+        int activeWorkers = 0;
+        for (WorkerResult r : results) {
+            if (r.localTokens > 0) {
+                activeWorkers++;
             }
+        }
+        float[][] partialsO = new float[activeWorkers][];
+        float[][] partialsStats = new float[activeWorkers][];
+        int wIdx = 0;
+        for (WorkerResult r : results) {
+            if (r.localTokens > 0) {
+                partialsO[wIdx] = r.o;
+                partialsStats[wIdx] = r.stats;
+                wIdx++;
+            }
+        }
+        MemorySegment outSeg = Arena.ofAuto().allocate((long) numHeads * headDim * 4L, 16);
+        NativeOptimizerBridge.mergeSplitKvF32(numHeads, headDim, partialsO, partialsStats, outSeg);
 
         long endWall = System.nanoTime();
 
@@ -366,48 +348,10 @@ public final class SplitKvSession implements AutoCloseable {
     private static WorkerResult computeCpuAttention(MemorySegment qSeg, CpuWorker cpu, int numHeads,
                                                     int numKvHeads, int headDim, float scale) {
         int tokens = cpu.localTokens;
-        int groupSize = numHeads / numKvHeads;
         float[] outO = new float[numHeads * headDim];
         float[] outStats = new float[numHeads * 2];
-        float[] scores = new float[tokens];
-
-        for (int h = 0; h < numHeads; h++) {
-            int kvH = h / groupSize;
-            float m = -Float.MAX_VALUE;
-            float l = 0.0f;
-
-            for (int t = 0; t < tokens; t++) {
-                long kOff = ((long) kvH * tokens + t) * headDim;
-                float dot = 0.0f;
-                for (int d = 0; d < headDim; d++) {
-                    float qVal = qSeg.get(ValueLayout.JAVA_FLOAT, ((long) h * headDim + d) * 4L);
-                    float kVal = cpu.kShard.get(ValueLayout.JAVA_FLOAT, (kOff + d) * 4L);
-                    dot += qVal * kVal;
-                }
-                float score = dot * scale;
-                scores[t] = score;
-                float newM = Math.max(m, score);
-                l = l * (float) Math.exp(m - newM) + (float) Math.exp(score - newM);
-                m = newM;
-            }
-
-            outStats[2 * h] = m;
-            outStats[2 * h + 1] = l;
-
-            if (l > 0.0f) {
-                for (int d = 0; d < headDim; d++) {
-                    float acc = 0.0f;
-                    for (int t = 0; t < tokens; t++) {
-                        float weight = (float) Math.exp(scores[t] - m);
-                        long vOff = ((long) kvH * tokens + t) * headDim + d;
-                        float vVal = cpu.vShard.get(ValueLayout.JAVA_FLOAT, vOff * 4L);
-                        acc += weight * vVal;
-                    }
-                    outO[h * headDim + d] = acc / l;
-                }
-            }
-        }
-
+        CpuFallbackKernels.computeCpuAttention(
+                qSeg, cpu.kShard, cpu.vShard, tokens, numHeads, numKvHeads, headDim, scale, outO, outStats);
         return new WorkerResult(ShardAllocation.HOST_CPU_RANK, tokens, outO, outStats);
     }
 

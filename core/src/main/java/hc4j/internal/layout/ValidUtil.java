@@ -18,7 +18,11 @@ package hc4j.internal.layout;
 
 import hc4j.DType;
 import hc4j.Tensor;
+import hc4j.internal.ffi.NativeEngine;
 import hc4j.internal.ffi.TensorAccess;
+import java.lang.foreign.Arena;
+import java.lang.foreign.MemorySegment;
+import java.lang.foreign.ValueLayout;
 import java.util.Arrays;
 
 /**
@@ -389,5 +393,239 @@ public final class ValidUtil {
         }
 
         return new BatchedMatmulPlan(m, n, k, batchShape, aBatchStrides, bBatchStrides, outputShape, flags);
+    }
+
+    /**
+     * An owning-or-borrowed operand holder returned by layout materialization helpers.
+     *
+     * @param tensor the materialized tensor to pass to native dispatch
+     * @param owned whether this holder owns a temporary copy that must be closed
+     */
+    public record SafeOperand(Tensor tensor, boolean owned) implements AutoCloseable {
+        @Override
+        public void close() {
+            if (owned) {
+                tensor.close();
+            }
+        }
+    }
+
+    /** Native FFM kernel signature for strided unary elementwise operations. */
+    @FunctionalInterface
+    public interface StridedUnaryKernel {
+        /**
+         * Dispatches a unary strided kernel.
+         *
+         * @param inId input buffer id
+         * @param outId output buffer id
+         * @param rank tensor rank
+         * @param shape shape segment or null if contiguous
+         * @param stridesIn input strides segment or null if contiguous
+         * @param stridesOut output strides segment or null if contiguous
+         * @param length element count
+         * @param isContiguous 1 if contiguous, 0 otherwise
+         * @return native status code
+         * @throws Throwable on FFM invocation failure
+         */
+        int dispatch(long inId, long outId, int rank, MemorySegment shape,
+                     MemorySegment stridesIn, MemorySegment stridesOut,
+                     long length, int isContiguous) throws Throwable;
+    }
+
+    /** Native FFM kernel signature for strided binary elementwise operations. */
+    @FunctionalInterface
+    public interface StridedBinaryKernel {
+        /**
+         * Dispatches a binary strided kernel.
+         *
+         * @param aId first input buffer id
+         * @param bId second input buffer id
+         * @param outId output buffer id
+         * @param rank broadcast rank
+         * @param shape shape segment or null if contiguous
+         * @param stridesA first input strides segment or null if contiguous
+         * @param stridesB second input strides segment or null if contiguous
+         * @param stridesOut output strides segment or null if contiguous
+         * @param length element count
+         * @param isContiguous 1 if contiguous, 0 otherwise
+         * @return native status code
+         * @throws Throwable on FFM invocation failure
+         */
+        int dispatch(long aId, long bId, long outId, int rank, MemorySegment shape,
+                     MemorySegment stridesA, MemorySegment stridesB, MemorySegment stridesOut,
+                     long length, int isContiguous) throws Throwable;
+    }
+
+    /**
+     * Resolves the native integer dtype code for elementwise math kernels ({@code i32 -> 0, f32 -> 1}).
+     *
+     * @param type tensor data type
+     * @return native dtype code
+     */
+    public static int resolveMathDTypeCode(DType type) {
+        return switch (type) {
+            case i32 -> 0;
+            case f32 -> 1;
+            default -> throw new UnsupportedOperationException("Operation not supported for dtype " + type);
+        };
+    }
+
+    /**
+     * Validates that {@code out} is contiguous with zero element offset.
+     *
+     * @param out destination tensor
+     */
+    public static void requireContiguousZeroOffsetOutput(Tensor out) {
+        TensorAccess access = TensorAccess.getInstance();
+        if (!out.isContiguous() || access.elementOffset(out) != 0) {
+            throw new IllegalArgumentException("Output tensor must be contiguous with zero offset");
+        }
+    }
+
+    /**
+     * Returns an independent copy when {@code input} aliases {@code out} with mismatched layout,
+     * or a contiguous copy when {@code input} has a non-zero element offset.
+     *
+     * @param input source tensor
+     * @param out destination tensor
+     * @return closeable operand handle
+     */
+    public static SafeOperand prepareAliasAndOffset(Tensor input, Tensor out) {
+        TensorAccess access = TensorAccess.getInstance();
+        if (access.getVramId(input) == access.getVramId(out) && !access.hasIdenticalLayout(input, out)) {
+            return new SafeOperand(input.copy(), true);
+        }
+        if (access.elementOffset(input) > 0) {
+            return new SafeOperand(input.contiguous(), true);
+        }
+        return new SafeOperand(input, false);
+    }
+
+    /**
+     * Returns a contiguous zero-offset tensor, copying only if {@code input} is non-contiguous or offset.
+     *
+     * @param input source tensor
+     * @return closeable operand handle
+     */
+    public static SafeOperand prepareContiguousZeroOffset(Tensor input) {
+        TensorAccess access = TensorAccess.getInstance();
+        if (!input.isContiguous() || access.elementOffset(input) != 0) {
+            return new SafeOperand(input.contiguous(), true);
+        }
+        return new SafeOperand(input, false);
+    }
+
+    /**
+     * Dispatches a unary strided GPU kernel after preparing aliasing/offset and shape validation.
+     *
+     * @param context error context string
+     * @param opName logical operation name for diagnostics
+     * @param input source tensor
+     * @param out destination tensor
+     * @param kernel native dispatch callback
+     * @return {@code out}
+     */
+    public static Tensor dispatchStridedUnary(String context, String opName, Tensor input, Tensor out, StridedUnaryKernel kernel) {
+        TensorAccess access = TensorAccess.getInstance();
+        requireContiguousZeroOffsetOutput(out);
+        try (SafeOperand safeIn = prepareAliasAndOffset(input, out)) {
+            Tensor effective = safeIn.tensor();
+            int[] sa = access.getShapeUnsafe(effective);
+            int[] sr = access.getShapeUnsafe(out);
+            requireSameShape(opName, sa, sr);
+
+            int[] sta = access.getStridesUnsafe(effective);
+            int[] str = access.getStridesUnsafe(out);
+            boolean contiguous = isContiguous(sa, sta) && isContiguous(sr, str);
+            int rank = out.dim();
+            long length = out.getSize();
+
+            int status;
+            if (contiguous) {
+                status = kernel.dispatch(
+                        access.getVramId(effective), access.getVramId(out),
+                        rank, MemorySegment.NULL, MemorySegment.NULL, MemorySegment.NULL, length, 1);
+            } else {
+                try (Arena arena = Arena.ofConfined()) {
+                    MemorySegment shapeSeg = arena.allocateFrom(ValueLayout.JAVA_INT, sr);
+                    MemorySegment stridesASeg = arena.allocateFrom(ValueLayout.JAVA_INT, sta);
+                    MemorySegment stridesCSeg = arena.allocateFrom(ValueLayout.JAVA_INT, str);
+                    status = kernel.dispatch(
+                            access.getVramId(effective), access.getVramId(out),
+                            rank, shapeSeg, stridesASeg, stridesCSeg, length, 0);
+                }
+            }
+            NativeEngine.checkStatus(status, context);
+            return out;
+        } catch (RuntimeException | Error e) {
+            throw e;
+        } catch (Throwable t) {
+            throw new RuntimeException("HC4J GPU Error: " + context + " failed", t);
+        }
+    }
+
+    /**
+     * Dispatches a binary broadcasted/strided GPU kernel after preparing aliasing/offset and shape validation.
+     *
+     * @param context error context string
+     * @param a first operand
+     * @param b second operand
+     * @param res destination tensor
+     * @param kernel native dispatch callback
+     * @return {@code res}
+     */
+    public static Tensor dispatchStridedBinary(String context, Tensor a, Tensor b, Tensor res, StridedBinaryKernel kernel) {
+        TensorAccess access = TensorAccess.getInstance();
+        requireContiguousZeroOffsetOutput(res);
+        try (SafeOperand safeA = prepareAliasAndOffset(a, res);
+             SafeOperand safeB = prepareAliasAndOffset(b, res)) {
+            Tensor effA = safeA.tensor();
+            Tensor effB = safeB.tensor();
+
+            int[] sa = access.getShapeUnsafe(effA);
+            int[] sb = access.getShapeUnsafe(effB);
+            int[] targetShape = broadcastShape(sa, sb);
+            int[] sr = access.getShapeUnsafe(res);
+            requireResultShape(targetShape, sr);
+
+            int[] sta = access.getStridesUnsafe(effA);
+            int[] stb = access.getStridesUnsafe(effB);
+            int[] str = access.getStridesUnsafe(res);
+
+            int[] bcastStridesA = broadcastStrides(sa, sta, targetShape);
+            int[] bcastStridesB = broadcastStrides(sb, stb, targetShape);
+
+            boolean contiguous = Arrays.equals(sa, targetShape)
+                    && Arrays.equals(sb, targetShape)
+                    && effA.isContiguous()
+                    && effB.isContiguous()
+                    && res.isContiguous();
+            int rank = targetShape.length;
+
+            int status;
+            if (contiguous) {
+                status = kernel.dispatch(
+                        access.getVramId(effA), access.getVramId(effB), access.getVramId(res),
+                        rank, MemorySegment.NULL, MemorySegment.NULL, MemorySegment.NULL, MemorySegment.NULL,
+                        res.getSize(), 1);
+            } else {
+                try (Arena arena = Arena.ofConfined()) {
+                    MemorySegment shapeSeg = arena.allocateFrom(ValueLayout.JAVA_INT, targetShape);
+                    MemorySegment stridesASeg = arena.allocateFrom(ValueLayout.JAVA_INT, bcastStridesA);
+                    MemorySegment stridesBSeg = arena.allocateFrom(ValueLayout.JAVA_INT, bcastStridesB);
+                    MemorySegment stridesCSeg = arena.allocateFrom(ValueLayout.JAVA_INT, str);
+                    status = kernel.dispatch(
+                            access.getVramId(effA), access.getVramId(effB), access.getVramId(res),
+                            rank, shapeSeg, stridesASeg, stridesBSeg, stridesCSeg,
+                            res.getSize(), 0);
+                }
+            }
+            NativeEngine.checkStatus(status, context);
+            return res;
+        } catch (RuntimeException | Error e) {
+            throw e;
+        } catch (Throwable t) {
+            throw new RuntimeException("HC4J GPU Error: " + context + " failed", t);
+        }
     }
 }

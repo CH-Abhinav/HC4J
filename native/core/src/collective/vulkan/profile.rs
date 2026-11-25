@@ -47,9 +47,11 @@ pub(crate) fn measure_compute_gflops(node: &GpuNode) -> Hc4jResult<f64> {
     let out_bytes: vk::DeviceSize = (total_threads as vk::DeviceSize) * 4; // 512 KiB on discrete, 128 KiB on other
 
     let spv_bytes = include_bytes!(concat!(env!("OUT_DIR"), "/collective_bench_fma.spv"));
-    let spv_words: &[u32] = bytemuck::cast_slice(spv_bytes);
+    let mut cursor = std::io::Cursor::new(spv_bytes);
+    let spv_words = ash::util::read_spv(&mut cursor)
+        .map_err(|e| Hc4jError::Device(format!("failed to parse bench_fma SPIR-V bytecode: {e}")))?;
 
-    let sm_ci = vk::ShaderModuleCreateInfo::default().code(spv_words);
+    let sm_ci = vk::ShaderModuleCreateInfo::default().code(&spv_words);
     let shader_module = unsafe { node.device.create_shader_module(&sm_ci, None) }
         .map_err(|e| Hc4jError::Device(format!("create_shader_module bench_fma failed: {e}")))?;
 

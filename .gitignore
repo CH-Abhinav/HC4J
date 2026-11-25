@@ -51,6 +51,14 @@ HC4J_AUDIT.md
 .classpath
 .settings/
 
+# --- Python / SDKs ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.coverage
+
 # --- Native Shared Libraries / Build Outputs ---
 *.dll
 *.so

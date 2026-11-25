@@ -52,8 +52,10 @@ public final class NativeEngine {
     private static volatile boolean initialized = false;
     private static volatile Throwable initFailure = null;
     private static volatile NativeLoadResult loadResult = null;
+    private static volatile boolean libraryLoadAttempted = false;
 
     private static MethodHandle initGpuHandle;
+    private static MethodHandle lastErrorHandle;
     private static MethodHandle gpuAllocHandle;
     private static MethodHandle gpuAllocBytesHandle;
     private static MethodHandle gpuAllocUninitHandle;
@@ -160,14 +162,52 @@ public final class NativeEngine {
         }
     }
 
+    /**
+     * Attempts to resolve and load the native shared library without initializing a GPU device.
+     * Safe for CPU-only C-ABI entry points (such as the optimizer and lossless Split-KV merge)
+     * and headless fallback detection.
+     *
+     * @return the loaded {@link SymbolLookup}, or {@code null} if the native library is unavailable
+     */
+    public static synchronized SymbolLookup tryLoadLibrarySymbols() {
+        if (loadResult != null) {
+            bindLastErrorHandle(loadResult.lookup());
+            return loadResult.lookup();
+        }
+        if (libraryLoadAttempted) {
+            return null;
+        }
+        libraryLoadAttempted = true;
+        try {
+            loadResult = NativeLoader.load();
+            bindLastErrorHandle(loadResult.lookup());
+            return loadResult.lookup();
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
     private static void loadLibrary() {
-        loadResult = NativeLoader.load();
+        if (loadResult == null) {
+            loadResult = NativeLoader.load();
+        }
+    }
+
+    @SuppressWarnings("restricted")
+    private static void bindLastErrorHandle(SymbolLookup lookup) {
+        if (lastErrorHandle != null || lookup == null) {
+            return;
+        }
+        lookup.find("hc4j_last_error").ifPresent(addr -> lastErrorHandle = Linker.nativeLinker().downcallHandle(
+                addr,
+                FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.JAVA_INT)));
     }
 
     @SuppressWarnings("restricted")
     private static void bindCoreHandles() {
         Linker linker = Linker.nativeLinker();
         SymbolLookup lookup = loadResult.lookup();
+        bindLastErrorHandle(lookup);
 
         initGpuHandle = linker.downcallHandle(lookup.find("hc4j_init_gpu").orElseThrow(),
                 FunctionDescriptor.of(ValueLayout.JAVA_INT));
@@ -286,18 +326,46 @@ public final class NativeEngine {
                         ValueLayout.JAVA_INT, ValueLayout.JAVA_INT, ValueLayout.JAVA_INT, ValueLayout.JAVA_INT, ValueLayout.JAVA_INT));
     }
 
+    /**
+     * Retrieves the thread-local diagnostic message from the most recent failed native FFI call,
+     * returning an empty string when unavailable or no diagnostic is recorded.
+     *
+     * @return native error string (never {@code null})
+     */
+    public static String lastError() {
+        MethodHandle h = lastErrorHandle;
+        if (h == null) {
+            return "";
+        }
+        try (Arena arena = Arena.ofConfined()) {
+            int cap = 512;
+            MemorySegment buf = arena.allocate(cap);
+            int len = (int) h.invokeExact(buf, cap);
+            if (len <= 0) {
+                return "";
+            }
+            int clamped = Math.min(len, cap - 1);
+            byte[] bytes = buf.asSlice(0, clamped).toArray(ValueLayout.JAVA_BYTE);
+            return new String(bytes, StandardCharsets.UTF_8);
+        } catch (Throwable ignored) {
+            return "";
+        }
+    }
+
     public static void checkStatus(int statusCode, String context) {
         if (statusCode == HC4J_SUCCESS) return;
+        String detail = lastError();
+        String suffix = detail.isBlank() ? "" : " [" + detail + "]";
         switch (statusCode) {
-            case HC4J_ERR_NOT_FOUND -> throw new IllegalStateException(context + ": GPU Buffer ID not found in Rust Registry!");
-            case HC4J_ERR_INVALID_PARAM -> throw new IllegalArgumentException(context + ": Invalid parameters passed to native bridge.");
-            case HC4J_ERR_GPU_READBACK -> throw new RuntimeException(context + ": GPU Readback failed during memory mapping.");
-            case HC4J_ERR_OUT_OF_MEMORY -> throw new GpuOutOfMemoryException(context + ": VRAM, host RAM and the spill tier are all exhausted.");
-            case HC4J_ERR_DEVICE -> throw new IllegalStateException(context + ": GPU device unavailable, lost, or timed out.");
-            case HC4J_ERR_GPU_VALIDATION -> throw new IllegalStateException(context + ": wgpu rejected the shader, pipeline or submission (see native log).");
-            case HC4J_ERR_HOST_IO -> throw new RuntimeException(context + ": Spill-file I/O failed.");
-            case HC4J_ERR_UNSUPPORTED -> throw new UnsupportedOperationException(context + ": Operation not supported for this tensor layout or size.");
-            default -> throw new RuntimeException(context + ": Unknown native FFM error code: " + statusCode);
+            case HC4J_ERR_NOT_FOUND -> throw new IllegalStateException(context + ": GPU Buffer ID not found in Rust Registry!" + suffix);
+            case HC4J_ERR_INVALID_PARAM -> throw new IllegalArgumentException(context + ": Invalid parameters passed to native bridge." + suffix);
+            case HC4J_ERR_GPU_READBACK -> throw new RuntimeException(context + ": GPU Readback failed during memory mapping." + suffix);
+            case HC4J_ERR_OUT_OF_MEMORY -> throw new GpuOutOfMemoryException(context + ": VRAM, host RAM and the spill tier are all exhausted." + suffix);
+            case HC4J_ERR_DEVICE -> throw new IllegalStateException(context + ": GPU device unavailable, lost, or timed out." + suffix);
+            case HC4J_ERR_GPU_VALIDATION -> throw new IllegalStateException(context + ": wgpu rejected the shader, pipeline or submission (see native log)." + suffix);
+            case HC4J_ERR_HOST_IO -> throw new RuntimeException(context + ": Spill-file I/O failed." + suffix);
+            case HC4J_ERR_UNSUPPORTED -> throw new UnsupportedOperationException(context + ": Operation not supported for this tensor layout or size." + suffix);
+            default -> throw new RuntimeException(context + ": Unknown native FFM error code: " + statusCode + suffix);
         }
     }
 

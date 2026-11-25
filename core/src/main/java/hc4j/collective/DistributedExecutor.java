@@ -18,6 +18,7 @@ package hc4j.collective;
 
 import hc4j.DType;
 import hc4j.Tensor;
+import hc4j.internal.collective.CpuFallbackKernels;
 import hc4j.nn.Activation;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
@@ -127,7 +128,7 @@ public final class DistributedExecutor {
                 if (rank == ShardAllocation.HOST_CPU_RANK) {
                     cpuUnits += units;
                     futures.add(CompletableFuture.runAsync(() ->
-                            computeCpuGemm(aSeg, bSeg, outSeg, rStart, units, n, k), executor));
+                            CpuFallbackKernels.computeCpuGemm(aSeg, bSeg, outSeg, rStart, units, n, k), executor));
                 } else {
                     executedGpuRanks.add(rank);
                     futures.add(CompletableFuture.runAsync(() -> {
@@ -225,24 +226,6 @@ public final class DistributedExecutor {
                 .ioMultiplier(1.0)
                 .build();
         return matmul(collective, a, b, spec).value();
-    }
-
-    private static void computeCpuGemm(MemorySegment aSeg, MemorySegment bSeg, MemorySegment outSeg,
-                                       int rStart, int units, int n, int k) {
-        for (int i = 0; i < units; i++) {
-            int globalRow = rStart + i;
-            long aRowOff = (long) globalRow * k;
-            long outRowOff = (long) globalRow * n;
-            for (int j = 0; j < n; j++) {
-                float sum = 0.0f;
-                for (int p = 0; p < k; p++) {
-                    float aVal = aSeg.get(ValueLayout.JAVA_FLOAT, (aRowOff + p) * 4L);
-                    float bVal = bSeg.get(ValueLayout.JAVA_FLOAT, ((long) p * n + j) * 4L);
-                    sum += aVal * bVal;
-                }
-                outSeg.set(ValueLayout.JAVA_FLOAT, (outRowOff + j) * 4L, sum);
-            }
-        }
     }
 
     // --- Workload 2: Distributed Megatron-LM Tensor-Parallel Transformer MLP ---
@@ -356,7 +339,8 @@ public final class DistributedExecutor {
                 if (rank == ShardAllocation.HOST_CPU_RANK) {
                     cpuUnits += units;
                     cpuFutures.add(CompletableFuture.supplyAsync(() ->
-                            computeCpuMlpSlice(xSeg, w1Seg, b1Seg, w2Seg, m, dIn, h, dOut, hStart, units, activation), executor));
+                            CpuFallbackKernels.computeCpuMlpSlice(
+                                    xSeg, w1Seg, b1Seg, w2Seg, m, dIn, h, dOut, hStart, units, activation), executor));
                 } else {
                     executedGpuRanks.add(rank);
                     gpuFutures.add(CompletableFuture.supplyAsync(() -> {
@@ -548,68 +532,6 @@ public final class DistributedExecutor {
                 .ioMultiplier(1.0)
                 .build();
         return transformerMlp(collective, x, w1, b1, w2, b2, activation, spec);
-    }
-
-    private static float[] computeCpuMlpSlice(MemorySegment xSeg, MemorySegment w1Seg, MemorySegment b1Seg,
-                                              MemorySegment w2Seg, int m, int dIn, int h, int dOut,
-                                              int hStart, int units, Activation activation) {
-        float[] hSlice = new float[m * units];
-
-        for (int i = 0; i < m; i++) {
-            long xRowOff = (long) i * dIn;
-            int hRowOff = i * units;
-            for (int j = 0; j < units; j++) {
-                int globalH = hStart + j;
-                float sum = 0.0f;
-                for (int p = 0; p < dIn; p++) {
-                    float xVal = xSeg.get(ValueLayout.JAVA_FLOAT, (xRowOff + p) * 4L);
-                    float wVal = w1Seg.get(ValueLayout.JAVA_FLOAT, ((long) p * h + globalH) * 4L);
-                    sum += xVal * wVal;
-                }
-                if (b1Seg != null) {
-                    sum += b1Seg.get(ValueLayout.JAVA_FLOAT, (long) globalH * 4L);
-                }
-                hSlice[hRowOff + j] = applyActivation(sum, activation);
-            }
-        }
-
-        float[] yCpu = new float[m * dOut];
-        for (int i = 0; i < m; i++) {
-            int hRowOff = i * units;
-            int yRowOff = i * dOut;
-            for (int j = 0; j < dOut; j++) {
-                float sum = 0.0f;
-                for (int p = 0; p < units; p++) {
-                    int globalH = hStart + p;
-                    float hVal = hSlice[hRowOff + p];
-                    float wVal = w2Seg.get(ValueLayout.JAVA_FLOAT, ((long) globalH * dOut + j) * 4L);
-                    sum += hVal * wVal;
-                }
-                yCpu[yRowOff + j] = sum;
-            }
-        }
-
-        return yCpu;
-    }
-
-    private static float applyActivation(float x, Activation activation) {
-        if (activation == null) {
-            return x;
-        }
-        return switch (activation) {
-            case RELU -> Math.max(x, 0.0f);
-            case GELU -> {
-                float cubic = 0.7978845608028654f * (x + 0.044715f * x * x * x);
-                float inner = Math.clamp(cubic, -10.0f, 10.0f);
-                yield 0.5f * x * (1.0f + (float) Math.tanh(inner));
-            }
-            case SILU -> {
-                float e = (float) Math.exp(-Math.abs(x));
-                float num = (x >= 0.0f) ? 1.0f : e;
-                yield x * num / (1.0f + e);
-            }
-            default -> throw new UnsupportedOperationException("Unsupported MLP activation: " + activation);
-        };
     }
 
     // --- Workload 3: Lossless Zero-Waste Split-KV Decode Attention ---
