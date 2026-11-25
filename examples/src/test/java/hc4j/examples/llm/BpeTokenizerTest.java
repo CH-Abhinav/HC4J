@@ -227,4 +227,133 @@ class BpeTokenizerTest {
         assertArrayEquals(new int[]{2, 12, 17}, ids);
         assertEquals("hello world", tok.decode(ids, true));
     }
+
+    @Test
+    @DisplayName("Qwen2.5 Sequence(Split + ByteLevel(use_regex=false)) prevents cross-word/newline merges and honors NFC + ChatML specials")
+    void testQwen25SequenceSplitPreTokenizerAndSpecials(@TempDir Path tempDir) throws IOException {
+        List<String> extras = List.of(
+                "user", "assistant", "What", "Ġis", "Ġthe", "Ġcapital", "?", "'s", "Ċ",
+                "<s>", "</s>", // ordinary HTML tokens in Qwen2.5 vocab MUST NOT trigger synthetic BOS/EOS!
+                "userĊ", "?Ċ" // cross-word/newline merged tokens that MUST NOT trigger across Split boundaries!
+        );
+        Map<String, Integer> vocab = buildByteLevelVocab(extras);
+        // Add individual intermediate tokens so words build cleanly via merges
+        for (String intermediate : List.of("us", "use", "as", "ass", "assi", "assis", "assist", "assista", "assistan",
+                "Wh", "Wha", "Ġi", "Ġt", "Ġth", "Ġc", "Ġca", "Ġcap", "Ġcapi", "Ġcapit", "Ġcapita",
+                "Ã©", "caf", "cafÃ", "cafÃ©")) {
+            if (!vocab.containsKey(intermediate)) {
+                vocab.put(intermediate, vocab.size());
+            }
+        }
+        int endoTextId = vocab.size();
+        int imStartId = vocab.size() + 1;
+        int imEndId = vocab.size() + 2;
+        int toolCallId = vocab.size() + 3;
+
+        List<String> merges = List.of(
+                // Tempting cross-boundary merges placed earliest in rank!
+                "r Ċ", "? Ċ", "use rĊ",
+                // Normal within-piece merges
+                "u s", "us e", "use r",
+                "a s", "as s", "ass i", "assi s", "assis t", "assist a", "assista n", "assistan t",
+                "W h", "Wh a", "Wha t",
+                "Ġ i", "Ġi s",
+                "Ġ t", "Ġt h", "Ġth e",
+                "Ġ c", "Ġc a", "Ġca p", "Ġcap i", "Ġcapi t", "Ġcapit a", "Ġcapita l",
+                "' s",
+                "c a", "ca f", "caf Ã", "cafÃ ©"
+        );
+
+        String qwenRegex = "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+";
+        Map<String, Object> preTokenizer = Map.of(
+                "type", "Sequence",
+                "pretokenizers", List.of(
+                        Map.of(
+                                "type", "Split",
+                                "pattern", Map.of("Regex", qwenRegex),
+                                "behavior", "Isolated",
+                                "invert", false
+                        ),
+                        Map.of(
+                                "type", "ByteLevel",
+                                "add_prefix_space", false,
+                                "trim_offsets", false,
+                                "use_regex", false
+                        )
+                )
+        );
+
+        Map<String, Object> root = new LinkedHashMap<>();
+        root.put("normalizer", Map.of("type", "NFC"));
+        root.put("pre_tokenizer", preTokenizer);
+        root.put("decoder", Map.of("type", "ByteLevel", "add_prefix_space", false, "use_regex", false));
+        root.put("added_tokens", List.of(
+                Map.of("id", endoTextId, "content", "<|endoftext|>", "special", true),
+                Map.of("id", imStartId, "content", "<|im_start|>", "special", true),
+                Map.of("id", imEndId, "content", "<|im_end|>", "special", true),
+                Map.of("id", toolCallId, "content", "<tool_call>", "special", false)
+        ));
+        root.put("model", Map.of("type", "BPE", "vocab", vocab, "merges", merges));
+
+        Path tokPath = tempDir.resolve("qwen_tokenizer.json");
+        Files.writeString(tokPath, MinimalJson.serialize(root));
+        BpeTokenizer tok = BpeTokenizer.load(tokPath);
+
+        assertTrue(tok.bosTokenId().isEmpty(), "ChatML tokenizer should not synthesize spurious BOS");
+        assertTrue(tok.eosTokenIds().contains(imEndId));
+        assertTrue(tok.eosTokenIds().contains(endoTextId));
+        assertFalse(tok.eosTokenIds().contains(vocab.get("</s>")), "Non-added HTML </s> in vocab must not be EOS");
+
+        String chatPrompt = "<|im_start|>user\nWhat's the capital?<|im_end|>\n<|im_start|>assistant\n";
+        int[] ids = tok.encode(chatPrompt, true);
+        int nlId = vocab.get("Ċ");
+        int[] expected = {
+                imStartId,
+                vocab.get("user"),
+                nlId,
+                vocab.get("What"),
+                vocab.get("'s"),
+                vocab.get("Ġthe"),
+                vocab.get("Ġcapital"),
+                vocab.get("?"),
+                imEndId,
+                nlId,
+                imStartId,
+                vocab.get("assistant"),
+                nlId
+        };
+        assertArrayEquals(expected, ids, "Split pre-tokenizer must keep 'user' + '\\n' separate despite 'r Ċ' merge");
+        assertEquals(chatPrompt, tok.decode(ids, false));
+        assertEquals("user\nWhat's the capital?\nassistant\n", tok.decode(ids, true));
+
+        // Non-special added token (<tool_call>) retained when skipSpecialTokens=true
+        int[] withTool = tok.encode("<tool_call>cafe\u0301");
+        assertEquals(toolCallId, withTool[0]);
+        assertEquals("<tool_call>café", tok.decode(withTool, true));
+    }
+
+    @Test
+    @DisplayName("SmolLM2 Sequence(Digits + ByteLevel(use_regex=true)) splits individual digits cleanly")
+    void testSmolLm2DigitsSequencePreTokenizer(@TempDir Path tempDir) throws IOException {
+        Map<String, Integer> vocab = buildByteLevelVocab(List.of("12", "123", "Ġ1"));
+        Map<String, Object> root = new LinkedHashMap<>();
+        root.put("pre_tokenizer", Map.of(
+                "type", "Sequence",
+                "pretokenizers", List.of(
+                        Map.of("type", "Digits", "individual_digits", true),
+                        Map.of("type", "ByteLevel", "add_prefix_space", false, "use_regex", true)
+                )
+        ));
+        root.put("decoder", Map.of("type", "ByteLevel", "add_prefix_space", true, "use_regex", true));
+        root.put("model", Map.of("type", "BPE", "vocab", vocab, "merges", List.of("1 2", "12 3", "Ġ 1")));
+
+        Path tokPath = tempDir.resolve("smol_tokenizer.json");
+        Files.writeString(tokPath, MinimalJson.serialize(root));
+        BpeTokenizer tok = BpeTokenizer.load(tokPath);
+
+        int[] ids = tok.encode(" 123");
+        // Digits(individual_digits=true) -> [" ", "1", "2", "3"] -> separate tokens ['Ġ', '1', '2', '3']
+        assertArrayEquals(new int[]{vocab.get("Ġ"), vocab.get("1"), vocab.get("2"), vocab.get("3")}, ids);
+        assertEquals(" 123", tok.decode(ids, true));
+    }
 }

@@ -20,6 +20,8 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 
@@ -32,11 +34,13 @@ import java.util.Objects;
  * @param numHiddenLayers       number of transformer decoder layers
  * @param numAttentionHeads     number of query attention heads
  * @param numKeyValueHeads      number of key/value heads for GQA (Grouped Query Attention)
+ * @param headDim               per-head attention dimension (explicit {@code head_dim} if present, else {@code hiddenSize / numAttentionHeads})
  * @param rmsNormEps            epsilon for RMSNorm
  * @param ropeTheta             base theta for Rotary Position Embedding
  * @param maxPositionEmbeddings maximum context length
  * @param tieWordEmbeddings     whether lm_head shares weights with embed_tokens
- * @param qkvBias               whether Q, K, V projections include bias terms (e.g. Qwen2.5)
+ * @param qkvBias               whether config explicitly declares Q/K/V attention bias
+ * @param eosTokenIds           end-of-sequence token IDs declared in {@code config.json}
  */
 public record LlamaConfig(
         int vocabSize,
@@ -45,20 +49,69 @@ public record LlamaConfig(
         int numHiddenLayers,
         int numAttentionHeads,
         int numKeyValueHeads,
+        int headDim,
         float rmsNormEps,
         float ropeTheta,
         int maxPositionEmbeddings,
         boolean tieWordEmbeddings,
-        boolean qkvBias
+        boolean qkvBias,
+        List<Integer> eosTokenIds
 ) {
 
     /**
-     * Dimension of each individual attention head.
-     *
-     * @return head dimension
+     * Compact constructor normalizing derived {@code headDim} and immutable {@code eosTokenIds}.
      */
-    public int headDim() {
-        return hiddenSize / numAttentionHeads;
+    public LlamaConfig {
+        if (headDim <= 0 && numAttentionHeads > 0) {
+            headDim = hiddenSize / numAttentionHeads;
+        }
+        eosTokenIds = (eosTokenIds == null) ? List.of() : List.copyOf(eosTokenIds);
+    }
+
+    /**
+     * Convenience constructor deriving {@link #headDim()} from {@code hiddenSize / numAttentionHeads}
+     * with an empty config-level EOS list.
+     *
+     * @param vocabSize             vocabulary size
+     * @param hiddenSize            hidden embedding dimension
+     * @param intermediateSize      feed-forward intermediate dimension
+     * @param numHiddenLayers       number of transformer decoder layers
+     * @param numAttentionHeads     number of query attention heads
+     * @param numKeyValueHeads      number of key/value heads for GQA
+     * @param rmsNormEps            epsilon for RMSNorm
+     * @param ropeTheta             base theta for Rotary Position Embedding
+     * @param maxPositionEmbeddings maximum context length
+     * @param tieWordEmbeddings     whether lm_head shares weights with embed_tokens
+     * @param qkvBias               whether config explicitly declares Q/K/V attention bias
+     */
+    public LlamaConfig(
+            int vocabSize,
+            int hiddenSize,
+            int intermediateSize,
+            int numHiddenLayers,
+            int numAttentionHeads,
+            int numKeyValueHeads,
+            float rmsNormEps,
+            float ropeTheta,
+            int maxPositionEmbeddings,
+            boolean tieWordEmbeddings,
+            boolean qkvBias
+    ) {
+        this(
+                vocabSize,
+                hiddenSize,
+                intermediateSize,
+                numHiddenLayers,
+                numAttentionHeads,
+                numKeyValueHeads,
+                numAttentionHeads > 0 ? hiddenSize / numAttentionHeads : 0,
+                rmsNormEps,
+                ropeTheta,
+                maxPositionEmbeddings,
+                tieWordEmbeddings,
+                qkvBias,
+                List.of()
+        );
     }
 
     /**
@@ -67,7 +120,7 @@ public record LlamaConfig(
      * @return key/value dimension
      */
     public int kvDim() {
-        return numKeyValueHeads * headDim();
+        return numKeyValueHeads * headDim;
     }
 
     /**
@@ -95,13 +148,16 @@ public record LlamaConfig(
         int numHiddenLayers = getInt(map, "num_hidden_layers", 32);
         int numAttentionHeads = getInt(map, "num_attention_heads", 32);
         int numKeyValueHeads = getInt(map, "num_key_value_heads", numAttentionHeads);
+        int explicitHeadDim = getInt(map, "head_dim", 0);
+        int headDim = explicitHeadDim > 0 ? explicitHeadDim : (hiddenSize / numAttentionHeads);
         float rmsNormEps = getFloat(map, "rms_norm_eps", 1e-5f);
         float ropeTheta = getFloat(map, "rope_theta", 10000.0f);
         int maxPositionEmbeddings = getInt(map, "max_position_embeddings", 2048);
         boolean tieWordEmbeddings = getBoolean(map, "tie_word_embeddings", false);
 
-        // Qwen2.5 uses attention_bias=true or qkv_bias=true
+        // Qwen2.5 omits attention_bias even when bias tensors exist in safetensors; record as config hint
         boolean qkvBias = getBoolean(map, "attention_bias", false) || getBoolean(map, "qkv_bias", false);
+        List<Integer> eosTokenIds = getIntList(map, "eos_token_id");
 
         return new LlamaConfig(
                 vocabSize,
@@ -110,11 +166,13 @@ public record LlamaConfig(
                 numHiddenLayers,
                 numAttentionHeads,
                 numKeyValueHeads,
+                headDim,
                 rmsNormEps,
                 ropeTheta,
                 maxPositionEmbeddings,
                 tieWordEmbeddings,
-                qkvBias
+                qkvBias,
+                eosTokenIds
         );
     }
 
@@ -146,5 +204,22 @@ public record LlamaConfig(
         Object val = map.get(key);
         if (val instanceof Boolean b) return b;
         return def;
+    }
+
+    private static List<Integer> getIntList(Map<String, Object> map, String key) {
+        Object val = map.get(key);
+        if (val instanceof Number n) {
+            return List.of(n.intValue());
+        }
+        if (val instanceof List<?> list) {
+            List<Integer> ids = new ArrayList<>(list.size());
+            for (Object item : list) {
+                if (item instanceof Number n && !ids.contains(n.intValue())) {
+                    ids.add(n.intValue());
+                }
+            }
+            return List.copyOf(ids);
+        }
+        return List.of();
     }
 }

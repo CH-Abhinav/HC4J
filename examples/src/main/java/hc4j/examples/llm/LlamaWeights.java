@@ -35,9 +35,10 @@ public final class LlamaWeights implements AutoCloseable {
      * @param kProj              key projection weight [kvDim, hiddenSize] (f32 or f16)
      * @param vProj              value projection weight [kvDim, hiddenSize] (f32 or f16)
      * @param oProj              output projection weight [hiddenSize, hiddenSize] (f32 or f16)
-     * @param qBias              optional query projection bias [hiddenSize] (f32, may be null)
+     * @param qBias              optional query projection bias [qDim] (f32, may be null)
      * @param kBias              optional key projection bias [kvDim] (f32, may be null)
      * @param vBias              optional value projection bias [kvDim] (f32, may be null)
+     * @param oBias              optional output projection bias [hiddenSize] (f32, may be null)
      * @param postAttentionNorm  post-attention RMSNorm weight [hiddenSize] (f32)
      * @param gateProj           SwiGLU gate projection weight [intermediateSize, hiddenSize] (f32 or f16)
      * @param upProj             SwiGLU up projection weight [intermediateSize, hiddenSize] (f32 or f16)
@@ -52,11 +53,47 @@ public final class LlamaWeights implements AutoCloseable {
             Tensor qBias,
             Tensor kBias,
             Tensor vBias,
+            Tensor oBias,
             Tensor postAttentionNorm,
             Tensor gateProj,
             Tensor upProj,
             Tensor downProj
     ) implements AutoCloseable {
+
+        /**
+         * Backwards-compatible constructor without {@code o_proj.bias}.
+         *
+         * @param inputNorm         input RMSNorm weight
+         * @param qProj             query projection weight
+         * @param kProj             key projection weight
+         * @param vProj             value projection weight
+         * @param oProj             output projection weight
+         * @param qBias             optional query bias
+         * @param kBias             optional key bias
+         * @param vBias             optional value bias
+         * @param postAttentionNorm post-attention RMSNorm weight
+         * @param gateProj          SwiGLU gate weight
+         * @param upProj            SwiGLU up weight
+         * @param downProj          SwiGLU down weight
+         */
+        public LayerWeights(
+                Tensor inputNorm,
+                Tensor qProj,
+                Tensor kProj,
+                Tensor vProj,
+                Tensor oProj,
+                Tensor qBias,
+                Tensor kBias,
+                Tensor vBias,
+                Tensor postAttentionNorm,
+                Tensor gateProj,
+                Tensor upProj,
+                Tensor downProj
+        ) {
+            this(inputNorm, qProj, kProj, vProj, oProj, qBias, kBias, vBias, null,
+                    postAttentionNorm, gateProj, upProj, downProj);
+        }
+
         @Override
         public void close() {
             closeQuietly(inputNorm);
@@ -67,6 +104,7 @@ public final class LlamaWeights implements AutoCloseable {
             closeQuietly(qBias);
             closeQuietly(kBias);
             closeQuietly(vBias);
+            closeQuietly(oBias);
             closeQuietly(postAttentionNorm);
             closeQuietly(gateProj);
             closeQuietly(upProj);
@@ -81,6 +119,15 @@ public final class LlamaWeights implements AutoCloseable {
     private final boolean lmHeadTied;
     private boolean closed = false;
 
+    /**
+     * Constructs a loaded {@link LlamaWeights} container.
+     *
+     * @param embedTokens token embedding table [vocabSize, hiddenSize]
+     * @param layers      per-layer transformer weights
+     * @param finalNorm   final RMSNorm weight [hiddenSize]
+     * @param lmHead      output projection weight [vocabSize, hiddenSize]
+     * @param lmHeadTied  whether {@code lmHead} shares the underlying tensor with {@code embedTokens}
+     */
     public LlamaWeights(Tensor embedTokens, List<LayerWeights> layers, Tensor finalNorm, Tensor lmHead, boolean lmHeadTied) {
         this.embedTokens = Objects.requireNonNull(embedTokens, "embedTokens");
         this.layers = List.copyOf(layers);
@@ -89,10 +136,40 @@ public final class LlamaWeights implements AutoCloseable {
         this.lmHeadTied = lmHeadTied;
     }
 
+    /**
+     * Returns the token embedding weight tensor.
+     *
+     * @return embedding tensor
+     */
     public Tensor embedTokens() { return embedTokens; }
+
+    /**
+     * Returns the immutable list of per-layer weights.
+     *
+     * @return layer weights list
+     */
     public List<LayerWeights> layers() { return layers; }
+
+    /**
+     * Returns the weights for decoder layer {@code idx}.
+     *
+     * @param idx zero-based layer index
+     * @return layer weights
+     */
     public LayerWeights layer(int idx) { return layers.get(idx); }
+
+    /**
+     * Returns the final RMSNorm weight tensor.
+     *
+     * @return final norm tensor
+     */
     public Tensor finalNorm() { return finalNorm; }
+
+    /**
+     * Returns the LM head weight tensor.
+     *
+     * @return LM head tensor
+     */
     public Tensor lmHead() { return lmHead; }
 
     /**
@@ -126,12 +203,11 @@ public final class LlamaWeights implements AutoCloseable {
                 Tensor vProj = reader.loadTensor(prefix + "self_attn.v_proj.weight", weightPrecision);
                 Tensor oProj = reader.loadTensor(prefix + "self_attn.o_proj.weight", weightPrecision);
 
-                Tensor qBias = (config.qkvBias() && reader.hasTensor(prefix + "self_attn.q_proj.bias"))
-                        ? reader.loadTensor(prefix + "self_attn.q_proj.bias", DType.f32) : null;
-                Tensor kBias = (config.qkvBias() && reader.hasTensor(prefix + "self_attn.k_proj.bias"))
-                        ? reader.loadTensor(prefix + "self_attn.k_proj.bias", DType.f32) : null;
-                Tensor vBias = (config.qkvBias() && reader.hasTensor(prefix + "self_attn.v_proj.bias"))
-                        ? reader.loadTensor(prefix + "self_attn.v_proj.bias", DType.f32) : null;
+                // Auto-detect attention biases directly from safetensors (Qwen2.5 omits "attention_bias" in config.json)
+                Tensor qBias = loadOptionalTensor(reader, prefix + "self_attn.q_proj.bias", DType.f32);
+                Tensor kBias = loadOptionalTensor(reader, prefix + "self_attn.k_proj.bias", DType.f32);
+                Tensor vBias = loadOptionalTensor(reader, prefix + "self_attn.v_proj.bias", DType.f32);
+                Tensor oBias = loadOptionalTensor(reader, prefix + "self_attn.o_proj.bias", DType.f32);
 
                 Tensor postAttnNorm = reader.loadTensor(prefix + "post_attention_layernorm.weight", DType.f32);
                 Tensor gateProj = reader.loadTensor(prefix + "mlp.gate_proj.weight", weightPrecision);
@@ -140,7 +216,7 @@ public final class LlamaWeights implements AutoCloseable {
 
                 layersList.add(new LayerWeights(
                         inputNorm, qProj, kProj, vProj, oProj,
-                        qBias, kBias, vBias,
+                        qBias, kBias, vBias, oBias,
                         postAttnNorm, gateProj, upProj, downProj
                 ));
             }
@@ -179,6 +255,10 @@ public final class LlamaWeights implements AutoCloseable {
                 closeQuietly(lmHead);
             }
         }
+    }
+
+    private static Tensor loadOptionalTensor(SafetensorsReader reader, String name, DType targetDType) {
+        return reader.hasTensor(name) ? reader.loadTensor(name, targetDType) : null;
     }
 
     private static void closeQuietly(Tensor t) {

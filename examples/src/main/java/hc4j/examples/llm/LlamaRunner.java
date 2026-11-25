@@ -295,7 +295,36 @@ public final class LlamaRunner implements AutoCloseable {
     }
 
     /**
+     * Returns the immutable set of EOS token IDs configured in {@link LlamaConfig}.
+     *
+     * @return set of config EOS token IDs
+     */
+    public Set<Integer> eosTokenIds() {
+        return collectEosTokenIds(config, null);
+    }
+
+    /**
+     * Collects the union of end-of-sequence token IDs declared by both {@link LlamaConfig}
+     * and {@link BpeTokenizer}.
+     *
+     * @param config    optional model config (may be null)
+     * @param tokenizer optional BPE tokenizer (may be null)
+     * @return immutable union of EOS token IDs
+     */
+    public static Set<Integer> collectEosTokenIds(LlamaConfig config, BpeTokenizer tokenizer) {
+        Set<Integer> eos = new LinkedHashSet<>();
+        if (tokenizer != null) {
+            eos.addAll(tokenizer.eosTokenIds());
+        }
+        if (config != null) {
+            eos.addAll(config.eosTokenIds());
+        }
+        return Collections.unmodifiableSet(eos);
+    }
+
+    /**
      * Greedy autoregressive generation returning the full token sequence {@code [prompt..., generated...]}.
+     * Automatically halts if any {@link LlamaConfig#eosTokenIds()} token is generated.
      *
      * @param promptTokens initial prompt token IDs
      * @param maxNewTokens maximum number of new tokens to generate
@@ -320,6 +349,7 @@ public final class LlamaRunner implements AutoCloseable {
 
     /**
      * Greedy autoregressive generation returning the full token sequence {@code [prompt..., generated...]}.
+     * Automatically halts if any {@link LlamaConfig#eosTokenIds()} token is generated.
      *
      * @param promptTokens initial prompt token IDs
      * @param maxNewTokens maximum number of new tokens to generate
@@ -330,11 +360,25 @@ public final class LlamaRunner implements AutoCloseable {
     }
 
     /**
-     * Greedy autoregressive generation stopping cleanly if any token in {@code eosTokenIds} is emitted.
+     * Greedy autoregressive generation stopping cleanly if any token in {@code config.eosTokenIds()}
+     * or {@code tokenizer.eosTokenIds()} is emitted.
      *
      * @param promptTokens initial prompt token IDs
      * @param maxNewTokens maximum number of new tokens to generate
-     * @param eosTokenIds  end-of-sequence token IDs causing early termination (may be empty)
+     * @param tokenizer    optional tokenizer contributing EOS token IDs (may be null)
+     * @return full token array containing prompt and generated tokens
+     */
+    public int[] generateGreedy(int[] promptTokens, int maxNewTokens, BpeTokenizer tokenizer) {
+        return generateGreedy(promptTokens, maxNewTokens, tokenizer != null ? tokenizer.eosTokenIds() : Set.of());
+    }
+
+    /**
+     * Greedy autoregressive generation stopping cleanly if any token in {@code eosTokenIds}
+     * or {@link LlamaConfig#eosTokenIds()} is emitted.
+     *
+     * @param promptTokens initial prompt token IDs
+     * @param maxNewTokens maximum number of new tokens to generate
+     * @param eosTokenIds  additional end-of-sequence token IDs causing early termination (may be null or empty)
      * @return full token array containing prompt and generated tokens
      */
     public int[] generateGreedy(int[] promptTokens, int maxNewTokens, Set<Integer> eosTokenIds) {
@@ -346,7 +390,10 @@ public final class LlamaRunner implements AutoCloseable {
         if (maxNewTokens < 0) {
             throw new IllegalArgumentException("maxNewTokens must be non-negative, got " + maxNewTokens);
         }
-        Set<Integer> eos = eosTokenIds != null ? eosTokenIds : Set.of();
+        Set<Integer> eos = new LinkedHashSet<>(config.eosTokenIds());
+        if (eosTokenIds != null) {
+            eos.addAll(eosTokenIds);
+        }
 
         List<Integer> seq = new ArrayList<>(promptTokens.length + maxNewTokens);
         for (int t : promptTokens) {
@@ -519,7 +566,7 @@ public final class LlamaRunner implements AutoCloseable {
                         attnFlat = layerScope.track(ctxPerm.reshape(seqLen, numHeads * headDim)); // [S, D]
                     }
 
-                    Tensor projOut = layerScope.track(Nn.linearTransposed(attnFlat, lw.oProj(), null));
+                    Tensor projOut = layerScope.track(Nn.linearTransposed(attnFlat, lw.oProj(), lw.oBias()));
                     Tensor outAttn = layerScope.track(hidden.add(projOut));
 
                     Tensor normX2 = layerScope.track(outAttn.rmsNorm(lw.postAttentionNorm(), eps));

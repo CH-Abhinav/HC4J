@@ -53,7 +53,7 @@ class LlamaRunnerTest {
         final LlamaConfig config;
         final float[] embed;
         final float[][] inNorms, qProjs, kProjs, vProjs, oProjs, postNorms, gateProjs, upProjs, downProjs;
-        final float[][] qBiases, kBiases, vBiases;
+        final float[][] qBiases, kBiases, vBiases, oBiases;
         final float[] finalNorm;
         final float[] lmHead;
         final List<List<double[]>> kCache = new ArrayList<>();
@@ -63,7 +63,7 @@ class LlamaRunnerTest {
         ReferenceTransformerF64(
                 LlamaConfig config, float[] embed,
                 float[][] inNorms, float[][] qProjs, float[][] kProjs, float[][] vProjs, float[][] oProjs,
-                float[][] qBiases, float[][] kBiases, float[][] vBiases,
+                float[][] qBiases, float[][] kBiases, float[][] vBiases, float[][] oBiases,
                 float[][] postNorms, float[][] gateProjs, float[][] upProjs, float[][] downProjs,
                 float[] finalNorm, float[] lmHead
         ) {
@@ -77,6 +77,7 @@ class LlamaRunnerTest {
             this.qBiases = qBiases;
             this.kBiases = kBiases;
             this.vBiases = vBiases;
+            this.oBiases = oBiases;
             this.postNorms = postNorms;
             this.gateProjs = gateProjs;
             this.upProjs = upProjs;
@@ -93,6 +94,7 @@ class LlamaRunnerTest {
             int seqLen = tokens.length;
             int D = config.hiddenSize();
             int H = config.numAttentionHeads();
+            int numHeads = H;
             int Hkv = config.numKeyValueHeads();
             int Dh = config.headDim();
             int kvDim = config.kvDim();
@@ -108,10 +110,10 @@ class LlamaRunnerTest {
             }
 
             for (int l = 0; l < config.numHiddenLayers(); l++) {
-                double[][] qSeq = new double[seqLen][D];
+                double[][] qSeq = new double[seqLen][numHeads * Dh];
                 for (int s = 0; s < seqLen; s++) {
                     double[] norm1 = rmsNorm(hidden[s], inNorms[l], config.rmsNormEps());
-                    double[] q = matVecT(norm1, qProjs[l], qBiases != null ? qBiases[l] : null, D, D);
+                    double[] q = matVecT(norm1, qProjs[l], qBiases != null ? qBiases[l] : null, numHeads * Dh, D);
                     double[] k = matVecT(norm1, kProjs[l], kBiases != null ? kBiases[l] : null, kvDim, D);
                     double[] v = matVecT(norm1, vProjs[l], vBiases != null ? vBiases[l] : null, kvDim, D);
 
@@ -126,7 +128,7 @@ class LlamaRunnerTest {
 
                 for (int s = 0; s < seqLen; s++) {
                     int totalContext = curPos + s + 1;
-                    double[] attnOut = new double[D];
+                    double[] attnOut = new double[numHeads * Dh];
                     for (int h = 0; h < H; h++) {
                         int kvH = h / groupSize;
                         double[] scores = new double[totalContext];
@@ -154,7 +156,7 @@ class LlamaRunnerTest {
                         }
                     }
 
-                    double[] oOut = matVecT(attnOut, oProjs[l], null, D, D);
+                    double[] oOut = matVecT(attnOut, oProjs[l], oBiases != null ? oBiases[l] : null, D, numHeads * Dh);
                     for (int d = 0; d < D; d++) {
                         hidden[s][d] += oOut[d];
                     }
@@ -232,6 +234,20 @@ class LlamaRunnerTest {
     private static ReferenceTransformerF64 writeSyntheticModel(
             Path dir, LlamaConfig cfg, DType weightDType, long seed
     ) throws IOException {
+        return writeSyntheticModel(dir, cfg, weightDType, seed, cfg.qkvBias(), false, false, 0.05f, false);
+    }
+
+    private static ReferenceTransformerF64 writeSyntheticModel(
+            Path dir,
+            LlamaConfig cfg,
+            DType weightDType,
+            long seed,
+            boolean writeQkvBiases,
+            boolean omitAttentionBiasInConfig,
+            boolean writeOBias,
+            float biasScale,
+            boolean omitLmHeadWhenUntied
+    ) throws IOException {
         Map<String, Object> cfgMap = new LinkedHashMap<>();
         cfgMap.put("vocab_size", cfg.vocabSize());
         cfgMap.put("hidden_size", cfg.hiddenSize());
@@ -239,11 +255,21 @@ class LlamaRunnerTest {
         cfgMap.put("num_hidden_layers", cfg.numHiddenLayers());
         cfgMap.put("num_attention_heads", cfg.numAttentionHeads());
         cfgMap.put("num_key_value_heads", cfg.numKeyValueHeads());
+        if (cfg.headDim() != cfg.hiddenSize() / cfg.numAttentionHeads()) {
+            cfgMap.put("head_dim", cfg.headDim());
+        }
         cfgMap.put("rms_norm_eps", cfg.rmsNormEps());
         cfgMap.put("rope_theta", cfg.ropeTheta());
         cfgMap.put("max_position_embeddings", cfg.maxPositionEmbeddings());
         cfgMap.put("tie_word_embeddings", cfg.tieWordEmbeddings());
-        cfgMap.put("attention_bias", cfg.qkvBias());
+        if (!omitAttentionBiasInConfig) {
+            cfgMap.put("attention_bias", cfg.qkvBias());
+        }
+        if (!cfg.eosTokenIds().isEmpty()) {
+            cfgMap.put("eos_token_id", cfg.eosTokenIds().size() == 1
+                    ? cfg.eosTokenIds().getFirst()
+                    : cfg.eosTokenIds());
+        }
         Files.writeString(dir.resolve("config.json"), MinimalJson.serialize(cfgMap));
 
         Random rng = new Random(seed);
@@ -252,6 +278,7 @@ class LlamaRunnerTest {
 
         int V = cfg.vocabSize();
         int D = cfg.hiddenSize();
+        int qDim = cfg.numAttentionHeads() * cfg.headDim();
         int I = cfg.intermediateSize();
         int L = cfg.numHiddenLayers();
         int kvDim = cfg.kvDim();
@@ -264,9 +291,10 @@ class LlamaRunnerTest {
         float[][] kProjs = new float[L][];
         float[][] vProjs = new float[L][];
         float[][] oProjs = new float[L][];
-        float[][] qBiases = cfg.qkvBias() ? new float[L][] : null;
-        float[][] kBiases = cfg.qkvBias() ? new float[L][] : null;
-        float[][] vBiases = cfg.qkvBias() ? new float[L][] : null;
+        float[][] qBiases = writeQkvBiases ? new float[L][] : null;
+        float[][] kBiases = writeQkvBiases ? new float[L][] : null;
+        float[][] vBiases = writeQkvBiases ? new float[L][] : null;
+        float[][] oBiases = writeOBias ? new float[L][] : null;
         float[][] postNorms = new float[L][];
         float[][] gateProjs = new float[L][];
         float[][] upProjs = new float[L][];
@@ -275,28 +303,32 @@ class LlamaRunnerTest {
         for (int l = 0; l < L; l++) {
             String p = "model.layers." + l + ".";
             inNorms[l] = positiveRandArray(rng, D, 0.8f, 1.2f);
-            qProjs[l] = randArray(rng, D * D, 0.08f);
+            qProjs[l] = randArray(rng, qDim * D, 0.08f);
             kProjs[l] = randArray(rng, kvDim * D, 0.08f);
             vProjs[l] = randArray(rng, kvDim * D, 0.08f);
-            oProjs[l] = randArray(rng, D * D, 0.08f);
+            oProjs[l] = randArray(rng, D * qDim, 0.08f);
             postNorms[l] = positiveRandArray(rng, D, 0.8f, 1.2f);
             gateProjs[l] = randArray(rng, I * D, 0.08f);
             upProjs[l] = randArray(rng, I * D, 0.08f);
             downProjs[l] = randArray(rng, D * I, 0.08f);
 
             weightMap.put(p + "input_layernorm.weight", SafetensorsWriter.ofFloat(new int[]{D}, inNorms[l]));
-            weightMap.put(p + "self_attn.q_proj.weight", makePayload(useHalf, new int[]{D, D}, qProjs[l]));
+            weightMap.put(p + "self_attn.q_proj.weight", makePayload(useHalf, new int[]{qDim, D}, qProjs[l]));
             weightMap.put(p + "self_attn.k_proj.weight", makePayload(useHalf, new int[]{kvDim, D}, kProjs[l]));
             weightMap.put(p + "self_attn.v_proj.weight", makePayload(useHalf, new int[]{kvDim, D}, vProjs[l]));
-            weightMap.put(p + "self_attn.o_proj.weight", makePayload(useHalf, new int[]{D, D}, oProjs[l]));
+            weightMap.put(p + "self_attn.o_proj.weight", makePayload(useHalf, new int[]{D, qDim}, oProjs[l]));
 
-            if (cfg.qkvBias()) {
-                qBiases[l] = randArray(rng, D, 0.05f);
-                kBiases[l] = randArray(rng, kvDim, 0.05f);
-                vBiases[l] = randArray(rng, kvDim, 0.05f);
-                weightMap.put(p + "self_attn.q_proj.bias", SafetensorsWriter.ofFloat(new int[]{D}, qBiases[l]));
+            if (writeQkvBiases) {
+                qBiases[l] = randArray(rng, qDim, biasScale);
+                kBiases[l] = randArray(rng, kvDim, biasScale);
+                vBiases[l] = randArray(rng, kvDim, biasScale);
+                weightMap.put(p + "self_attn.q_proj.bias", SafetensorsWriter.ofFloat(new int[]{qDim}, qBiases[l]));
                 weightMap.put(p + "self_attn.k_proj.bias", SafetensorsWriter.ofFloat(new int[]{kvDim}, kBiases[l]));
                 weightMap.put(p + "self_attn.v_proj.bias", SafetensorsWriter.ofFloat(new int[]{kvDim}, vBiases[l]));
+            }
+            if (writeOBias) {
+                oBiases[l] = randArray(rng, D, biasScale);
+                weightMap.put(p + "self_attn.o_proj.bias", SafetensorsWriter.ofFloat(new int[]{D}, oBiases[l]));
             }
 
             weightMap.put(p + "post_attention_layernorm.weight", SafetensorsWriter.ofFloat(new int[]{D}, postNorms[l]));
@@ -309,7 +341,7 @@ class LlamaRunnerTest {
         weightMap.put("model.norm.weight", SafetensorsWriter.ofFloat(new int[]{D}, finalNorm));
 
         float[] lmHead;
-        if (cfg.tieWordEmbeddings()) {
+        if (cfg.tieWordEmbeddings() || omitLmHeadWhenUntied) {
             lmHead = embed;
         } else {
             lmHead = randArray(rng, V * D, 0.08f);
@@ -319,7 +351,7 @@ class LlamaRunnerTest {
         SafetensorsWriter.write(dir.resolve("model.safetensors"), weightMap);
         return new ReferenceTransformerF64(
                 cfg, embed, inNorms, qProjs, kProjs, vProjs, oProjs,
-                qBiases, kBiases, vBiases, postNorms, gateProjs, upProjs, downProjs,
+                qBiases, kBiases, vBiases, oBiases, postNorms, gateProjs, upProjs, downProjs,
                 finalNorm, lmHead
         );
     }
@@ -612,6 +644,151 @@ class LlamaRunnerTest {
         assertEquals(memBefore.tensorsDevice(), memAfterCli.tensorsDevice());
         assertEquals(memBefore.tensorsHost(), memAfterCli.tensorsHost());
         assertEquals(memBefore.tensorsEvicted(), memAfterCli.tensorsEvicted());
+    }
+
+    @Test
+    @DisplayName("Qwen2.5 Regression: omitted attention_bias auto-detected for Q/K/V/O, array eos_token_id, scientific config & CLI UX")
+    void testQwen25OmittedAttentionBiasAndConfigFields(@TempDir Path tempDir) throws IOException {
+        // Verify MinimalJson & LlamaConfig scientific notation, large rope_theta, explicit head_dim, and array eos_token_id
+        String qwenConfigJson = """
+                {
+                  "vocab_size": 32,
+                  "hidden_size": 16,
+                  "intermediate_size": 32,
+                  "num_hidden_layers": 2,
+                  "num_attention_heads": 4,
+                  "num_key_value_heads": 2,
+                  "rms_norm_eps": 1e-06,
+                  "rope_theta": 1e6,
+                  "max_position_embeddings": 32768,
+                  "tie_word_embeddings": true,
+                  "eos_token_id": [15, 16]
+                }
+                """;
+        LlamaConfig parsedCfg = LlamaConfig.fromJson(qwenConfigJson);
+        assertFalse(parsedCfg.qkvBias(), "attention_bias omitted so config flag defaults to false");
+        assertEquals(1e-6f, parsedCfg.rmsNormEps(), 1e-12f);
+        assertEquals(1_000_000.0f, parsedCfg.ropeTheta(), 1e-3f);
+        assertEquals(4, parsedCfg.headDim());
+        assertEquals(List.of(15, 16), parsedCfg.eosTokenIds());
+
+        // Also check explicit head_dim override (e.g. Qwen3-style non-hiddenSize/heads)
+        LlamaConfig explicitHeadCfg = LlamaConfig.fromJson("""
+                {"vocab_size":32,"hidden_size":16,"intermediate_size":32,"num_hidden_layers":1,
+                 "num_attention_heads":2,"num_key_value_heads":1,"head_dim":8,"eos_token_id":151645}
+                """);
+        assertEquals(8, explicitHeadCfg.headDim());
+        assertEquals(2, explicitHeadCfg.gqaRatio());
+        assertEquals(List.of(151645), explicitHeadCfg.eosTokenIds());
+
+        var memBefore = Engine.memoryStats();
+
+        // 1. F32 model: omits attention_bias in config.json, writes +/-20.0 Q/K/V biases + EOS [15, 16]
+        Path f32Dir = tempDir.resolve("qwen_f32");
+        Files.createDirectories(f32Dir);
+        ReferenceTransformerF64 refF32 = writeSyntheticModel(
+                f32Dir, parsedCfg, DType.f32, 31415L, true, true, false, 20.0f, false);
+
+        LlamaConfig loadedCfgF32 = LlamaConfig.fromFile(f32Dir.resolve("config.json"));
+        assertFalse(loadedCfgF32.qkvBias());
+        assertEquals(List.of(15, 16), loadedCfgF32.eosTokenIds());
+
+        int[] prompt = new int[]{2, 7, 13, 4};
+        try (SafetensorsReader reader = SafetensorsReader.open(f32Dir);
+             LlamaWeights weights = LlamaWeights.load(reader, loadedCfgF32, DType.f32);
+             LlamaRunner runner = new LlamaRunner(loadedCfgF32, weights, 64)) {
+
+            for (LlamaWeights.LayerWeights lw : weights.layers()) {
+                assertNotNull(lw.qBias(), "q_proj.bias must be auto-detected even when attention_bias is omitted");
+                assertNotNull(lw.kBias(), "k_proj.bias must be auto-detected even when attention_bias is omitted");
+                assertNotNull(lw.vBias(), "v_proj.bias must be auto-detected even when attention_bias is omitted");
+                assertNull(lw.oBias(), "o_proj.bias absent so expected null");
+            }
+            assertEquals(java.util.Set.of(15, 16), runner.eosTokenIds());
+
+            float[] gpuPrefill = runner.forward(prompt);
+            float[] refPrefill = refF32.forward(prompt);
+            assertArrayEquals(refPrefill, gpuPrefill, 1e-4f, "F32 Qwen2.5-style prefill with +/-20 QKV biases");
+
+            int nextTok = LlamaRunner.argmax(gpuPrefill);
+            for (int step = 0; step < 3; step++) {
+                float[] gpuDec = runner.forward(new int[]{nextTok});
+                float[] refDec = refF32.forward(new int[]{nextTok});
+                assertArrayEquals(refDec, gpuDec, 1e-4f, "F32 Qwen2.5-style decode step " + step);
+                nextTok = LlamaRunner.argmax(gpuDec);
+            }
+        }
+
+        // 2. F16 model: omits attention_bias in config.json, includes Q/K/V + optional O biases (+/-20.0), tied fallback
+        Path f16Dir = tempDir.resolve("qwen_f16");
+        Files.createDirectories(f16Dir);
+        LlamaConfig untiedFallbackCfg = new LlamaConfig(
+                32, 16, 32, 2, 4, 2, 4, 1e-6f, 1_000_000.0f, 32768, false, false, List.of(15, 16));
+        ReferenceTransformerF64 refF16 = writeSyntheticModel(
+                f16Dir, untiedFallbackCfg, DType.f16, 27182L, true, true, true, 20.0f, true);
+
+        LlamaConfig loadedCfgF16 = LlamaConfig.fromFile(f16Dir.resolve("config.json"));
+        try (SafetensorsReader reader = SafetensorsReader.open(f16Dir);
+             LlamaWeights weights = LlamaWeights.load(reader, loadedCfgF16, DType.f16);
+             LlamaRunner runner = new LlamaRunner(loadedCfgF16, weights, 64)) {
+
+            assertNotNull(weights.layer(0).qBias());
+            assertNotNull(weights.layer(0).kBias());
+            assertNotNull(weights.layer(0).vBias());
+            assertNotNull(weights.layer(0).oBias(), "o_proj.bias should be auto-detected when present");
+            assertSame(weights.embedTokens(), weights.lmHead(), "lm_head should fall back to embedTokens when absent");
+
+            float[] gpuPrefill = runner.forward(prompt);
+            float[] refPrefill = refF16.forward(prompt);
+            assertArrayEquals(refPrefill, gpuPrefill, 2e-2f, "F16 Qwen2.5-style prefill with +/-20 Q/K/V/O biases");
+
+            int nextTok = LlamaRunner.argmax(gpuPrefill);
+            for (int step = 0; step < 3; step++) {
+                float[] gpuDec = runner.forward(new int[]{nextTok});
+                float[] refDec = refF16.forward(new int[]{nextTok});
+                assertArrayEquals(refDec, gpuDec, 2e-2f, "F16 Qwen2.5-style decode step " + step);
+                nextTok = LlamaRunner.argmax(gpuDec);
+            }
+
+            // Verify LlamaRunner stops early when config EOS token ID is generated
+            runner.reset();
+            LlamaConfig stopNowCfg = new LlamaConfig(
+                    32, 16, 32, 2, 4, 2, 4, 1e-6f, 1_000_000.0f, 32768, true, false,
+                    List.of(LlamaRunner.argmax(gpuPrefill)));
+            try (LlamaRunner eosRunner = new LlamaRunner(stopNowCfg, weights, 64)) {
+                int[] seq = eosRunner.generateGreedy(prompt, 8, java.util.Set.of(31));
+                assertEquals(prompt.length + 1, seq.length,
+                        "generateGreedy must stop immediately when config.eosTokenIds() triggers");
+            }
+        }
+
+        // 3. Verify CLI prompt unescaping and transition-only morph trace formatting
+        assertEquals("<|im_start|>user\nHi\tthere\\end\r\n<|im_start|>assistant\n",
+                LlamaCli.unescapePrompt("<|im_start|>user\\nHi\\tthere\\\\end\\r\\n<|im_start|>assistant\\n"));
+
+        WorkloadPlan wp = WorkloadPlanner.plan(
+                List.of(new DeviceProfile(0, "GPU0", "Discrete", 0x10DE, 1, 8_000_000_000L, 1000.0)),
+                List.of(),
+                WorkloadSpec.builder(100, 10.0, 16).build());
+        RolePlan prefillPlan = new RolePlan(wp, List.of(), 0.1, 0.0, 0, 0, false, "BalancedTP");
+        RolePlan decodePlan = new RolePlan(wp, List.of(), 0.1, 0.0, 10, 1, true, "ReclaimedSplitKV+CPU");
+        List<PhaseEvent> sampleTrace = List.of(
+                new PhaseEvent(PhaseEvent.Phase.PREFILL, 20, 20, prefillPlan, null),
+                new PhaseEvent(PhaseEvent.Phase.DECODE, 1, 21, decodePlan, null),
+                new PhaseEvent(PhaseEvent.Phase.DECODE, 1, 22, decodePlan, null),
+                new PhaseEvent(PhaseEvent.Phase.DECODE, 1, 23, decodePlan, null)
+        );
+        List<String> formattedTrace = LlamaCli.formatMorphTraceLines(sampleTrace);
+        assertEquals(3, formattedTrace.size(), "Expected 2 transition lines + 1 summary line: " + formattedTrace);
+        assertTrue(formattedTrace.get(0).contains("PREFILL:"));
+        assertTrue(formattedTrace.get(1).contains("DECODE:"));
+        assertTrue(formattedTrace.get(2).contains("PREFILL/BalancedTP=1 steps"));
+        assertTrue(formattedTrace.get(2).contains("DECODE/ReclaimedSplitKV+CPU=3 steps"));
+
+        var memAfter = Engine.memoryStats();
+        assertEquals(memBefore.tensorsDevice(), memAfter.tensorsDevice());
+        assertEquals(memBefore.tensorsHost(), memAfter.tensorsHost());
+        assertEquals(memBefore.tensorsEvicted(), memAfter.tensorsEvicted());
     }
 
     // --- Helpers ---

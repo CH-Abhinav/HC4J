@@ -19,16 +19,16 @@ package hc4j.examples.llm;
 import hc4j.DType;
 import hc4j.collective.Collective;
 import hc4j.collective.HostCpuProfile;
+import hc4j.collective.RolePlan;
 import hc4j.engine.Engine;
-import java.io.IOException;
-import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.ArrayList;
-import java.util.LinkedHashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Random;
 import java.util.Set;
 
@@ -38,6 +38,11 @@ import java.util.Set;
  * temperature sampling, and live Prefill &rarr; Decode auto-morphing.
  */
 public final class LlamaCli {
+
+    /** Default host CPU compute throughput estimate (GFLOP/s) when {@code --distributed} is enabled. */
+    private static final double DEFAULT_CPU_GFLOPS = 250.0;
+    /** Default host CPU system memory bandwidth estimate (GB/s) when {@code --distributed} is enabled. */
+    private static final double DEFAULT_CPU_RAM_BW_GBPS = 50.0;
 
     private LlamaCli() {
         throw new AssertionError("No instances of LlamaCli");
@@ -52,12 +57,15 @@ public final class LlamaCli {
     public static void main(String[] args) throws Exception {
         Path modelDir = Paths.get(".");
         String promptText = null;
+        boolean rawPrompt = false;
         int[] explicitTokens = null;
         int maxNewTokens = 32;
         int maxSeqLen = LlamaRunner.DEFAULT_MAX_SEQ_LEN;
         DType precision = DType.f16;
         float temperature = 0.0f;
         int distributedRanks = 0;
+        double cpuGflops = DEFAULT_CPU_GFLOPS;
+        double cpuRamBwGbps = DEFAULT_CPU_RAM_BW_GBPS;
         boolean ignoreEos = false;
         long seed = System.nanoTime();
 
@@ -69,6 +77,7 @@ public final class LlamaCli {
                 case "--prompt" -> {
                     if (i + 1 < args.length) promptText = args[++i];
                 }
+                case "--raw-prompt" -> rawPrompt = true;
                 case "--tokens" -> {
                     if (i + 1 < args.length) {
                         String[] parts = args[++i].split(",");
@@ -103,6 +112,23 @@ public final class LlamaCli {
                         distributedRanks = 2;
                     }
                 }
+                case "--cpu-gflops" -> {
+                    if (i + 1 < args.length) {
+                        cpuGflops = Double.parseDouble(args[++i]);
+                        if (cpuGflops < 0.0 || !Double.isFinite(cpuGflops)) {
+                            throw new IllegalArgumentException("--cpu-gflops must be finite and >= 0, got " + cpuGflops);
+                        }
+                    }
+                }
+                case "--cpu-ram-bw-gbps" -> {
+                    if (i + 1 < args.length) {
+                        cpuRamBwGbps = Double.parseDouble(args[++i]);
+                        if (cpuRamBwGbps < 0.0 || !Double.isFinite(cpuRamBwGbps)) {
+                            throw new IllegalArgumentException(
+                                    "--cpu-ram-bw-gbps must be finite and >= 0, got " + cpuRamBwGbps);
+                        }
+                    }
+                }
                 case "--ignore-eos" -> ignoreEos = true;
                 case "--help", "-h" -> {
                     printUsage();
@@ -110,6 +136,10 @@ public final class LlamaCli {
                 }
                 default -> throw new IllegalArgumentException("Unknown CLI flag: " + args[i]);
             }
+        }
+
+        if (promptText != null && !rawPrompt) {
+            promptText = unescapePrompt(promptText);
         }
 
         Path configPath = modelDir.resolve("config.json");
@@ -143,16 +173,16 @@ public final class LlamaCli {
             promptTokens = new int[]{1, 150, 42};
         }
 
-        Set<Integer> eosTokenIds = ignoreEos ? Set.of() : collectEosTokenIds(tokenizer, configPath);
+        Set<Integer> eosTokenIds = ignoreEos ? Set.of() : LlamaRunner.collectEosTokenIds(config, tokenizer);
 
         System.out.println("==================================================================");
         System.out.println("HC4J Transformer LLM Runner (100% GPU)");
         System.out.println("==================================================================");
         System.out.println("Adapter: " + Engine.adapterInfo());
         System.out.println("Model Directory: " + modelDir.toAbsolutePath());
-        System.out.printf("Architecture: layers=%d, hidden=%d, intermediate=%d, heads=%d, kv_heads=%d, vocab=%d%n",
+        System.out.printf("Architecture: layers=%d, hidden=%d, intermediate=%d, heads=%d, kv_heads=%d, head_dim=%d, vocab=%d%n",
                 config.numHiddenLayers(), config.hiddenSize(), config.intermediateSize(),
-                config.numAttentionHeads(), config.numKeyValueHeads(), config.vocabSize());
+                config.numAttentionHeads(), config.numKeyValueHeads(), config.headDim(), config.vocabSize());
         System.out.printf("Config: weight_dtype=%s, max_seq_len=%d, temperature=%.2f%n",
                 precision, effectiveMaxSeqLen, temperature);
 
@@ -160,8 +190,13 @@ public final class LlamaCli {
         HostCpuProfile cpuProfile = HostCpuProfile.disabled();
         if (distributedRanks >= 2) {
             collective = Collective.open(distributedRanks);
-            cpuProfile = HostCpuProfile.of("Host-CPU", 16L * 1024 * 1024 * 1024, 250.0, 50.0, 32.0);
-            System.out.printf("Attached Collective: %d ranks + HostCpuProfile (live auto-morphing)%n", distributedRanks);
+            if (cpuGflops > 0.0 && cpuRamBwGbps > 0.0) {
+                cpuProfile = HostCpuProfile.of("Host-CPU", 16L * 1024 * 1024 * 1024, cpuGflops, cpuRamBwGbps, 32.0);
+                System.out.printf("Attached Collective: %d ranks + HostCpuProfile (%.1f GFLOP/s, %.1f GB/s RAM)%n",
+                        distributedRanks, cpuGflops, cpuRamBwGbps);
+            } else {
+                System.out.printf("Attached Collective: %d ranks (GPU-only; Host CPU disabled)%n", distributedRanks);
+            }
         }
 
         long vramBeforeLoad = Engine.memoryStats().vramUsed();
@@ -176,7 +211,8 @@ public final class LlamaCli {
                     reader.tensorNames().size(), weightVramMb);
 
             if (promptText != null) {
-                System.out.println("Prompt (" + promptTokens.length + " tokens): " + promptText);
+                String preview = promptText.replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t");
+                System.out.println("Prompt (" + promptTokens.length + " tokens): " + preview);
             } else {
                 System.out.println("Prompt Tokens: " + java.util.Arrays.toString(promptTokens));
             }
@@ -194,6 +230,7 @@ public final class LlamaCli {
             if (maxNewTokens > 0) {
                 if (promptText != null) {
                     System.out.print(promptText);
+                    System.out.flush();
                 }
                 emitToken(streamDecoder, nextToken, eosTokenIds);
                 generated.add(nextToken);
@@ -238,8 +275,8 @@ public final class LlamaCli {
 
             if (collective != null && !runner.morphTrace().isEmpty()) {
                 System.out.println("\nLive Prefill -> Decode Auto-Morphing Trace:");
-                for (PhaseEvent event : runner.morphTrace()) {
-                    System.out.println("  " + event.summary());
+                for (String line : formatMorphTraceLines(runner.morphTrace())) {
+                    System.out.println(line);
                 }
             }
         } finally {
@@ -291,39 +328,86 @@ public final class LlamaCli {
         return probs.length - 1;
     }
 
-    private static Set<Integer> collectEosTokenIds(BpeTokenizer tokenizer, Path configPath) throws IOException {
-        Set<Integer> eos = new LinkedHashSet<>();
-        if (tokenizer != null) {
-            eos.addAll(tokenizer.eosTokenIds());
-        }
-        if (Files.exists(configPath)) {
-            Map<String, Object> cfg = MinimalJson.parseObject(Files.readString(configPath, StandardCharsets.UTF_8));
-            Object eosObj = cfg.get("eos_token_id");
-            if (eosObj instanceof Number n) {
-                eos.add(n.intValue());
-            } else if (eosObj instanceof List<?> list) {
-                for (Object item : list) {
-                    if (item instanceof Number n) {
-                        eos.add(n.intValue());
-                    }
+    static String unescapePrompt(String raw) {
+        StringBuilder sb = new StringBuilder(raw.length());
+        for (int i = 0; i < raw.length(); i++) {
+            char c = raw.charAt(i);
+            if (c == '\\' && i + 1 < raw.length()) {
+                char next = raw.charAt(i + 1);
+                switch (next) {
+                    case 'n' -> { sb.append('\n'); i++; }
+                    case 't' -> { sb.append('\t'); i++; }
+                    case 'r' -> { sb.append('\r'); i++; }
+                    case '\\' -> { sb.append('\\'); i++; }
+                    default -> sb.append(c);
                 }
+            } else {
+                sb.append(c);
             }
         }
-        return eos;
+        return sb.toString();
+    }
+
+    static List<String> formatMorphTraceLines(List<PhaseEvent> trace) {
+        List<String> lines = new ArrayList<>();
+        if (trace == null || trace.isEmpty()) {
+            return lines;
+        }
+        PhaseEvent.Phase prevPhase = null;
+        String prevRegime = null;
+        int prevReclaimed = Integer.MIN_VALUE;
+        boolean prevCpuReclaimed = false;
+        boolean hasPrev = false;
+
+        Map<String, Integer> regimeCounts = new LinkedHashMap<>();
+        for (PhaseEvent event : trace) {
+            RolePlan rp = event.rolePlan();
+            String regime = rp != null ? rp.activeRegime() : "SingleGPU";
+            int reclaimedGpus = rp != null ? rp.reclaimedGpuCount() : 0;
+            boolean cpuReclaimed = rp != null && rp.cpuReclaimed();
+
+            regimeCounts.merge(event.phase().name() + "/" + regime, 1, Integer::sum);
+
+            if (!hasPrev
+                    || event.phase() != prevPhase
+                    || !Objects.equals(regime, prevRegime)
+                    || reclaimedGpus != prevReclaimed
+                    || cpuReclaimed != prevCpuReclaimed) {
+                lines.add("  " + event.summary());
+                prevPhase = event.phase();
+                prevRegime = regime;
+                prevReclaimed = reclaimedGpus;
+                prevCpuReclaimed = cpuReclaimed;
+                hasPrev = true;
+            }
+        }
+
+        StringBuilder summary = new StringBuilder("  Regime summary:");
+        for (Map.Entry<String, Integer> entry : regimeCounts.entrySet()) {
+            summary.append(' ').append(entry.getKey()).append('=').append(entry.getValue()).append(" steps;");
+        }
+        if (summary.charAt(summary.length() - 1) == ';') {
+            summary.deleteCharAt(summary.length() - 1);
+        }
+        lines.add(summary.toString());
+        return lines;
     }
 
     private static void printUsage() {
         System.out.println("Usage: LlamaCli [options]");
         System.out.println("Options:");
-        System.out.println("  --model-dir <dir>        Directory containing config.json, model.safetensors, and tokenizer.json");
-        System.out.println("  --prompt \"<text>\"        Text prompt to encode with tokenizer.json and stream output");
-        System.out.println("  --tokens <t1,t2,...>     Comma-separated prompt token IDs (fallback when tokenizer.json is absent)");
-        System.out.println("  --max-new-tokens <N>     Maximum number of new tokens to generate (default: 32)");
-        System.out.println("  --max-seq-len <N>        Maximum KV-cache sequence length (default: 2048)");
-        System.out.println("  --dtype <f16|f32>        Weight precision (default: f16)");
-        System.out.println("  --temperature <float>    Sampling temperature (0.0 = deterministic greedy, default: 0.0)");
-        System.out.println("  --seed <long>            Random seed for temperature sampling");
-        System.out.println("  --distributed [ranks]    Attach Collective (default 2 ranks) + HostCpuProfile for live auto-morphing");
-        System.out.println("  --ignore-eos             Continue generation past EOS token IDs");
+        System.out.println("  --model-dir <dir>         Directory containing config.json, model.safetensors, and tokenizer.json");
+        System.out.println("  --prompt \"<text>\"         Text prompt (supports \\n/\\t/\\r escapes unless --raw-prompt is passed)");
+        System.out.println("  --raw-prompt              Treat --prompt literally without escape conversion");
+        System.out.println("  --tokens <t1,t2,...>      Comma-separated prompt token IDs (fallback when tokenizer.json is absent)");
+        System.out.println("  --max-new-tokens <N>      Maximum number of new tokens to generate (default: 32)");
+        System.out.println("  --max-seq-len <N>         Maximum KV-cache sequence length (default: 2048)");
+        System.out.println("  --dtype <f16|f32>         Weight precision (default: f16)");
+        System.out.println("  --temperature <float>     Sampling temperature (0.0 = deterministic greedy, default: 0.0)");
+        System.out.println("  --seed <long>             Random seed for temperature sampling");
+        System.out.println("  --distributed [ranks]     Attach Collective (default 2 ranks) + HostCpuProfile for live auto-morphing");
+        System.out.println("  --cpu-gflops <GFLOPS>     Host CPU compute estimate for --distributed planning (default: 250.0, 0 disables CPU)");
+        System.out.println("  --cpu-ram-bw-gbps <GB/s>  Host CPU RAM bandwidth estimate for --distributed planning (default: 50.0)");
+        System.out.println("  --ignore-eos              Continue generation past EOS token IDs");
     }
 }

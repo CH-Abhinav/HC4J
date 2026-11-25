@@ -21,6 +21,7 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.text.Normalizer;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
@@ -31,8 +32,10 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.OptionalInt;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import java.util.regex.PatternSyntaxException;
 
 /**
  * Pure-Java zero-dependency Byte-Pair Encoding (BPE) tokenizer loading HuggingFace {@code tokenizer.json}.
@@ -50,9 +53,21 @@ public final class BpeTokenizer {
         METASPACE
     }
 
-    // Standard GPT-2 pre-tokenization pattern separating words (with leading space), numbers, punctuation, and runs of whitespace
+    // Standard GPT-2 pre-tokenization pattern separating contractions, words (with leading space), numbers, punctuation, and whitespace
     private static final Pattern GPT2_PRETOKEN_PATTERN = Pattern.compile(
-            " ?\\p{L}+| ?\\p{N}+| ?[^\\s\\p{L}\\p{N}]+|\\s+(?!\\S)|\\s+");
+            "'s|'t|'re|'ve|'m|'ll|'d| ?\\p{L}+| ?\\p{N}+| ?[^\\s\\p{L}\\p{N}]+|\\s+(?!\\S)|\\s+",
+            Pattern.UNICODE_CHARACTER_CLASS);
+
+    private static final Pattern DIGITS_INDIVIDUAL_PATTERN = Pattern.compile("\\p{N}");
+    private static final Pattern DIGITS_GROUPED_PATTERN = Pattern.compile("\\p{N}+");
+
+    private sealed interface PreTokenStep permits SplitStep, ByteLevelStep, MetaspaceStep {}
+
+    private record SplitStep(Pattern pattern, String behavior, boolean invert) implements PreTokenStep {}
+
+    private record ByteLevelStep(boolean addPrefixSpace, boolean useRegex) implements PreTokenStep {}
+
+    private record MetaspaceStep(char replacement, boolean addPrefixSpace) implements PreTokenStep {}
 
     private static final char[] BYTE_TO_CHAR = new char[256];
     private static final Map<Character, Byte> CHAR_TO_BYTE = new HashMap<>(512);
@@ -82,12 +97,15 @@ public final class BpeTokenizer {
     private final Set<Integer> specialTokenIds;
     private final Pattern addedTokenPattern;
     private final Mode mode;
-    private final boolean byteLevelUseRegex;
+    private final List<Normalizer.Form> normalizerForms;
+    private final List<PreTokenStep> preTokenSteps;
     private final char metaspaceChar;
     private final boolean metaspaceAddPrefixSpace;
+    private final boolean ignoreMerges;
     private final Integer unkTokenId;
     private final OptionalInt bosTokenId;
     private final Set<Integer> eosTokenIds;
+    private final Map<String, int[]> pieceCache = new ConcurrentHashMap<>();
 
     private BpeTokenizer(
             Map<String, Integer> tokenToId,
@@ -97,9 +115,11 @@ public final class BpeTokenizer {
             Set<Integer> specialTokenIds,
             Pattern addedTokenPattern,
             Mode mode,
-            boolean byteLevelUseRegex,
+            List<Normalizer.Form> normalizerForms,
+            List<PreTokenStep> preTokenSteps,
             char metaspaceChar,
             boolean metaspaceAddPrefixSpace,
+            boolean ignoreMerges,
             Integer unkTokenId,
             OptionalInt bosTokenId,
             Set<Integer> eosTokenIds
@@ -111,9 +131,11 @@ public final class BpeTokenizer {
         this.specialTokenIds = Collections.unmodifiableSet(specialTokenIds);
         this.addedTokenPattern = addedTokenPattern;
         this.mode = mode;
-        this.byteLevelUseRegex = byteLevelUseRegex;
+        this.normalizerForms = List.copyOf(normalizerForms);
+        this.preTokenSteps = List.copyOf(preTokenSteps);
         this.metaspaceChar = metaspaceChar;
         this.metaspaceAddPrefixSpace = metaspaceAddPrefixSpace;
+        this.ignoreMerges = ignoreMerges;
         this.unkTokenId = unkTokenId;
         this.bosTokenId = bosTokenId;
         this.eosTokenIds = Collections.unmodifiableSet(eosTokenIds);
@@ -208,7 +230,9 @@ public final class BpeTokenizer {
 
         Pattern addedTokenPattern = compileAddedTokenPattern(addedTokens.keySet());
 
+        List<Normalizer.Form> normalizerForms = parseNormalizerForms(root.get("normalizer"));
         TokenizerLayoutConfig layout = detectLayout(root, tokenToId);
+        boolean ignoreMerges = Boolean.TRUE.equals(model.get("ignore_merges"));
 
         Integer unkId = null;
         Object unkObj = model.get("unk_token");
@@ -216,12 +240,13 @@ public final class BpeTokenizer {
             unkId = tokenToId.get(unkTok);
         }
 
-        OptionalInt bosId = detectBosTokenId(root, tokenToId);
-        Set<Integer> eosIds = detectEosTokenIds(root, tokenToId);
+        OptionalInt bosId = detectBosTokenId(root, addedTokens, specialTokenIds);
+        Set<Integer> eosIds = detectEosTokenIds(root, addedTokens, specialTokenIds);
 
         return new BpeTokenizer(
                 tokenToId, idToToken, mergeRanks, addedTokens, specialTokenIds, addedTokenPattern,
-                layout.mode, layout.byteLevelUseRegex, layout.metaspaceChar, layout.metaspaceAddPrefixSpace,
+                layout.mode, normalizerForms, layout.preTokenSteps,
+                layout.metaspaceChar, layout.metaspaceAddPrefixSpace, ignoreMerges,
                 unkId, bosId, eosIds
         );
     }
@@ -246,9 +271,6 @@ public final class BpeTokenizer {
     public int[] encode(String text, boolean addBos) {
         Objects.requireNonNull(text, "text");
         List<Integer> out = new ArrayList<>();
-        if (addBos && bosTokenId.isPresent()) {
-            out.add(bosTokenId.getAsInt());
-        }
 
         if (addedTokenPattern == null) {
             encodeNormalChunk(text, out);
@@ -268,6 +290,13 @@ public final class BpeTokenizer {
             }
             if (lastEnd < text.length()) {
                 encodeNormalChunk(text.substring(lastEnd), out);
+            }
+        }
+
+        if (addBos && bosTokenId.isPresent()) {
+            int bos = bosTokenId.getAsInt();
+            if (out.isEmpty() || out.getFirst() != bos) {
+                out.addFirst(bos);
             }
         }
 
@@ -501,33 +530,161 @@ public final class BpeTokenizer {
         if (text.isEmpty()) {
             return;
         }
-        if (mode == Mode.METASPACE) {
-            StringBuilder mapped = new StringBuilder();
-            String replaced = text.replace(' ', metaspaceChar);
-            if (metaspaceAddPrefixSpace && !replaced.isEmpty() && replaced.charAt(0) != metaspaceChar) {
-                mapped.append(metaspaceChar);
+        String normalized = text;
+        for (Normalizer.Form form : normalizerForms) {
+            normalized = Normalizer.normalize(normalized, form);
+        }
+
+        List<String> chunks = List.of(normalized);
+        boolean encodedToTargetAlphabet = false;
+        for (PreTokenStep step : preTokenSteps) {
+            switch (step) {
+                case SplitStep s -> chunks = applySplit(chunks, s);
+                case ByteLevelStep bl -> {
+                    chunks = applyByteLevel(chunks, bl, encodedToTargetAlphabet);
+                    encodedToTargetAlphabet = true;
+                }
+                case MetaspaceStep ms -> {
+                    chunks = applyMetaspace(chunks, ms);
+                    encodedToTargetAlphabet = true;
+                }
             }
-            mapped.append(replaced);
-            runBpeOnPiece(mapped.toString(), out);
+        }
+
+        if (!encodedToTargetAlphabet && mode == Mode.BYTE_LEVEL) {
+            List<String> converted = new ArrayList<>(chunks.size());
+            for (String chunk : chunks) {
+                if (!chunk.isEmpty()) {
+                    converted.add(toByteLevelUnicode(chunk));
+                }
+            }
+            chunks = converted;
+        }
+
+        for (String piece : chunks) {
+            runBpeOnPiece(piece, out);
+        }
+    }
+
+    private static List<String> applySplit(List<String> inputs, SplitStep step) {
+        List<String> result = new ArrayList<>(inputs.size() * 2);
+        for (String chunk : inputs) {
+            if (chunk.isEmpty()) {
+                continue;
+            }
+            splitChunk(chunk, step.pattern(), step.behavior(), step.invert(), result);
+        }
+        return result;
+    }
+
+    private static void splitChunk(String text, Pattern pattern, String behavior, boolean invert, List<String> out) {
+        Matcher matcher = pattern.matcher(text);
+        if ("Removed".equalsIgnoreCase(behavior)) {
+            int lastEnd = 0;
+            while (matcher.find()) {
+                if (invert) {
+                    if (matcher.start() < matcher.end()) {
+                        out.add(matcher.group());
+                    }
+                } else if (matcher.start() > lastEnd) {
+                    out.add(text.substring(lastEnd, matcher.start()));
+                }
+                lastEnd = matcher.end();
+            }
+            if (!invert && lastEnd < text.length()) {
+                out.add(text.substring(lastEnd));
+            }
             return;
         }
 
-        if (byteLevelUseRegex) {
-            Matcher matcher = GPT2_PRETOKEN_PATTERN.matcher(text);
+        if ("MergedWithPrevious".equalsIgnoreCase(behavior)) {
+            int startOutIdx = out.size();
             int lastEnd = 0;
             while (matcher.find()) {
-                if (matcher.start() > lastEnd) {
-                    runBpeOnPiece(toByteLevelUnicode(text.substring(lastEnd, matcher.start())), out);
+                String gap = text.substring(lastEnd, matcher.start());
+                if (!gap.isEmpty()) {
+                    out.add(gap);
                 }
-                runBpeOnPiece(toByteLevelUnicode(matcher.group()), out);
+                String hit = matcher.group();
+                if (!hit.isEmpty()) {
+                    if (invert || out.size() == startOutIdx) {
+                        out.add(hit);
+                    } else {
+                        int lastIdx = out.size() - 1;
+                        out.set(lastIdx, out.get(lastIdx) + hit);
+                    }
+                }
                 lastEnd = matcher.end();
             }
             if (lastEnd < text.length()) {
-                runBpeOnPiece(toByteLevelUnicode(text.substring(lastEnd)), out);
+                out.add(text.substring(lastEnd));
             }
-        } else {
-            runBpeOnPiece(toByteLevelUnicode(text), out);
+            return;
         }
+
+        // Default ("Isolated", "Contiguous", "MergedWithNext" fallback): emit gaps and matches cleanly in order
+        int lastEnd = 0;
+        while (matcher.find()) {
+            if (matcher.start() > lastEnd) {
+                out.add(text.substring(lastEnd, matcher.start()));
+            }
+            if (!matcher.group().isEmpty()) {
+                out.add(matcher.group());
+            }
+            lastEnd = matcher.end();
+        }
+        if (lastEnd < text.length()) {
+            out.add(text.substring(lastEnd));
+        }
+    }
+
+    private static List<String> applyByteLevel(List<String> inputs, ByteLevelStep step, boolean alreadyByteLevel) {
+        List<String> current = inputs;
+        if (step.addPrefixSpace() && !alreadyByteLevel && !current.isEmpty()) {
+            List<String> prefixed = new ArrayList<>(current);
+            String first = prefixed.getFirst();
+            if (!first.isEmpty() && first.charAt(0) != ' ') {
+                prefixed.set(0, " " + first);
+            }
+            current = prefixed;
+        }
+        if (step.useRegex()) {
+            List<String> split = new ArrayList<>(current.size() * 4);
+            for (String chunk : current) {
+                if (!chunk.isEmpty()) {
+                    splitChunk(chunk, GPT2_PRETOKEN_PATTERN, "Isolated", false, split);
+                }
+            }
+            current = split;
+        }
+        if (alreadyByteLevel) {
+            return current;
+        }
+        List<String> out = new ArrayList<>(current.size());
+        for (String chunk : current) {
+            if (!chunk.isEmpty()) {
+                out.add(toByteLevelUnicode(chunk));
+            }
+        }
+        return out;
+    }
+
+    private static List<String> applyMetaspace(List<String> inputs, MetaspaceStep step) {
+        List<String> out = new ArrayList<>(inputs.size());
+        boolean firstPiece = true;
+        for (String chunk : inputs) {
+            if (chunk.isEmpty()) {
+                continue;
+            }
+            String replaced = chunk.replace(' ', step.replacement());
+            if (firstPiece && step.addPrefixSpace() && !replaced.isEmpty() && replaced.charAt(0) != step.replacement()) {
+                out.add(step.replacement() + replaced);
+            } else {
+                out.add(replaced);
+            }
+            firstPiece = false;
+        }
+        return out;
     }
 
     private static String toByteLevelUnicode(String raw) {
@@ -544,8 +701,15 @@ public final class BpeTokenizer {
             return;
         }
         Integer wholeId = tokenToId.get(unicodePiece);
-        if (wholeId != null && unicodePiece.length() == 1) {
+        if (wholeId != null && (ignoreMerges || Character.codePointCount(unicodePiece, 0, unicodePiece.length()) == 1)) {
             out.add(wholeId);
+            return;
+        }
+        int[] cached = pieceCache.get(unicodePiece);
+        if (cached != null) {
+            for (int id : cached) {
+                out.add(id);
+            }
             return;
         }
 
@@ -588,15 +752,21 @@ public final class BpeTokenizer {
             symbols = merged;
         }
 
-        for (String sym : symbols) {
+        int[] resolved = new int[symbols.size()];
+        for (int idx = 0; idx < symbols.size(); idx++) {
+            String sym = symbols.get(idx);
             Integer id = tokenToId.get(sym);
             if (id != null) {
-                out.add(id);
+                resolved[idx] = id;
             } else if (unkTokenId != null) {
-                out.add(unkTokenId);
+                resolved[idx] = unkTokenId;
             } else {
                 throw new IllegalArgumentException("Token piece not found in vocabulary: '" + sym + "'");
             }
+            out.add(resolved[idx]);
+        }
+        if (pieceCache.size() < 16384) {
+            pieceCache.putIfAbsent(unicodePiece, resolved);
         }
     }
 
@@ -644,77 +814,191 @@ public final class BpeTokenizer {
 
     private record TokenizerLayoutConfig(
             Mode mode,
-            boolean byteLevelUseRegex,
+            List<PreTokenStep> preTokenSteps,
             char metaspaceChar,
             boolean metaspaceAddPrefixSpace
     ) {}
 
-    private static TokenizerLayoutConfig detectLayout(Map<String, Object> root, Map<String, Integer> tokenToId) {
-        List<Map<?, ?>> nodes = new ArrayList<>();
-        collectTypedNodes(root.get("pre_tokenizer"), nodes);
-        collectTypedNodes(root.get("decoder"), nodes);
+    private static List<Normalizer.Form> parseNormalizerForms(Object normalizerObj) {
+        List<Normalizer.Form> forms = new ArrayList<>();
+        collectNormalizerForms(normalizerObj, forms);
+        return forms;
+    }
 
-        Boolean byteLevelRegex = null;
+    private static void collectNormalizerForms(Object node, List<Normalizer.Form> out) {
+        if (!(node instanceof Map<?, ?> map)) {
+            return;
+        }
+        Object typeObj = map.get("type");
+        if (typeObj instanceof String type) {
+            switch (type.toUpperCase()) {
+                case "NFC" -> out.add(Normalizer.Form.NFC);
+                case "NFD" -> out.add(Normalizer.Form.NFD);
+                case "NFKC" -> out.add(Normalizer.Form.NFKC);
+                case "NFKD" -> out.add(Normalizer.Form.NFKD);
+                case "SEQUENCE" -> {
+                    if (map.get("normalizers") instanceof List<?> list) {
+                        for (Object child : list) {
+                            collectNormalizerForms(child, out);
+                        }
+                    }
+                }
+                default -> {}
+            }
+        }
+    }
+
+    private static TokenizerLayoutConfig detectLayout(Map<String, Object> root, Map<String, Integer> tokenToId) {
+        List<PreTokenStep> steps = new ArrayList<>();
+        parsePreTokenizerSteps(root.get("pre_tokenizer"), steps);
+
+        List<Map<?, ?>> decoderNodes = new ArrayList<>();
+        collectTypedNodes(root.get("decoder"), decoderNodes);
+        List<Map<?, ?>> preNodes = new ArrayList<>();
+        collectTypedNodes(root.get("pre_tokenizer"), preNodes);
+
         boolean sawByteLevel = false;
         boolean sawMetaspace = false;
         char metaspaceChar = '\u2581';
         boolean metaspaceAddPrefix = false;
 
-        for (Map<?, ?> node : nodes) {
-            Object typeObj = node.get("type");
-            if (!(typeObj instanceof String type)) {
+        for (Map<?, ?> node : decoderNodes) {
+            if (!(node.get("type") instanceof String type)) {
                 continue;
             }
             if ("ByteLevel".equalsIgnoreCase(type)) {
                 sawByteLevel = true;
-                Object useRegexObj = node.get("use_regex");
-                if (useRegexObj instanceof Boolean b && byteLevelRegex == null) {
-                    byteLevelRegex = b;
-                }
             } else if ("Metaspace".equalsIgnoreCase(type)) {
                 sawMetaspace = true;
-                Object repObj = node.get("replacement");
-                if (repObj instanceof String s && !s.isEmpty()) {
-                    metaspaceChar = s.charAt(0);
+                metaspaceChar = parseMetaspaceChar(node, metaspaceChar);
+                metaspaceAddPrefix = parseMetaspaceAddPrefix(node, metaspaceAddPrefix);
+            }
+        }
+
+        for (Map<?, ?> node : preNodes) {
+            if (!(node.get("type") instanceof String type)) {
+                continue;
+            }
+            if ("ByteLevel".equalsIgnoreCase(type)) {
+                sawByteLevel = true;
+            } else if ("Metaspace".equalsIgnoreCase(type)) {
+                sawMetaspace = true;
+                metaspaceChar = parseMetaspaceChar(node, metaspaceChar);
+                metaspaceAddPrefix = parseMetaspaceAddPrefix(node, metaspaceAddPrefix);
+            }
+        }
+
+        Mode mode;
+        if (sawByteLevel) {
+            mode = Mode.BYTE_LEVEL;
+        } else if (sawMetaspace) {
+            mode = Mode.METASPACE;
+        } else {
+            boolean hasByteSpace = false;
+            boolean hasMetaspaceChar = false;
+            for (String tok : tokenToId.keySet()) {
+                if (tok.indexOf('\u0120') >= 0) {
+                    hasByteSpace = true;
+                    break;
                 }
-                Object addPrefixObj = node.get("add_prefix_space");
-                if (addPrefixObj instanceof Boolean b) {
-                    metaspaceAddPrefix = b;
-                } else {
-                    Object schemeObj = node.get("prepend_scheme");
-                    if (schemeObj instanceof String scheme) {
-                        metaspaceAddPrefix = "always".equalsIgnoreCase(scheme) || "first".equalsIgnoreCase(scheme);
+                if (tok.indexOf('\u2581') >= 0) {
+                    hasMetaspaceChar = true;
+                }
+            }
+            mode = hasByteSpace ? Mode.BYTE_LEVEL : (hasMetaspaceChar ? Mode.METASPACE : Mode.BYTE_LEVEL);
+        }
+
+        if (steps.isEmpty()) {
+            if (mode == Mode.METASPACE) {
+                steps.add(new MetaspaceStep(metaspaceChar, metaspaceAddPrefix));
+            } else {
+                steps.add(new ByteLevelStep(false, true));
+            }
+        }
+
+        return new TokenizerLayoutConfig(mode, steps, metaspaceChar, metaspaceAddPrefix);
+    }
+
+    private static void parsePreTokenizerSteps(Object node, List<PreTokenStep> steps) {
+        if (!(node instanceof Map<?, ?> map)) {
+            return;
+        }
+        if (!(map.get("type") instanceof String type)) {
+            return;
+        }
+        switch (type) {
+            case "Sequence" -> {
+                if (map.get("pretokenizers") instanceof List<?> children) {
+                    for (Object child : children) {
+                        parsePreTokenizerSteps(child, steps);
                     }
                 }
             }
-        }
-
-        if (sawByteLevel) {
-            return new TokenizerLayoutConfig(Mode.BYTE_LEVEL, byteLevelRegex == null || byteLevelRegex, metaspaceChar, false);
-        }
-        if (sawMetaspace) {
-            return new TokenizerLayoutConfig(Mode.METASPACE, true, metaspaceChar, metaspaceAddPrefix);
-        }
-
-        // Vocab-based fallback detection
-        boolean hasByteSpace = false;
-        boolean hasMetaspaceChar = false;
-        for (String tok : tokenToId.keySet()) {
-            if (tok.indexOf('\u0120') >= 0) {
-                hasByteSpace = true;
-                break;
+            case "Split" -> {
+                Pattern pat = parseSplitPattern(map.get("pattern"));
+                if (pat != null) {
+                    String behavior = (map.get("behavior") instanceof String b) ? b : "Isolated";
+                    boolean invert = Boolean.TRUE.equals(map.get("invert"));
+                    steps.add(new SplitStep(pat, behavior, invert));
+                }
             }
-            if (tok.indexOf('\u2581') >= 0) {
-                hasMetaspaceChar = true;
+            case "Digits" -> {
+                boolean individual = Boolean.TRUE.equals(map.get("individual_digits"));
+                steps.add(new SplitStep(individual ? DIGITS_INDIVIDUAL_PATTERN : DIGITS_GROUPED_PATTERN, "Isolated", false));
+            }
+            case "ByteLevel" -> {
+                boolean addPrefixSpace = Boolean.TRUE.equals(map.get("add_prefix_space"));
+                boolean useRegex = !(map.get("use_regex") instanceof Boolean b) || b;
+                steps.add(new ByteLevelStep(addPrefixSpace, useRegex));
+            }
+            case "Metaspace" -> {
+                char rep = parseMetaspaceChar(map, '\u2581');
+                boolean addPrefix = parseMetaspaceAddPrefix(map, false);
+                steps.add(new MetaspaceStep(rep, addPrefix));
+            }
+            default -> {}
+        }
+    }
+
+    private static Pattern parseSplitPattern(Object patternObj) {
+        if (!(patternObj instanceof Map<?, ?> patMap)) {
+            return null;
+        }
+        if (patMap.get("String") instanceof String literal) {
+            return Pattern.compile(Pattern.quote(literal));
+        }
+        if (patMap.get("Regex") instanceof String regex) {
+            try {
+                return Pattern.compile(regex, Pattern.UNICODE_CHARACTER_CLASS);
+            } catch (PatternSyntaxException ignored) {
+                try {
+                    return Pattern.compile(regex);
+                } catch (PatternSyntaxException fallback) {
+                    return GPT2_PRETOKEN_PATTERN;
+                }
             }
         }
-        if (hasByteSpace) {
-            return new TokenizerLayoutConfig(Mode.BYTE_LEVEL, true, '\u2581', false);
+        return null;
+    }
+
+    private static char parseMetaspaceChar(Map<?, ?> node, char fallback) {
+        Object repObj = node.get("replacement");
+        if (repObj instanceof String s && !s.isEmpty()) {
+            return s.charAt(0);
         }
-        if (hasMetaspaceChar) {
-            return new TokenizerLayoutConfig(Mode.METASPACE, true, '\u2581', false);
+        return fallback;
+    }
+
+    private static boolean parseMetaspaceAddPrefix(Map<?, ?> node, boolean fallback) {
+        Object addPrefixObj = node.get("add_prefix_space");
+        if (addPrefixObj instanceof Boolean b) {
+            return b;
         }
-        return new TokenizerLayoutConfig(Mode.BYTE_LEVEL, true, '\u2581', false);
+        Object schemeObj = node.get("prepend_scheme");
+        if (schemeObj instanceof String scheme) {
+            return "always".equalsIgnoreCase(scheme) || "first".equalsIgnoreCase(scheme);
+        }
+        return fallback;
     }
 
     private static void collectTypedNodes(Object node, List<Map<?, ?>> out) {
@@ -732,13 +1016,11 @@ public final class BpeTokenizer {
         }
     }
 
-    private static OptionalInt detectBosTokenId(Map<String, Object> root, Map<String, Integer> tokenToId) {
-        for (String cand : BOS_CANDIDATES) {
-            Integer id = tokenToId.get(cand);
-            if (id != null) {
-                return OptionalInt.of(id);
-            }
-        }
+    private static OptionalInt detectBosTokenId(
+            Map<String, Object> root,
+            Map<String, Integer> addedTokens,
+            Set<Integer> specialTokenIds
+    ) {
         Object postObj = root.get("post_processor");
         if (postObj instanceof Map<?, ?> post) {
             Integer id = inspectTemplateProcessingSpecial(post, true);
@@ -746,14 +1028,24 @@ public final class BpeTokenizer {
                 return OptionalInt.of(id);
             }
         }
+        for (String cand : BOS_CANDIDATES) {
+            Integer id = addedTokens.get(cand);
+            if (id != null && specialTokenIds.contains(id)) {
+                return OptionalInt.of(id);
+            }
+        }
         return OptionalInt.empty();
     }
 
-    private static Set<Integer> detectEosTokenIds(Map<String, Object> root, Map<String, Integer> tokenToId) {
+    private static Set<Integer> detectEosTokenIds(
+            Map<String, Object> root,
+            Map<String, Integer> addedTokens,
+            Set<Integer> specialTokenIds
+    ) {
         Set<Integer> eos = new LinkedHashSet<>();
         for (String cand : EOS_CANDIDATES) {
-            Integer id = tokenToId.get(cand);
-            if (id != null) {
+            Integer id = addedTokens.get(cand);
+            if (id != null && specialTokenIds.contains(id)) {
                 eos.add(id);
             }
         }
