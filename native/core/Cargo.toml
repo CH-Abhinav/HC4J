@@ -1,0 +1,53 @@
+[package]
+name = "hc4rs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Safe Rust GPU tensor engine, WGSL compute kernels, Vulkan P2P collectives, and exact workload optimizer (hc4x core & Rust SDK)."
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lib]
+name = "hc4rs"
+
+[features]
+default = ["vulkan-p2p"]
+vulkan-p2p = []
+
+[dependencies]
+pollster = "1.0.0"
+bytemuck = "1.25.2"
+
+[dependencies.wgpu]
+version = "30.0.0"
+default-features = false
+features = ["wgsl"]
+
+[target.'cfg(target_os = "windows")'.dependencies.wgpu]
+version = "30.0.0"
+features = ["dx12", "vulkan", "wgsl"]
+
+[target.'cfg(target_os = "linux")'.dependencies.wgpu]
+version = "30.0.0"
+features = ["vulkan", "wgsl"]
+
+[target.'cfg(target_os = "macos")'.dependencies.wgpu]
+version = "30.0.0"
+features = ["metal", "wgsl"]
+
+[target.'cfg(any(target_os = "windows", target_os = "linux"))'.dependencies]
+ash = "0.38"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Memory"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
+[build-dependencies]
+bytemuck = "1.25.2"
+naga = { version = "30.0.0", features = ["wgsl-in", "spv-out"] }
+
+[dev-dependencies]
+naga = { version = "30.0.0", features = ["wgsl-in"] }

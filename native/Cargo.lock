@@ -266,7 +266,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "hc4j"
+name = "hc4rs"
 version = "0.1.0"
 dependencies = [
  "ash",
@@ -276,6 +276,13 @@ dependencies = [
  "pollster",
  "wgpu",
  "windows-sys",
+]
+
+[[package]]
+name = "hc4x-ffi"
+version = "0.1.0"
+dependencies = [
+ "hc4rs",
 ]
 
 [[package]]

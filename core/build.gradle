@@ -30,6 +30,12 @@ tasks.register('buildRust', Exec) {
 
     onlyIf { !skipRust }
 
+    inputs.file(file("${rootDir}/native/Cargo.toml"))
+    inputs.file(file("${rootDir}/native/Cargo.lock"))
+    inputs.dir(file("${rootDir}/native/core"))
+    inputs.dir(file("${rootDir}/native/ffi"))
+    outputs.file(nativeReleaseBinary)
+
     if (System.getProperty("os.name").toLowerCase().contains("windows")) {
         commandLine 'cmd', '/c', 'cargo build --manifest-path native/Cargo.toml --release'
     } else {

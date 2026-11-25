@@ -1,0 +1,20 @@
+[package]
+name = "hc4x-ffi"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Thin panic-guarded C-ABI shared library (hc4j.dll / libhc4j.so / libhc4j.dylib) over hc4rs for Java Panama FFM, Python, and C/C++."
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lib]
+name = "hc4j"
+crate-type = ["cdylib"]
+
+[features]
+default = ["vulkan-p2p"]
+vulkan-p2p = ["hc4rs/vulkan-p2p"]
+
+[dependencies]
+hc4rs = { path = "../core" }
