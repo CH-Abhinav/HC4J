@@ -239,12 +239,14 @@ public final class MatmulOps {
         access.ensureOpen(b);
         access.ensureOpen(res);
 
-        if (access.elementOffset(a) > 0) {
+        if (access.elementOffset(a) > 0
+                || !ValidUtil.hasValidInnerMatmulLayout(access.getShapeUnsafe(a), access.getStridesUnsafe(a))) {
             try (Tensor contigA = a.contiguous()) {
                 return batchedMatmul(contigA, b, res, transposeA, transposeB);
             }
         }
-        if (access.elementOffset(b) > 0) {
+        if (access.elementOffset(b) > 0
+                || !ValidUtil.hasValidInnerMatmulLayout(access.getShapeUnsafe(b), access.getStridesUnsafe(b))) {
             try (Tensor contigB = b.contiguous()) {
                 return batchedMatmul(a, contigB, res, transposeA, transposeB);
             }

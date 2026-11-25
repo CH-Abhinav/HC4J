@@ -160,9 +160,6 @@ public final class SplitKvSession implements AutoCloseable {
                     + rolePlan.totalKvTokens() + ")");
         }
 
-        Tensor contigK = fullKCache.isContiguous() ? fullKCache : fullKCache.contiguous();
-        Tensor contigV = fullVCache.isContiguous() ? fullVCache : fullVCache.contiguous();
-
         List<GpuWorker> gpus = new ArrayList<>();
         CpuWorker cpu = null;
         Arena cpuSharedArena = Arena.ofShared();
@@ -171,8 +168,8 @@ public final class SplitKvSession implements AutoCloseable {
             long totalBytes = (long) numKvHeads * totalTokens * headDim * 4L;
             MemorySegment fullKSeg = stageArena.allocate(totalBytes, 16);
             MemorySegment fullVSeg = stageArena.allocate(totalBytes, 16);
-            contigK.copyTo(fullKSeg);
-            contigV.copyTo(fullVSeg);
+            fullKCache.copyTo(fullKSeg);
+            fullVCache.copyTo(fullVSeg);
 
             int currentToken = 0;
             for (SplitKvAssignment assignment : rolePlan.splitKvAssignments()) {
@@ -248,20 +245,14 @@ public final class SplitKvSession implements AutoCloseable {
 
         long startWall = System.nanoTime();
 
-        Tensor q2D = q;
-        int[] qShape = q2D.getShape();
+        int[] qShape = q.getShape();
         if (qShape.length != 2 || qShape[0] != numHeads || qShape[1] != headDim) {
             long totalQElements = 1;
             for (int s : qShape) totalQElements *= s;
-            if (totalQElements == (long) numHeads * headDim) {
-                q2D = q2D.reshape(numHeads, headDim);
-            } else {
+            if (totalQElements != (long) numHeads * headDim) {
                 throw new IllegalArgumentException("q tensor shape " + Arrays.toString(qShape)
                         + " cannot be reshaped to [" + numHeads + ", " + headDim + "]");
             }
-        }
-        if (!q2D.isContiguous()) {
-            q2D = q2D.contiguous();
         }
 
         List<WorkerResult> results = new ArrayList<>(gpuWorkers.size() + (cpuWorker != null ? 1 : 0));
@@ -276,7 +267,7 @@ public final class SplitKvSession implements AutoCloseable {
 
             long qBytes = (long) numHeads * headDim * 4L;
             MemorySegment qSeg = qArena.allocate(qBytes, 16);
-            q2D.copyTo(qSeg);
+            q.copyTo(qSeg);
 
             List<CompletableFuture<WorkerResult>> futures = new ArrayList<>();
 

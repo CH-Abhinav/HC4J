@@ -272,6 +272,7 @@ fn f16_and_transformer_shaders() {
     // Pure f32 transformer primitives validate with zero capabilities:
     validate("embedding_f32", super::nn::embedding::EMBEDDING_F32_WGSL);
     validate("rope_f32", super::nn::rope::ROPE_F32_WGSL);
+    validate("kv_cache_append_f32", super::nn::kv_cache::KV_CACHE_APPEND_F32_WGSL);
 
     // Portable f16 shaders use standard WGSL 1.0 pack2x16float/unpack2x16float (no `enable f16;`):
     let f16_in_f32 = Capabilities::SHADER_FLOAT16_IN_FLOAT32;

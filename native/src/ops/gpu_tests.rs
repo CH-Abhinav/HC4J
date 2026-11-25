@@ -13,7 +13,7 @@ use crate::ops::matmul::{FLAG_TRANS_A, FLAG_TRANS_B, dispatch_batched_matmul_f32
 use crate::ops::math::*;
 use crate::ops::nn::{
     Activation, dispatch_activation_f32, dispatch_add_row_bias_f32, dispatch_cross_entropy_rows,
-    dispatch_layernorm_rows_f32, dispatch_rmsnorm_rows_f32, dispatch_softmax_rows_f32,
+    dispatch_kv_cache_append_f32, dispatch_layernorm_rows_f32, dispatch_rmsnorm_rows_f32, dispatch_softmax_rows_f32,
 };
 use crate::ops::reduce::{
     dispatch_argmax_axis, dispatch_argmax_rows, dispatch_reduce_axis_f32, dispatch_reduce_diff2_f32,
@@ -1771,6 +1771,76 @@ fn rope_neox_half_split() {
             free(id_out);
         }
     }
+}
+
+#[test]
+fn kv_cache_append_prefill_and_decode() {
+    let Some(_gpu) = gpu() else { return };
+    let (num_kv_heads, max_seq_len, head_dim) = (2u32, 6u32, 4u32);
+    let cache_elems = (num_kv_heads * max_seq_len * head_dim) as usize;
+    let init_sentinel = -999.0f32;
+    let cache_init = vec![init_sentinel; cache_elems];
+    let id_cache = upload(&cache_init);
+
+    // Prefill step: seq_len = 3, pos_offset = 0
+    let prefill_seq = 3u32;
+    let prefill_src: Vec<f32> = (0..(prefill_seq * num_kv_heads * head_dim) as usize)
+        .map(|i| (i as f32) + 1.0)
+        .collect();
+    let id_prefill = upload(&prefill_src);
+
+    assert_eq!(
+        dispatch_kv_cache_append_f32(id_prefill, id_cache, num_kv_heads, max_seq_len, head_dim, prefill_seq, 0),
+        0
+    );
+
+    // Decode step: seq_len = 1, pos_offset = 3
+    let decode_seq = 1u32;
+    let decode_src: Vec<f32> = (0..(decode_seq * num_kv_heads * head_dim) as usize)
+        .map(|i| 100.0 + (i as f32))
+        .collect();
+    let id_decode = upload(&decode_src);
+
+    assert_eq!(
+        dispatch_kv_cache_append_f32(id_decode, id_cache, num_kv_heads, max_seq_len, head_dim, decode_seq, 3),
+        0
+    );
+
+    // Out-of-bounds and aliasing guards
+    assert_ne!(
+        dispatch_kv_cache_append_f32(id_decode, id_cache, num_kv_heads, max_seq_len, head_dim, decode_seq, 6),
+        0
+    );
+    assert_ne!(
+        dispatch_kv_cache_append_f32(id_cache, id_cache, num_kv_heads, max_seq_len, head_dim, decode_seq, 0),
+        0
+    );
+
+    let got = download(id_cache, cache_elems);
+    for h in 0..num_kv_heads as usize {
+        for pos in 0..max_seq_len as usize {
+            for d in 0..head_dim as usize {
+                let cache_idx = (h * (max_seq_len as usize) + pos) * (head_dim as usize) + d;
+                let expected = if pos < 3 {
+                    let src_idx = (pos * (num_kv_heads as usize) + h) * (head_dim as usize) + d;
+                    prefill_src[src_idx]
+                } else if pos == 3 {
+                    let src_idx = h * (head_dim as usize) + d;
+                    decode_src[src_idx]
+                } else {
+                    init_sentinel
+                };
+                assert_eq!(
+                    got[cache_idx], expected,
+                    "KV cache mismatch at (h={h}, pos={pos}, d={d})"
+                );
+            }
+        }
+    }
+
+    free(id_prefill);
+    free(id_decode);
+    free(id_cache);
 }
 
 

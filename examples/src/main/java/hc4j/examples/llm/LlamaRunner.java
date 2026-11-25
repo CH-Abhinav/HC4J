@@ -17,92 +17,212 @@
 package hc4j.examples.llm;
 
 import hc4j.DType;
+import hc4j.GpuScope;
+import hc4j.Slice;
 import hc4j.Tensor;
 import hc4j.collective.Collective;
+import hc4j.collective.DistributedExecutor;
+import hc4j.collective.DistributedResult;
+import hc4j.collective.ExecutionReport;
+import hc4j.collective.HostCpuProfile;
 import hc4j.collective.RolePlan;
+import hc4j.collective.SplitKvAssignment;
 import hc4j.collective.SplitKvSpec;
+import hc4j.collective.WorkloadPlanner;
 import hc4j.collective.WorkloadSpec;
 import hc4j.nn.Nn;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Objects;
+import java.util.Set;
+import java.util.function.BiFunction;
 
 /**
- * High-performance pure-Java Transformer decoder forward runner for Llama-3.2, Qwen2.5, and SmolLM2 models.
+ * Pure-Java 100%-GPU Transformer decoder forward runner for Llama-3.2, Qwen2.5, and SmolLM2 models.
  * <p>
- * Supports portable f16 and f32 weights, RMSNorm, GQA (Grouped Query Attention), NeoX half-split RoPE,
- * SwiGLU MLP, KV-Caching, and live Prefill &rarr; Decode Auto-Morphing telemetry when attached to a {@link Collective}.
+ * Maintains per-layer KV-caches resident in GPU VRAM (updated in-place via {@link Nn#kvCacheAppend}),
+ * executes single-device Prefill and Decode attention purely on the GPU using batched 3-D GEMM and
+ * {@link Nn#softmax} with zero per-layer host round-trips, and dynamically morphs Decode attention
+ * onto {@link DistributedExecutor#splitKvAttention} when attached to a {@link Collective} whose
+ * {@link RolePlan} activates &ge; 2 Split-KV workers.
  */
 public final class LlamaRunner implements AutoCloseable {
+
+    /** Default upper bound on pre-allocated VRAM KV-cache sequence length. */
+    public static final int DEFAULT_MAX_SEQ_LEN = 2048;
 
     private final LlamaConfig config;
     private final LlamaWeights weights;
     private final Collective collective;
+    private final HostCpuProfile hostCpuProfile;
+    private final BiFunction<WorkloadSpec, SplitKvSpec, RolePlan> rolePlanner;
+    private final int maxSeqLen;
 
-    // KV Cache stored per layer: list of tokens, each token is a float[numKvHeads * headDim]
-    private final List<List<float[]>> kCache;
-    private final List<List<float[]>> vCache;
+    // VRAM-resident KV caches per layer: [numKvHeads, maxSeqLen, headDim]
+    private final Tensor[] kCaches;
+    private final Tensor[] vCaches;
 
-    // Telemetry trace recording phase transitions and role plans
-    private final List<String> morphTrace = new ArrayList<>();
+    // Telemetry trace recording phase transitions, role plans, and Split-KV execution reports
+    private final List<PhaseEvent> morphTrace = new ArrayList<>();
 
     private int curPos = 0;
     private boolean closed = false;
 
     /**
-     * Creates a new runner for the given config and weights.
+     * Creates a single-GPU runner with the default bounded KV-cache length.
      *
      * @param config  model architecture configuration
      * @param weights loaded GPU weights
      */
     public LlamaRunner(LlamaConfig config, LlamaWeights weights) {
-        this(config, weights, null);
+        this(config, weights, null, HostCpuProfile.disabled(), defaultCacheLen(config), null);
     }
 
     /**
-     * Creates a new runner attached to a {@link Collective} for distributed execution and auto-morphing.
+     * Creates a single-GPU runner with an explicit maximum KV-cache sequence length.
+     *
+     * @param config    model architecture configuration
+     * @param weights   loaded GPU weights
+     * @param maxSeqLen maximum sequence length reserved in VRAM KV-cache
+     */
+    public LlamaRunner(LlamaConfig config, LlamaWeights weights, int maxSeqLen) {
+        this(config, weights, null, HostCpuProfile.disabled(), maxSeqLen, null);
+    }
+
+    /**
+     * Creates a runner attached to a {@link Collective} for live Prefill &rarr; Decode auto-morphing.
      *
      * @param config     model architecture configuration
      * @param weights    loaded GPU weights
-     * @param collective optional collective (may be null for single-device execution)
+     * @param collective optional collective (may be null for single-GPU execution)
      */
     public LlamaRunner(LlamaConfig config, LlamaWeights weights, Collective collective) {
-        this.config = Objects.requireNonNull(config, "config");
-        this.weights = Objects.requireNonNull(weights, "weights");
-        this.collective = collective;
-
-        this.kCache = new ArrayList<>(config.numHiddenLayers());
-        this.vCache = new ArrayList<>(config.numHiddenLayers());
-        for (int i = 0; i < config.numHiddenLayers(); i++) {
-            kCache.add(new ArrayList<>());
-            vCache.add(new ArrayList<>());
-        }
+        this(config, weights, collective, HostCpuProfile.disabled(), defaultCacheLen(config), null);
     }
 
     /**
-     * Returns the telemetry trace of live Prefill &rarr; Decode auto-morphing transitions.
+     * Creates a runner attached to a {@link Collective} with an explicit maximum KV-cache sequence length.
      *
-     * @return unmodifiable list of morphing events
+     * @param config     model architecture configuration
+     * @param weights    loaded GPU weights
+     * @param collective optional collective (may be null)
+     * @param maxSeqLen  maximum sequence length reserved in VRAM KV-cache
      */
-    public List<String> morphTrace() {
+    public LlamaRunner(LlamaConfig config, LlamaWeights weights, Collective collective, int maxSeqLen) {
+        this(config, weights, collective, HostCpuProfile.disabled(), maxSeqLen, null);
+    }
+
+    /**
+     * Creates a runner attached to a {@link Collective} and optional {@link HostCpuProfile}.
+     *
+     * @param config         model architecture configuration
+     * @param weights        loaded GPU weights
+     * @param collective     optional collective (may be null)
+     * @param hostCpuProfile host CPU profile for hybrid planning (defaults to disabled if null)
+     * @param maxSeqLen      maximum sequence length reserved in VRAM KV-cache
+     */
+    public LlamaRunner(LlamaConfig config, LlamaWeights weights, Collective collective,
+                       HostCpuProfile hostCpuProfile, int maxSeqLen) {
+        this(config, weights, collective, hostCpuProfile, maxSeqLen, null);
+    }
+
+    /**
+     * Creates a runner attached to a {@link Collective} with a custom {@link RolePlan} supplier.
+     *
+     * @param config      model architecture configuration
+     * @param weights     loaded GPU weights
+     * @param collective  optional collective (may be null)
+     * @param rolePlanner optional custom role planning function (defaults to {@link WorkloadPlanner#planRoles})
+     */
+    public LlamaRunner(LlamaConfig config, LlamaWeights weights, Collective collective,
+                       BiFunction<WorkloadSpec, SplitKvSpec, RolePlan> rolePlanner) {
+        this(config, weights, collective, HostCpuProfile.disabled(), defaultCacheLen(config), rolePlanner);
+    }
+
+    /**
+     * Full constructor configuring VRAM KV-cache capacity, collective handle, CPU profile, and role planner.
+     *
+     * @param config         model architecture configuration
+     * @param weights        loaded GPU weights
+     * @param collective     optional collective (may be null)
+     * @param hostCpuProfile optional host CPU profile (defaults to disabled if null)
+     * @param maxSeqLen      maximum sequence length reserved in VRAM KV-cache
+     * @param rolePlanner    optional custom role planner (defaults to {@link WorkloadPlanner#planRoles})
+     */
+    public LlamaRunner(LlamaConfig config, LlamaWeights weights, Collective collective,
+                       HostCpuProfile hostCpuProfile, int maxSeqLen,
+                       BiFunction<WorkloadSpec, SplitKvSpec, RolePlan> rolePlanner) {
+        this.config = Objects.requireNonNull(config, "config");
+        this.weights = Objects.requireNonNull(weights, "weights");
+        this.collective = collective;
+        this.hostCpuProfile = hostCpuProfile != null ? hostCpuProfile : HostCpuProfile.disabled();
+        if (maxSeqLen <= 0) {
+            throw new IllegalArgumentException("maxSeqLen must be strictly positive, got " + maxSeqLen);
+        }
+        this.maxSeqLen = maxSeqLen;
+        if (rolePlanner != null) {
+            this.rolePlanner = rolePlanner;
+        } else if (collective != null) {
+            this.rolePlanner = (tp, kv) ->
+                    WorkloadPlanner.planRoles(collective.deviceProfiles(), collective.topology(), tp, kv);
+        } else {
+            this.rolePlanner = null;
+        }
+
+        int numLayers = config.numHiddenLayers();
+        int numKvHeads = config.numKeyValueHeads();
+        int headDim = config.headDim();
+        this.kCaches = new Tensor[numLayers];
+        this.vCaches = new Tensor[numLayers];
+        try {
+            for (int l = 0; l < numLayers; l++) {
+                this.kCaches[l] = Tensor.empty(DType.f32, numKvHeads, maxSeqLen, headDim);
+                this.vCaches[l] = Tensor.empty(DType.f32, numKvHeads, maxSeqLen, headDim);
+            }
+        } catch (RuntimeException | Error e) {
+            releaseCaches();
+            throw e;
+        }
+    }
+
+    private static int defaultCacheLen(LlamaConfig config) {
+        Objects.requireNonNull(config, "config");
+        int maxPos = config.maxPositionEmbeddings();
+        return maxPos > 0 ? Math.min(maxPos, DEFAULT_MAX_SEQ_LEN) : DEFAULT_MAX_SEQ_LEN;
+    }
+
+    /**
+     * Returns the configured maximum KV-cache sequence length.
+     *
+     * @return maximum sequence length
+     */
+    public int maxSeqLen() {
+        return maxSeqLen;
+    }
+
+    /**
+     * Returns the telemetry trace of Prefill/Decode auto-morphing transitions and Split-KV reports.
+     *
+     * @return unmodifiable list of phase events
+     */
+    public List<PhaseEvent> morphTrace() {
         return Collections.unmodifiableList(morphTrace);
     }
 
     /**
-     * Resets the KV-cache and position pointer to start a new sequence.
+     * Resets the sequence position cursor and telemetry trace to start a fresh generation sequence
+     * without reallocating the VRAM KV-cache buffers.
      */
     public void reset() {
-        for (int i = 0; i < config.numHiddenLayers(); i++) {
-            kCache.get(i).clear();
-            vCache.get(i).clear();
-        }
+        ensureOpen();
         curPos = 0;
         morphTrace.clear();
     }
 
     /**
-     * Current token position in the sequence.
+     * Current accumulated token position in the sequence.
      *
      * @return token position index
      */
@@ -111,7 +231,42 @@ public final class LlamaRunner implements AutoCloseable {
     }
 
     /**
-     * Runs the prefill forward pass on a prompt sequence of token IDs.
+     * Runs a forward pass on the provided token IDs and returns the final token's logits {@code float[vocabSize]}.
+     * Uses {@link PhaseEvent.Phase#PREFILL} when {@code tokens.length > 1 || currentPosition() == 0},
+     * and {@link PhaseEvent.Phase#DECODE} for single-token autoregressive steps.
+     *
+     * @param tokens non-empty array of input token IDs
+     * @return next-token logits of length {@link LlamaConfig#vocabSize()}
+     */
+    public float[] forward(int[] tokens) {
+        ensureOpen();
+        Objects.requireNonNull(tokens, "tokens");
+        if (tokens.length == 0) {
+            throw new IllegalArgumentException("Input tokens must not be empty");
+        }
+        PhaseEvent.Phase phase = (tokens.length > 1 || curPos == 0)
+                ? PhaseEvent.Phase.PREFILL
+                : PhaseEvent.Phase.DECODE;
+        return forwardWithPhase(tokens, phase);
+    }
+
+    /**
+     * Runs a forward pass on a list of token IDs and returns the final token's logits.
+     *
+     * @param tokens non-empty list of input token IDs
+     * @return next-token logits of length {@link LlamaConfig#vocabSize()}
+     */
+    public float[] forward(List<Integer> tokens) {
+        Objects.requireNonNull(tokens, "tokens");
+        int[] arr = new int[tokens.size()];
+        for (int i = 0; i < arr.length; i++) {
+            arr[i] = tokens.get(i);
+        }
+        return forward(arr);
+    }
+
+    /**
+     * Runs the prefill forward pass on a prompt sequence of token IDs and returns the greedy next token.
      *
      * @param promptTokens list of input token IDs
      * @return predicted next token ID
@@ -121,321 +276,360 @@ public final class LlamaRunner implements AutoCloseable {
         if (promptTokens.isEmpty()) {
             throw new IllegalArgumentException("Prompt tokens must not be empty");
         }
-
-        int seqLen = promptTokens.size();
-
-        // 1. Telemetry & Live Prefill Auto-Morphing
-        if (collective != null) {
-            long totalUnits = (long) seqLen * config.hiddenSize();
-            double flopsPerUnit = 2.0 * config.intermediateSize();
-            long bytesPerUnit = 4L * config.hiddenSize();
-            long syncBytes = (long) seqLen * config.hiddenSize() * 4L;
-            WorkloadSpec tpSpec = WorkloadSpec.prefill(totalUnits, flopsPerUnit, bytesPerUnit, syncBytes);
-
-            long kvBytesPerToken = 2L * config.numHiddenLayers() * config.numKeyValueHeads() * config.headDim() * 2L;
-            double attnFlops = 4.0 * config.numAttentionHeads() * config.headDim();
-            SplitKvSpec kvSpec = new SplitKvSpec(seqLen, kvBytesPerToken, attnFlops, 1024L, 100_000_000L, 0.85);
-
-            RolePlan rolePlan = collective.planRoles(tpSpec, kvSpec);
-            morphTrace.add("PREFILL: S=" + seqLen + " regime=" + rolePlan.activeRegime()
-                    + " reclaimedGpus=" + rolePlan.reclaimedGpuCount());
+        int[] arr = new int[promptTokens.size()];
+        for (int i = 0; i < arr.length; i++) {
+            arr[i] = promptTokens.get(i);
         }
-
-        int[] tokenArray = new int[seqLen];
-        for (int i = 0; i < seqLen; i++) tokenArray[i] = promptTokens.get(i);
-
-        try (Tensor tokens = Tensor.fromArray(tokenArray, seqLen);
-             Tensor x = weights.embedTokens().embedding(tokens)) {
-
-            Tensor h = x;
-            boolean hOwned = false;
-
-            for (int l = 0; l < config.numHiddenLayers(); l++) {
-                Tensor nextH = forwardLayerPrefill(l, h, seqLen);
-                if (hOwned) {
-                    h.close();
-                }
-                h = nextH;
-                hOwned = true;
-            }
-
-            try (Tensor finalNorm = h.rmsNorm(weights.finalNorm(), config.rmsNormEps());
-                 Tensor logits = Nn.linearTransposed(finalNorm, weights.lmHead(), null)) {
-
-                // Read last token logits: logits[seqLen - 1]
-                try (Tensor lastLogits = logits.slice(hc4j.Slice.at(seqLen - 1));
-                     Tensor bestToken = lastLogits.argmaxRows()) {
-                    curPos += seqLen;
-                    return bestToken.itemInt();
-                }
-            } finally {
-                if (hOwned) {
-                    h.close();
-                }
-            }
-        }
+        return argmax(forwardWithPhase(arr, PhaseEvent.Phase.PREFILL));
     }
 
     /**
-     * Runs a single auto-regressive decode step (seqLen = 1).
+     * Runs a single autoregressive decode step ({@code S == 1}) and returns the greedy next token.
      *
-     * @param tokenId token ID of the previous step
+     * @param tokenId token ID from the previous step
      * @return predicted next token ID
      */
     public int decodeStep(int tokenId) {
-        // 1. Telemetry & Live Decode Auto-Morphing
-        if (collective != null) {
-            long totalUnits = config.hiddenSize();
-            double flopsPerUnit = 2.0 * config.intermediateSize();
-            long bytesPerUnit = 4L * config.hiddenSize();
-            long syncBytes = (long) config.hiddenSize() * 4L;
-            WorkloadSpec tpSpec = WorkloadSpec.decode(totalUnits, flopsPerUnit, bytesPerUnit, syncBytes);
-
-            int totalKvTokens = curPos + 1;
-            long kvBytesPerToken = 2L * config.numHiddenLayers() * config.numKeyValueHeads() * config.headDim() * 2L;
-            double attnFlops = 4.0 * config.numAttentionHeads() * config.headDim();
-            SplitKvSpec kvSpec = new SplitKvSpec(totalKvTokens, kvBytesPerToken, attnFlops, 1024L, 100_000_000L, 0.85);
-
-            RolePlan rolePlan = collective.planRoles(tpSpec, kvSpec);
-            morphTrace.add("DECODE: S=1 pos=" + curPos + " regime=" + rolePlan.activeRegime()
-                    + " reclaimedGpus=" + rolePlan.reclaimedGpuCount());
-        }
-
-        try (Tensor token = Tensor.fromArray(new int[]{tokenId}, 1);
-             Tensor x = weights.embedTokens().embedding(token)) {
-
-            Tensor h = x;
-            boolean hOwned = false;
-
-            for (int l = 0; l < config.numHiddenLayers(); l++) {
-                Tensor nextH = forwardLayerDecode(l, h);
-                if (hOwned) {
-                    h.close();
-                }
-                h = nextH;
-                hOwned = true;
-            }
-
-            try (Tensor finalNorm = h.rmsNorm(weights.finalNorm(), config.rmsNormEps());
-                 Tensor logits = Nn.linearTransposed(finalNorm, weights.lmHead(), null);
-                 Tensor bestToken = logits.argmaxRows()) {
-                curPos += 1;
-                return bestToken.itemInt();
-            } finally {
-                if (hOwned) {
-                    h.close();
-                }
-            }
-        }
+        ensureOpen();
+        return argmax(forwardWithPhase(new int[]{tokenId}, PhaseEvent.Phase.DECODE));
     }
 
     /**
-     * Greedy auto-regressive text generation.
+     * Greedy autoregressive generation returning the full token sequence {@code [prompt..., generated...]}.
      *
-     * @param promptTokens prompt token IDs
+     * @param promptTokens initial prompt token IDs
      * @param maxNewTokens maximum number of new tokens to generate
-     * @return full sequence including prompt and generated tokens
+     * @return full list containing prompt and generated tokens
      */
     public List<Integer> generate(List<Integer> promptTokens, int maxNewTokens) {
-        List<Integer> result = new ArrayList<>(promptTokens);
-        int nextToken = prefill(promptTokens);
-        result.add(nextToken);
+        Objects.requireNonNull(promptTokens, "promptTokens");
+        if (promptTokens.isEmpty()) {
+            throw new IllegalArgumentException("Prompt tokens must not be empty");
+        }
+        int[] promptArr = new int[promptTokens.size()];
+        for (int i = 0; i < promptArr.length; i++) {
+            promptArr[i] = promptTokens.get(i);
+        }
+        int[] full = generateGreedy(promptArr, maxNewTokens, Set.of());
+        List<Integer> out = new ArrayList<>(full.length);
+        for (int tok : full) {
+            out.add(tok);
+        }
+        return out;
+    }
 
-        for (int i = 1; i < maxNewTokens; i++) {
+    /**
+     * Greedy autoregressive generation returning the full token sequence {@code [prompt..., generated...]}.
+     *
+     * @param promptTokens initial prompt token IDs
+     * @param maxNewTokens maximum number of new tokens to generate
+     * @return full token array containing prompt and generated tokens
+     */
+    public int[] generateGreedy(int[] promptTokens, int maxNewTokens) {
+        return generateGreedy(promptTokens, maxNewTokens, Set.of());
+    }
+
+    /**
+     * Greedy autoregressive generation stopping cleanly if any token in {@code eosTokenIds} is emitted.
+     *
+     * @param promptTokens initial prompt token IDs
+     * @param maxNewTokens maximum number of new tokens to generate
+     * @param eosTokenIds  end-of-sequence token IDs causing early termination (may be empty)
+     * @return full token array containing prompt and generated tokens
+     */
+    public int[] generateGreedy(int[] promptTokens, int maxNewTokens, Set<Integer> eosTokenIds) {
+        ensureOpen();
+        Objects.requireNonNull(promptTokens, "promptTokens");
+        if (promptTokens.length == 0) {
+            throw new IllegalArgumentException("Prompt tokens must not be empty");
+        }
+        if (maxNewTokens < 0) {
+            throw new IllegalArgumentException("maxNewTokens must be non-negative, got " + maxNewTokens);
+        }
+        Set<Integer> eos = eosTokenIds != null ? eosTokenIds : Set.of();
+
+        List<Integer> seq = new ArrayList<>(promptTokens.length + maxNewTokens);
+        for (int t : promptTokens) {
+            seq.add(t);
+        }
+        if (maxNewTokens == 0) {
+            return seq.stream().mapToInt(Integer::intValue).toArray();
+        }
+
+        int nextToken = argmax(forwardWithPhase(promptTokens, PhaseEvent.Phase.PREFILL));
+        seq.add(nextToken);
+
+        for (int step = 1; step < maxNewTokens; step++) {
+            if (eos.contains(nextToken)) {
+                break;
+            }
             nextToken = decodeStep(nextToken);
-            result.add(nextToken);
+            seq.add(nextToken);
+        }
+
+        int[] result = new int[seq.size()];
+        for (int i = 0; i < result.length; i++) {
+            result[i] = seq.get(i);
         }
         return result;
     }
 
-    // --- Internal Layer Forward Passes ---
+    /**
+     * Returns the index of the maximum logit value.
+     *
+     * @param logits float array of logits
+     * @return argmax index
+     */
+    public static int argmax(float[] logits) {
+        Objects.requireNonNull(logits, "logits");
+        if (logits.length == 0) {
+            throw new IllegalArgumentException("logits must not be empty");
+        }
+        int bestIdx = 0;
+        float bestVal = logits[0];
+        for (int i = 1; i < logits.length; i++) {
+            if (logits[i] > bestVal) {
+                bestVal = logits[i];
+                bestIdx = i;
+            }
+        }
+        return bestIdx;
+    }
 
-    private Tensor forwardLayerPrefill(int layerIdx, Tensor x, int seqLen) {
-        LlamaWeights.LayerWeights lw = weights.layer(layerIdx);
-        float eps = config.rmsNormEps();
+    // --- Core GPU Forward Implementation ---
+
+    private float[] forwardWithPhase(int[] tokens, PhaseEvent.Phase phase) {
+        ensureOpen();
+        int seqLen = tokens.length;
+        if (seqLen == 0) {
+            throw new IllegalArgumentException("tokens must not be empty");
+        }
+        int posOffset = curPos;
+        int totalLen = posOffset + seqLen;
+        if (totalLen > maxSeqLen) {
+            throw new IllegalArgumentException(
+                    "Context length " + totalLen + " exceeds configured KV-cache capacity " + maxSeqLen);
+        }
+
+        RolePlan rolePlan = null;
+        boolean useSplitKvDecode = false;
+        if (collective != null && rolePlanner != null) {
+            WorkloadSpec tpSpec = buildTpSpec(phase, seqLen);
+            SplitKvSpec kvSpec = buildSplitKvSpec(totalLen);
+            rolePlan = rolePlanner.apply(tpSpec, kvSpec);
+            if (phase == PhaseEvent.Phase.DECODE && seqLen == 1) {
+                int activeWorkers = 0;
+                for (SplitKvAssignment a : rolePlan.splitKvAssignments()) {
+                    if (a.kvTokens() > 0) {
+                        activeWorkers++;
+                    }
+                }
+                useSplitKvDecode = (activeWorkers >= 2);
+            }
+        }
+
         int headDim = config.headDim();
         int numHeads = config.numAttentionHeads();
         int numKvHeads = config.numKeyValueHeads();
-        int gqaRatio = config.gqaRatio();
+        int groupSize = numHeads / numKvHeads;
+        float eps = config.rmsNormEps();
+        float ropeTheta = config.ropeTheta();
         float scale = (float) (1.0 / Math.sqrt(headDim));
 
-        try (Tensor normX = x.rmsNorm(lw.inputNorm(), eps);
-             Tensor qFlat = Nn.linearTransposed(normX, lw.qProj(), lw.qBias());
-             Tensor kFlat = Nn.linearTransposed(normX, lw.kProj(), lw.kBias());
-             Tensor vFlat = Nn.linearTransposed(normX, lw.vProj(), lw.vBias());
-             Tensor qReshaped = qFlat.reshape(seqLen, numHeads, headDim);
-             Tensor kReshaped = kFlat.reshape(seqLen, numKvHeads, headDim);
-             Tensor qRoPE = qReshaped.rope(curPos, config.ropeTheta());
-             Tensor kRoPE = kReshaped.rope(curPos, config.ropeTheta())) {
+        List<ExecutionReport> layerReports = useSplitKvDecode
+                ? new ArrayList<>(config.numHiddenLayers())
+                : null;
 
-            // Cache Key & Value
-            float[] kData = kRoPE.toFloatArray();
-            float[] vData = vFlat.toFloatArray();
-            int kvDim = config.kvDim();
-            for (int s = 0; s < seqLen; s++) {
-                float[] kTok = new float[kvDim];
-                float[] vTok = new float[kvDim];
-                System.arraycopy(kData, s * kvDim, kTok, 0, kvDim);
-                System.arraycopy(vData, s * kvDim, vTok, 0, kvDim);
-                kCache.get(layerIdx).add(kTok);
-                vCache.get(layerIdx).add(vTok);
+        float[] logits;
+        try (GpuScope outerScope = GpuScope.open()) {
+            Tensor causalMask = null;
+            if (seqLen > 1) {
+                float[] maskData = new float[seqLen * totalLen];
+                for (int qPos = 0; qPos < seqLen; qPos++) {
+                    int absQ = posOffset + qPos;
+                    int rowOffset = qPos * totalLen;
+                    for (int kPos = 0; kPos < totalLen; kPos++) {
+                        maskData[rowOffset + kPos] = (kPos <= absQ) ? 0.0f : -1e9f;
+                    }
+                }
+                causalMask = outerScope.fromArray(maskData, 1, seqLen, totalLen);
             }
 
-            // Multi-Head Causal Attention with GQA
-            float[] qArr = qRoPE.toFloatArray();
-            float[] attnOutArr = new float[seqLen * config.hiddenSize()];
+            Tensor tokenIds = outerScope.fromArray(tokens, seqLen);
+            Tensor hidden = outerScope.track(weights.embedTokens().embedding(tokenIds));
 
-            for (int h = 0; h < numHeads; h++) {
-                int kvH = h / gqaRatio;
-                for (int s = 0; s < seqLen; s++) {
-                    int totalContext = curPos + s + 1;
-                    float[] scores = new float[totalContext];
-                    float maxScore = -Float.MAX_VALUE;
+            for (int l = 0; l < config.numHiddenLayers(); l++) {
+                LlamaWeights.LayerWeights lw = weights.layer(l);
+                try (GpuScope layerScope = GpuScope.open()) {
+                    Tensor normX = layerScope.track(hidden.rmsNorm(lw.inputNorm(), eps));
+                    Tensor q = layerScope.track(Nn.linearTransposed(normX, lw.qProj(), lw.qBias()));
+                    Tensor k = layerScope.track(Nn.linearTransposed(normX, lw.kProj(), lw.kBias()));
+                    Tensor v = layerScope.track(Nn.linearTransposed(normX, lw.vProj(), lw.vBias()));
 
-                    for (int t = 0; t < totalContext; t++) {
-                        // Causal mask: only attend to tokens <= curPos + s
-                        float[] kTok = kCache.get(layerIdx).get(t);
-                        float dot = 0.0f;
-                        int qOffset = (s * numHeads + h) * headDim;
-                        int kOffset = kvH * headDim;
-                        for (int d = 0; d < headDim; d++) {
-                            dot += qArr[qOffset + d] * kTok[kOffset + d];
+                    Tensor q3 = layerScope.track(q.reshape(seqLen, numHeads, headDim));
+                    Tensor k3 = layerScope.track(k.reshape(seqLen, numKvHeads, headDim));
+                    Tensor v3 = layerScope.track(v.reshape(seqLen, numKvHeads, headDim));
+
+                    Nn.rope(q3, posOffset, ropeTheta, q3);
+                    Nn.rope(k3, posOffset, ropeTheta, k3);
+
+                    Nn.kvCacheAppend(kCaches[l], k3, posOffset);
+                    Nn.kvCacheAppend(vCaches[l], v3, posOffset);
+
+                    Tensor kActive = layerScope.track(kCaches[l].slice(Slice.all(), Slice.to(totalLen), Slice.all()));
+                    Tensor vActive = layerScope.track(vCaches[l].slice(Slice.all(), Slice.to(totalLen), Slice.all()));
+
+                    Tensor attnFlat;
+                    if (useSplitKvDecode) {
+                        Tensor qDec = layerScope.track(q3.reshape(numHeads, headDim));
+                        DistributedResult<Tensor> splitRes = DistributedExecutor.splitKvAttention(
+                                collective, qDec, kActive, vActive, scale, rolePlan);
+                        Tensor splitOut = layerScope.track(splitRes.value());
+                        attnFlat = layerScope.track(splitOut.reshape(1, numHeads * headDim));
+                        layerReports.add(splitRes.report());
+                    } else {
+                        Tensor kExp;
+                        Tensor vExp;
+                        if (groupSize == 1) {
+                            kExp = kActive;
+                            vExp = vActive;
+                        } else {
+                            kExp = layerScope.track(
+                                    layerScope.track(
+                                            layerScope.track(kActive.unsqueeze(1))
+                                                    .broadcastTo(numKvHeads, groupSize, totalLen, headDim))
+                                            .reshape(numHeads, totalLen, headDim));
+                            vExp = layerScope.track(
+                                    layerScope.track(
+                                            layerScope.track(vActive.unsqueeze(1))
+                                                    .broadcastTo(numKvHeads, groupSize, totalLen, headDim))
+                                            .reshape(numHeads, totalLen, headDim));
                         }
-                        scores[t] = dot * scale;
-                        if (scores[t] > maxScore) maxScore = scores[t];
-                    }
 
-                    // Softmax
-                    float sumExp = 0.0f;
-                    for (int t = 0; t < totalContext; t++) {
-                        scores[t] = (float) Math.exp(scores[t] - maxScore);
-                        sumExp += scores[t];
-                    }
-                    float invSum = 1.0f / sumExp;
-                    for (int t = 0; t < totalContext; t++) {
-                        scores[t] *= invSum;
-                    }
-
-                    // Weighted sum of values
-                    int outOffset = s * config.hiddenSize() + h * headDim;
-                    for (int t = 0; t < totalContext; t++) {
-                        float weight = scores[t];
-                        float[] vTok = vCache.get(layerIdx).get(t);
-                        int vOffset = kvH * headDim;
-                        for (int d = 0; d < headDim; d++) {
-                            attnOutArr[outOffset + d] += weight * vTok[vOffset + d];
+                        Tensor qH = layerScope.track(q3.permute(1, 0, 2)); // [H, S, D_h]
+                        Tensor kHT = layerScope.track(kExp.permute(0, 2, 1)); // [H, D_h, totalLen]
+                        Tensor scores = layerScope.track(qH.matmul(kHT)); // [H, S, totalLen]
+                        scores.muli(scale);
+                        if (causalMask != null) {
+                            scores.addi(causalMask);
                         }
+                        Tensor probs = layerScope.track(Nn.softmax(scores)); // [H, S, totalLen]
+                        Tensor ctx = layerScope.track(probs.matmul(vExp)); // [H, S, D_h]
+                        Tensor ctxPerm = layerScope.track(ctx.permute(1, 0, 2)); // [S, H, D_h]
+                        attnFlat = layerScope.track(ctxPerm.reshape(seqLen, numHeads * headDim)); // [S, D]
                     }
+
+                    Tensor projOut = layerScope.track(Nn.linearTransposed(attnFlat, lw.oProj(), null));
+                    Tensor outAttn = layerScope.track(hidden.add(projOut));
+
+                    Tensor normX2 = layerScope.track(outAttn.rmsNorm(lw.postAttentionNorm(), eps));
+                    Tensor gateProj = layerScope.track(Nn.linearTransposed(normX2, lw.gateProj(), null));
+                    Tensor gate = layerScope.track(gateProj.silu());
+                    Tensor up = layerScope.track(Nn.linearTransposed(normX2, lw.upProj(), null));
+                    Tensor mlp = layerScope.track(gate.mul(up));
+                    Tensor down = layerScope.track(Nn.linearTransposed(mlp, lw.downProj(), null));
+
+                    Tensor nextHidden = outerScope.track(outAttn.add(down));
+                    hidden.close();
+                    hidden = nextHidden;
                 }
             }
 
-            // Attention output projection & residual
-            Tensor outAttn;
-            try (Tensor attnTensor = Tensor.fromArray(attnOutArr, seqLen, config.hiddenSize());
-                 Tensor projOut = Nn.linearTransposed(attnTensor, lw.oProj(), null)) {
-                outAttn = x.add(projOut);
+            Tensor lastTokenHidden;
+            if (seqLen == 1) {
+                lastTokenHidden = hidden;
+            } else {
+                Tensor lastSlice = outerScope.track(hidden.slice(Slice.range(seqLen - 1, seqLen), Slice.all()));
+                lastTokenHidden = outerScope.track(lastSlice.contiguous());
             }
 
-            // SwiGLU MLP & residual
-            try (Tensor normX2 = outAttn.rmsNorm(lw.postAttentionNorm(), eps);
-                 Tensor gateProj = Nn.linearTransposed(normX2, lw.gateProj(), null);
-                 Tensor gate = gateProj.silu();
-                 Tensor up = Nn.linearTransposed(normX2, lw.upProj(), null);
-                 Tensor mlp = gate.mul(up);
-                 Tensor down = Nn.linearTransposed(mlp, lw.downProj(), null)) {
-                return outAttn.add(down);
-            } finally {
-                outAttn.close();
+            Tensor finalNorm = outerScope.track(lastTokenHidden.rmsNorm(weights.finalNorm(), eps));
+            Tensor logitsTensor = outerScope.track(Nn.linearTransposed(finalNorm, weights.lmHead(), null));
+            logits = logitsTensor.toFloatArray();
+        }
+
+        curPos = totalLen;
+        ExecutionReport stepReport = mergeReports(layerReports);
+        morphTrace.add(new PhaseEvent(phase, seqLen, totalLen, rolePlan, stepReport));
+        return logits;
+    }
+
+    private WorkloadSpec buildTpSpec(PhaseEvent.Phase phase, int seqLen) {
+        long totalUnits = (phase == PhaseEvent.Phase.PREFILL)
+                ? (long) seqLen * config.hiddenSize()
+                : config.hiddenSize();
+        double flopsPerUnit = 2.0 * config.intermediateSize();
+        long bytesPerUnit = 4L * config.hiddenSize();
+        long syncBytes = (long) seqLen * config.hiddenSize() * 4L;
+        return WorkloadSpec.builder(totalUnits, flopsPerUnit, bytesPerUnit)
+                .syncBytes(syncBytes)
+                .ioMultiplier(1.0)
+                .hostCpu(hostCpuProfile)
+                .build();
+    }
+
+    private SplitKvSpec buildSplitKvSpec(int totalKvTokens) {
+        long kvBytesPerToken = 2L * config.numHiddenLayers() * config.numKeyValueHeads() * config.headDim() * 2L;
+        double attnFlops = 4.0 * config.numAttentionHeads() * config.headDim();
+        return new SplitKvSpec(totalKvTokens, kvBytesPerToken, attnFlops, 1024L, 100_000_000L, 0.85);
+    }
+
+    private static ExecutionReport mergeReports(List<ExecutionReport> reports) {
+        if (reports == null || reports.isEmpty()) {
+            return null;
+        }
+        if (reports.size() == 1) {
+            return reports.getFirst();
+        }
+        ExecutionReport first = reports.getFirst();
+        double wall = 0.0;
+        double compute = 0.0;
+        double sync = 0.0;
+        long cpuUnits = 0L;
+        Set<Integer> executed = new LinkedHashSet<>();
+        Set<Integer> pruned = new LinkedHashSet<>();
+        for (ExecutionReport r : reports) {
+            wall += r.wallTimeMs();
+            compute += r.computeTimeMs();
+            sync += r.syncTimeMs();
+            cpuUnits += r.cpuInPlaceUnits();
+            executed.addAll(r.executedGpuRanks());
+            pruned.addAll(r.prunedGpuRanks());
+        }
+        return new ExecutionReport(
+                first.operation(),
+                first.workloadPlan(),
+                first.rolePlan(),
+                wall,
+                compute,
+                sync,
+                List.copyOf(executed),
+                List.copyOf(pruned),
+                cpuUnits
+        );
+    }
+
+    private void releaseCaches() {
+        for (int i = 0; i < kCaches.length; i++) {
+            closeQuietly(kCaches[i]);
+            kCaches[i] = null;
+            closeQuietly(vCaches[i]);
+            vCaches[i] = null;
+        }
+    }
+
+    private static void closeQuietly(Tensor t) {
+        if (t != null && !t.isClosed()) {
+            try {
+                t.close();
+            } catch (Throwable ignored) {
             }
         }
     }
 
-    private Tensor forwardLayerDecode(int layerIdx, Tensor x) {
-        LlamaWeights.LayerWeights lw = weights.layer(layerIdx);
-        float eps = config.rmsNormEps();
-        int headDim = config.headDim();
-        int numHeads = config.numAttentionHeads();
-        int numKvHeads = config.numKeyValueHeads();
-        int gqaRatio = config.gqaRatio();
-        float scale = (float) (1.0 / Math.sqrt(headDim));
-
-        try (Tensor normX = x.rmsNorm(lw.inputNorm(), eps);
-             Tensor qFlat = Nn.linearTransposed(normX, lw.qProj(), lw.qBias());
-             Tensor kFlat = Nn.linearTransposed(normX, lw.kProj(), lw.kBias());
-             Tensor vFlat = Nn.linearTransposed(normX, lw.vProj(), lw.vBias());
-             Tensor qReshaped = qFlat.reshape(1, numHeads, headDim);
-             Tensor kReshaped = kFlat.reshape(1, numKvHeads, headDim);
-             Tensor qRoPE = qReshaped.rope(curPos, config.ropeTheta());
-             Tensor kRoPE = kReshaped.rope(curPos, config.ropeTheta())) {
-
-            // Store single token K & V
-            float[] kData = kRoPE.toFloatArray();
-            float[] vData = vFlat.toFloatArray();
-            kCache.get(layerIdx).add(kData);
-            vCache.get(layerIdx).add(vData);
-
-            int totalContext = kCache.get(layerIdx).size();
-            float[] qArr = qRoPE.toFloatArray();
-            float[] attnOutArr = new float[config.hiddenSize()];
-
-            for (int h = 0; h < numHeads; h++) {
-                int kvH = h / gqaRatio;
-                float[] scores = new float[totalContext];
-                float maxScore = -Float.MAX_VALUE;
-
-                for (int t = 0; t < totalContext; t++) {
-                    float[] kTok = kCache.get(layerIdx).get(t);
-                    float dot = 0.0f;
-                    int qOffset = h * headDim;
-                    int kOffset = kvH * headDim;
-                    for (int d = 0; d < headDim; d++) {
-                        dot += qArr[qOffset + d] * kTok[kOffset + d];
-                    }
-                    scores[t] = dot * scale;
-                    if (scores[t] > maxScore) maxScore = scores[t];
-                }
-
-                // Softmax
-                float sumExp = 0.0f;
-                for (int t = 0; t < totalContext; t++) {
-                    scores[t] = (float) Math.exp(scores[t] - maxScore);
-                    sumExp += scores[t];
-                }
-                float invSum = 1.0f / sumExp;
-                for (int t = 0; t < totalContext; t++) {
-                    scores[t] *= invSum;
-                }
-
-                // Weighted sum of values
-                int outOffset = h * headDim;
-                for (int t = 0; t < totalContext; t++) {
-                    float weight = scores[t];
-                    float[] vTok = vCache.get(layerIdx).get(t);
-                    int vOffset = kvH * headDim;
-                    for (int d = 0; d < headDim; d++) {
-                        attnOutArr[outOffset + d] += weight * vTok[vOffset + d];
-                    }
-                }
-            }
-
-            // Output projection & residual
-            Tensor outAttn;
-            try (Tensor attnTensor = Tensor.fromArray(attnOutArr, 1, config.hiddenSize());
-                 Tensor projOut = Nn.linearTransposed(attnTensor, lw.oProj(), null)) {
-                outAttn = x.add(projOut);
-            }
-
-            // SwiGLU MLP & residual
-            try (Tensor normX2 = outAttn.rmsNorm(lw.postAttentionNorm(), eps);
-                 Tensor gateProj = Nn.linearTransposed(normX2, lw.gateProj(), null);
-                 Tensor gate = gateProj.silu();
-                 Tensor up = Nn.linearTransposed(normX2, lw.upProj(), null);
-                 Tensor mlp = gate.mul(up);
-                 Tensor down = Nn.linearTransposed(mlp, lw.downProj(), null)) {
-                return outAttn.add(down);
-            } finally {
-                outAttn.close();
-            }
+    private void ensureOpen() {
+        if (closed) {
+            throw new IllegalStateException("LlamaRunner has already been closed");
         }
     }
 
@@ -443,7 +637,9 @@ public final class LlamaRunner implements AutoCloseable {
     public void close() {
         if (!closed) {
             closed = true;
-            reset();
+            curPos = 0;
+            morphTrace.clear();
+            releaseCaches();
         }
     }
 }

@@ -210,11 +210,13 @@ public final class NativeBindings {
         static final MethodHandle DISPATCH_MATMUL_F32_F16 = bind("dispatch_matmul_f32_f16",
                 FunctionDescriptor.of(JAVA_INT, JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_INT, JAVA_INT, JAVA_INT, JAVA_INT));
 
-        // Transformer primitives: embedding & rope
+        // Transformer primitives: embedding, rope & kv-cache append
         static final MethodHandle DISPATCH_EMBEDDING = bind("dispatch_embedding",
                 FunctionDescriptor.of(JAVA_INT, JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_INT, JAVA_INT, JAVA_INT, JAVA_INT));
         static final MethodHandle DISPATCH_ROPE_F32 = bind("dispatch_rope_f32",
                 FunctionDescriptor.of(JAVA_INT, JAVA_LONG, JAVA_LONG, JAVA_INT, JAVA_INT, JAVA_INT, JAVA_INT, JAVA_INT, JAVA_INT));
+        static final MethodHandle DISPATCH_KV_CACHE_APPEND_F32 = bind("dispatch_kv_cache_append_f32",
+                FunctionDescriptor.of(JAVA_INT, JAVA_LONG, JAVA_LONG, JAVA_INT, JAVA_INT, JAVA_INT, JAVA_INT, JAVA_INT));
 
         @SuppressWarnings("restricted")
         private static MethodHandle bind(String name, FunctionDescriptor desc) {
@@ -440,5 +442,11 @@ public final class NativeBindings {
 
     public static int dispatchRopeF32(long in, long out, int batch, int seqLen, int numHeads, int headDim, int posOffset, int thetaBits) throws Throwable {
         return (int) Holder.DISPATCH_ROPE_F32.invokeExact(in, out, batch, seqLen, numHeads, headDim, posOffset, thetaBits);
+    }
+
+    public static int dispatchKvCacheAppendF32(long src, long cache, int numKvHeads, int maxSeqLen,
+                                               int headDim, int seqLen, int posOffset) throws Throwable {
+        return (int) Holder.DISPATCH_KV_CACHE_APPEND_F32.invokeExact(
+                src, cache, numKvHeads, maxSeqLen, headDim, seqLen, posOffset);
     }
 }

@@ -340,4 +340,19 @@ public final class Nn {
     public static Tensor rope(Tensor x, int positionOffset, float theta, Tensor out) {
         return NnOps.rope(x, positionOffset, theta, out);
     }
+
+    /**
+     * Appends and transposes incoming Key or Value states of shape {@code [seqLen, numKvHeads, headDim]}
+     * directly into a pre-allocated VRAM KV-cache tensor of shape {@code [numKvHeads, maxSeqLen, headDim]}
+     * starting at token index {@code posOffset}, without host round-trips or buffer reallocations.
+     *
+     * @param cache     destination KV-cache tensor of shape {@code [numKvHeads, maxSeqLen, headDim]}
+     * @param newValues incoming key or value tensor of shape {@code [seqLen, numKvHeads, headDim]}
+     * @param posOffset starting sequence position offset in the cache ({@code posOffset + seqLen <= maxSeqLen})
+     * @throws NullPointerException     if {@code cache} or {@code newValues} is null
+     * @throws IllegalArgumentException if shapes, dtypes, aliasing, or bounds are invalid
+     */
+    public static void kvCacheAppend(Tensor cache, Tensor newValues, int posOffset) {
+        NnOps.kvCacheAppend(cache, newValues, posOffset);
+    }
 }

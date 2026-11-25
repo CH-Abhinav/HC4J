@@ -373,4 +373,63 @@ class F16AndTransformerOpsTest {
         assertEquals(before.tensorsHost(), after.tensorsHost());
         assertEquals(before.tensorsEvicted(), after.tensorsEvicted());
     }
+
+    @Test
+    @DisplayName("Nn.kvCacheAppend performs Prefill + Decode transposed writes and bounds validation")
+    void testKvCacheAppendPrefillDecodeAndBounds() {
+        int numKvHeads = 2;
+        int maxSeqLen = 6;
+        int headDim = 4;
+
+        var statsBefore = Engine.memoryStats();
+        try (Tensor cache = Tensor.full(-777.0f, numKvHeads, maxSeqLen, headDim)) {
+            int prefillSeq = 3;
+            float[] prefillData = new float[prefillSeq * numKvHeads * headDim];
+            for (int i = 0; i < prefillData.length; i++) {
+                prefillData[i] = i + 1.0f;
+            }
+            try (Tensor prefillK = Tensor.fromArray(prefillData, prefillSeq, numKvHeads, headDim)) {
+                Nn.kvCacheAppend(cache, prefillK, 0);
+            }
+
+            int decodeSeq = 1;
+            float[] decodeData = new float[decodeSeq * numKvHeads * headDim];
+            for (int i = 0; i < decodeData.length; i++) {
+                decodeData[i] = 500.0f + i;
+            }
+            try (Tensor decodeK = Tensor.fromArray(decodeData, decodeSeq, numKvHeads, headDim)) {
+                Nn.kvCacheAppend(cache, decodeK, 3);
+
+                // Bounds validation
+                assertThrows(IllegalArgumentException.class, () -> Nn.kvCacheAppend(cache, decodeK, 6));
+                assertThrows(IllegalArgumentException.class, () -> Nn.kvCacheAppend(cache, decodeK, -1));
+            }
+
+            // Shape validation
+            try (Tensor badHeads = Tensor.zeros(DType.f32, 1, numKvHeads + 1, headDim)) {
+                assertThrows(IllegalArgumentException.class, () -> Nn.kvCacheAppend(cache, badHeads, 0));
+            }
+
+            // Verify exact transposed contents without corrupting untouched positions
+            float[] got = cache.toFloatArray();
+            for (int h = 0; h < numKvHeads; h++) {
+                for (int pos = 0; pos < maxSeqLen; pos++) {
+                    for (int d = 0; d < headDim; d++) {
+                        int cacheIdx = (h * maxSeqLen + pos) * headDim + d;
+                        float expected;
+                        if (pos < 3) {
+                            expected = prefillData[(pos * numKvHeads + h) * headDim + d];
+                        } else if (pos == 3) {
+                            expected = decodeData[h * headDim + d];
+                        } else {
+                            expected = -777.0f;
+                        }
+                        assertEquals(expected, got[cacheIdx], 1e-6f, "Mismatch at h=" + h + " pos=" + pos + " d=" + d);
+                    }
+                }
+            }
+        }
+        var statsAfter = Engine.memoryStats();
+        assertEquals(statsBefore.tensorsDevice(), statsAfter.tensorsDevice());
+    }
 }

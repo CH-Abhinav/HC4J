@@ -94,6 +94,29 @@ public final class ValidUtil {
         return true;
     }
 
+    /**
+     * Checks whether a batched matrix operand's trailing 2-D matrix dimensions {@code [rows, cols]}
+     * have contiguous row-major ({@code [cols, 1]}) or transposed column-major ({@code [1, rows]})
+     * inner strides compatible with {@code dispatch_batched_matmul_f32}.
+     *
+     * @param shape   tensor shape (length &gt;= 2)
+     * @param strides tensor strides matching {@code shape}
+     * @return true if inner 2-D layout is contiguous row-major or column-major
+     */
+    public static boolean hasValidInnerMatmulLayout(int[] shape, int[] strides) {
+        int r = shape.length;
+        if (r < 2) {
+            return false;
+        }
+        int rows = shape[r - 2];
+        int cols = shape[r - 1];
+        int s0 = strides[r - 2];
+        int s1 = strides[r - 1];
+        boolean rowMajor = (rows == 1 || s0 == cols) && (cols == 1 || s1 == 1);
+        boolean colMajor = (rows == 1 || s0 == 1) && (cols == 1 || s1 == rows);
+        return rowMajor || colMajor;
+    }
+
     public static Dims matmulDims(int[] sa, int[] sb, boolean transposeA, boolean transposeB) {
         if (sa.length < 1 || sa.length > 2 || sb.length < 1 || sb.length > 2) {
             throw new IllegalArgumentException("Matmul supports 1-D and 2-D operands, got "

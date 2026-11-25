@@ -616,6 +616,7 @@ public final class NnOps {
             return res;
         } catch (Throwable t) {
             if (t instanceof RuntimeException re) throw re;
+            if (t instanceof Error er) throw er;
             throw new RuntimeException("HC4J GPU Error: embedding failed", t);
         }
     }
@@ -687,7 +688,74 @@ public final class NnOps {
             return res;
         } catch (Throwable t) {
             if (t instanceof RuntimeException re) throw re;
+            if (t instanceof Error er) throw er;
             throw new RuntimeException("HC4J GPU Error: rope failed", t);
         }
+    }
+
+    public static void kvCacheAppend(Tensor cache, Tensor newValues, int posOffset) {
+        Objects.requireNonNull(cache, "cache");
+        Objects.requireNonNull(newValues, "newValues");
+
+        TensorAccess access = TensorAccess.getInstance();
+        access.ensureOpen(cache);
+        access.ensureOpen(newValues);
+
+        long idCache = access.getVramId(cache);
+        ValidUtil.requireNoAlias(idCache, access.getVramId(newValues),
+                "kvCacheAppend cache and newValues must not share the same buffer");
+
+        if (!newValues.isContiguous() || access.elementOffset(newValues) != 0) {
+            try (Tensor contigNew = newValues.contiguous()) {
+                kvCacheAppend(cache, contigNew, posOffset);
+                return;
+            }
+        }
+
+        if (!cache.isContiguous() || access.elementOffset(cache) != 0) {
+            throw new IllegalArgumentException("KV cache tensor must be contiguous with zero offset");
+        }
+
+        ValidUtil.requireOperandF32("kvCacheAppend cache", cache.getDType());
+        ValidUtil.requireOperandF32("kvCacheAppend newValues", newValues.getDType());
+
+        int[] cacheShape = access.getShapeUnsafe(cache);
+        if (cacheShape.length != 3) {
+            throw new IllegalArgumentException(
+                    "KV cache must be 3-D [numKvHeads, maxSeqLen, headDim], got " + cacheShape.length + "-D");
+        }
+        int[] newShape = access.getShapeUnsafe(newValues);
+        if (newShape.length != 3) {
+            throw new IllegalArgumentException(
+                    "KV newValues must be 3-D [seqLen, numKvHeads, headDim], got " + newShape.length + "-D");
+        }
+
+        int numKvHeads = cacheShape[0];
+        int maxSeqLen = cacheShape[1];
+        int headDim = cacheShape[2];
+        int seqLen = newShape[0];
+
+        if (newShape[1] != numKvHeads || newShape[2] != headDim) {
+            throw new IllegalArgumentException(
+                    "KV shape mismatch: newValues=" + java.util.Arrays.toString(newShape)
+                            + " incompatible with cache=" + java.util.Arrays.toString(cacheShape));
+        }
+        if (posOffset < 0 || (long) posOffset + seqLen > maxSeqLen) {
+            throw new IllegalArgumentException(
+                    "KV cache write out of bounds: posOffset=" + posOffset
+                            + ", seqLen=" + seqLen + ", maxSeqLen=" + maxSeqLen);
+        }
+
+        long idSrc = access.getVramId(newValues);
+        int status;
+        try {
+            status = NativeBindings.dispatchKvCacheAppendF32(
+                    idSrc, idCache, numKvHeads, maxSeqLen, headDim, seqLen, posOffset);
+        } catch (Throwable t) {
+            if (t instanceof RuntimeException re) throw re;
+            if (t instanceof Error er) throw er;
+            throw new RuntimeException("HC4J GPU Error: kvCacheAppend failed", t);
+        }
+        NativeEngine.checkStatus(status, "NnOps.kvCacheAppend");
     }
 }
