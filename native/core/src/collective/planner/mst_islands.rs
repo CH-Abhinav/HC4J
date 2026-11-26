@@ -4,7 +4,9 @@
 
 use std::collections::HashMap;
 
-use super::ring_tsp::{AllSubsetsRingTable, solve_optimal_ring, solve_ring_bottleneck_greedy};
+use super::ring_tsp::{
+    AllSubsetsRingTable, precompute_all_subsets_ring_for_payload, solve_optimal_ring, solve_ring_hockney_greedy,
+};
 use crate::collective::backend::{
     DeviceProfileC, LinkInfo, TRANSPORT_HOST_SHARED_DMA, TRANSPORT_HOST_STAGED, TRANSPORT_PEER_TO_PEER,
 };
@@ -18,10 +20,41 @@ pub struct IslandInfo {
     pub members: Vec<u32>,
 }
 
+#[inline]
+fn ring_allreduce_time_secs(
+    indices: &[usize],
+    bw: &[Vec<f64>],
+    lat_us: &[Vec<f64>],
+    ring_table: Option<&AllSubsetsRingTable>,
+    sync_bytes: u64,
+) -> f64 {
+    let m = indices.len();
+    if m <= 1 || sync_bytes == 0 {
+        return 0.0;
+    }
+    let m_f = m as f64;
+    if let Some(t) = ring_table {
+        let mut mask = 0usize;
+        for &idx in indices {
+            mask |= 1usize << idx;
+        }
+        let h_us = t.hockney_us(mask);
+        if h_us > 0.0 {
+            return 2.0 * (m_f - 1.0) * (h_us / 1e6);
+        }
+        let ring_bw = t.bottleneck(mask).max(1e-6);
+        let ring_lat_secs = t.latency_us(mask) / 1e6;
+        return 2.0 * (m_f - 1.0) * ring_lat_secs
+            + 2.0 * ((m_f - 1.0) / m_f) * ((sync_bytes as f64) / (ring_bw * 1e9));
+    }
+    let (_, _, hockney_us) = solve_ring_hockney_greedy(indices, bw, lat_us, sync_bytes);
+    2.0 * (m_f - 1.0) * (hockney_us / 1e6)
+}
+
 /// Estimates exact collective AllReduce sync latency in milliseconds by evaluating
 /// both flat global ring and all `m - 1` hierarchical MST dendrogram level cuts.
 ///
-/// Mirrors Java `WorkloadPlanner.estimateSyncMsExact` bit-for-bit.
+/// Mirrors Java `MstDendrogram.estimateSyncMsExact` bit-for-bit.
 pub(crate) fn estimate_sync_ms_exact(
     active_indices: &[usize],
     bw: &[Vec<f64>],
@@ -36,24 +69,7 @@ pub(crate) fn estimate_sync_ms_exact(
         return 0.0;
     }
 
-    let mut mask = 0usize;
-    for &idx in active_indices {
-        mask |= 1usize << idx;
-    }
-
-    let ring_bw = match ring_table {
-        Some(t) => t.bottleneck(mask),
-        None => solve_ring_bottleneck_greedy(active_indices, bw),
-    };
-    let ring_lat_secs = match ring_table {
-        Some(t) => t.latency_us(mask) / 1e6,
-        None => 0.0,
-    };
-    let ring_bw = if ring_bw <= 0.0 { 1e-6 } else { ring_bw };
-
-    let m_f = m as f64;
-    let sync_f = sync_bytes as f64;
-    let t_flat = 2.0 * (m_f - 1.0) * ring_lat_secs + 2.0 * ((m_f - 1.0) / m_f) * (sync_f / (ring_bw * 1e9));
+    let t_flat = ring_allreduce_time_secs(active_indices, bw, lat_us, ring_table, sync_bytes);
     let mut best_time_secs = t_flat;
 
     #[derive(Clone, Copy)]
@@ -138,45 +154,15 @@ pub(crate) fn estimate_sync_ms_exact(
         let mut t_intra_max = 0.0f64;
 
         for isl in &islands {
-            let leader = pick_mst_leader(isl, active_indices, devices, bw);
+            let leader = pick_mst_leader(isl, active_indices, devices, bw, lat_us, sync_bytes);
             leaders.push(leader);
             if isl.len() > 1 {
-                let mut b_intra = f64::MAX;
-                let mut lat_intra_secs = 0.0f64;
-                for &member in isl {
-                    if member != leader {
-                        let min_b = bw[member][leader].min(bw[leader][member]);
-                        let max_l = lat_us[member][leader].max(lat_us[leader][member]) / 1e6;
-                        b_intra = b_intra.min(min_b);
-                        lat_intra_secs = lat_intra_secs.max(max_l);
-                    }
-                }
-                if b_intra <= 0.0 {
-                    b_intra = 1e-6;
-                }
-                let sz_f = isl.len() as f64;
-                let t_intra =
-                    2.0 * (sz_f - 1.0) * lat_intra_secs + 2.0 * ((sz_f - 1.0) / sz_f) * (sync_f / (b_intra * 1e9));
+                let t_intra = ring_allreduce_time_secs(isl, bw, lat_us, ring_table, sync_bytes);
                 t_intra_max = t_intra_max.max(t_intra);
             }
         }
 
-        let mut leader_mask = 0usize;
-        for &l in &leaders {
-            leader_mask |= 1usize << l;
-        }
-        let b_lead = match ring_table {
-            Some(t) => t.bottleneck(leader_mask),
-            None => solve_ring_bottleneck_greedy(&leaders, bw),
-        };
-        let lat_lead_secs = match ring_table {
-            Some(t) => t.latency_us(leader_mask) / 1e6,
-            None => 0.0,
-        };
-        let b_lead = if b_lead <= 0.0 { 1e-6 } else { b_lead };
-
-        let k_f = leaders.len() as f64;
-        let t_lead = 2.0 * (k_f - 1.0) * lat_lead_secs + 2.0 * ((k_f - 1.0) / k_f) * (sync_f / (b_lead * 1e9));
+        let t_lead = ring_allreduce_time_secs(&leaders, bw, lat_us, ring_table, sync_bytes);
         let t_hier = t_intra_max + t_lead;
         if t_hier < best_time_secs * (1.0 - 1e-6) {
             best_time_secs = t_hier;
@@ -186,39 +172,49 @@ pub(crate) fn estimate_sync_ms_exact(
     best_time_secs * 1000.0
 }
 
-fn pick_mst_leader(members: &[usize], active_indices: &[usize], devices: &[DeviceProfileC], bw: &[Vec<f64>]) -> usize {
+fn pick_mst_leader(
+    members: &[usize],
+    active_indices: &[usize],
+    devices: &[DeviceProfileC],
+    bw: &[Vec<f64>],
+    lat_us: &[Vec<f64>],
+    sync_bytes: u64,
+) -> usize {
     let mut best = members[0];
+    let mut best_worst_out_t = f64::INFINITY;
     let mut best_gflops = -1.0f64;
-    let mut best_mean_out = -1.0f64;
 
     for &m in members {
         let gflops = devices.get(m).map_or(0.0, |d| d.compute_gflops);
-        let mut out_sum = 0.0f64;
-        let mut out_count = 0usize;
+        let mut worst_out_t = 0.0f64;
+        let mut has_outbound = false;
         for &o in active_indices {
             if !members.contains(&o) {
-                out_sum += bw[m][o];
-                out_count += 1;
+                has_outbound = true;
+                let link_t = (lat_us[m][o] / 1e6) + (sync_bytes as f64) / (bw[m][o].max(1e-6) * 1e9);
+                worst_out_t = worst_out_t.max(link_t);
             }
         }
-        let mean_out = if out_count > 0 {
-            out_sum / out_count as f64
-        } else {
-            0.0
-        };
+        if !has_outbound {
+            worst_out_t = 0.0;
+        }
 
-        let better = if (gflops - best_gflops).abs() > 1e-4 {
+        let scale = worst_out_t.max(best_worst_out_t).max(1e-9);
+        let diff = worst_out_t - best_worst_out_t;
+        let better = if diff < -1e-6 * scale {
+            true
+        } else if diff > 1e-6 * scale {
+            false
+        } else if (gflops - best_gflops).abs() > 1e-4 {
             gflops > best_gflops
-        } else if (mean_out - best_mean_out).abs() > 1e-4 {
-            mean_out > best_mean_out
         } else {
             m < best
         };
 
         if better {
             best = m;
+            best_worst_out_t = worst_out_t;
             best_gflops = gflops;
-            best_mean_out = mean_out;
         }
     }
     best
@@ -270,11 +266,13 @@ fn pick_leader(
     members: &[u32],
     profiles: &[DeviceProfileC],
     bw: &[Vec<f64>],
+    lat_us: &[Vec<f64>],
     ranks: usize,
+    sync_bytes: u64,
 ) -> u32 {
     let mut best_leader = members[0];
+    let mut best_worst_out_t = f64::INFINITY;
     let mut best_gflops = -1.0;
-    let mut best_mean_out = -1.0;
 
     for &m in members {
         let m_idx = m as usize;
@@ -284,32 +282,36 @@ fn pick_leader(
             .map(|p| p.compute_gflops)
             .unwrap_or(0.0);
 
-        let mut out_bw_sum = 0.0;
-        let mut out_count = 0;
+        let mut worst_out_t = 0.0f64;
+        let mut has_outbound = false;
         for other in 0..ranks {
             if !members.contains(&(other as u32)) {
-                out_bw_sum += bw[m_idx][other];
-                out_count += 1;
+                has_outbound = true;
+                let link_t =
+                    (lat_us[m_idx][other] / 1e6) + (sync_bytes as f64) / (bw[m_idx][other].max(1e-6) * 1e9);
+                worst_out_t = worst_out_t.max(link_t);
             }
         }
-        let mean_out = if out_count > 0 {
-            out_bw_sum / out_count as f64
-        } else {
-            0.0
-        };
+        if !has_outbound {
+            worst_out_t = 0.0;
+        }
 
-        let is_cand_better = if (gflops - best_gflops).abs() > 1e-4 {
+        let scale = worst_out_t.max(best_worst_out_t).max(1e-9);
+        let diff = worst_out_t - best_worst_out_t;
+        let is_cand_better = if diff < -1e-6 * scale {
+            true
+        } else if diff > 1e-6 * scale {
+            false
+        } else if (gflops - best_gflops).abs() > 1e-4 {
             gflops > best_gflops
-        } else if (mean_out - best_mean_out).abs() > 1e-4 {
-            mean_out > best_mean_out
         } else {
             m < best_leader
         };
 
         if is_cand_better {
             best_leader = m;
+            best_worst_out_t = worst_out_t;
             best_gflops = gflops;
-            best_mean_out = mean_out;
         }
     }
     best_leader
@@ -404,6 +406,7 @@ pub fn detect_islands_for_payload(
     });
 
     // Evaluate all m dendrogram cuts k in 0..ranks
+    let ring_table = (ranks <= 12).then(|| precompute_all_subsets_ring_for_payload(ranks, &bw, &lat_us, sync_bytes));
     let mut best_k = 0;
     let mut best_time = f64::INFINITY;
 
@@ -423,8 +426,13 @@ pub fn detect_islands_for_payload(
                 b_ring = 1e-6;
             }
             let m_f = ranks as f64;
-            let t_flat = 2.0 * (m_f - 1.0) * lat_ring_secs
-                + 2.0 * ((m_f - 1.0) / m_f) * (sync_bytes as f64 / (b_ring * 1e9));
+            let t_flat = if let Some(t) = &ring_table {
+                let all_idx: Vec<usize> = (0..ranks).collect();
+                ring_allreduce_time_secs(&all_idx, &bw, &lat_us, Some(t), sync_bytes)
+            } else {
+                2.0 * (m_f - 1.0) * lat_ring_secs
+                    + 2.0 * ((m_f - 1.0) / m_f) * (sync_bytes as f64 / (b_ring * 1e9))
+            };
 
             best_k = 0;
             best_time = t_flat;
@@ -451,64 +459,23 @@ pub fn detect_islands_for_payload(
             let mut leaders = Vec::with_capacity(island_members.len());
             let mut t_intra_max = 0.0f64;
             for members in &island_members {
-                let leader = pick_leader(members, profiles, &bw, ranks);
+                let leader = pick_leader(members, profiles, &bw, &lat_us, ranks, sync_bytes);
                 leaders.push(leader);
                 if members.len() > 1 {
-                    let mut b_intra = f64::INFINITY;
-                    let mut lat_intra_secs = 0.0f64;
-                    for &m in members {
-                        if m != leader {
-                            let u = m as usize;
-                            let l = leader as usize;
-                            let min_bw = bw[u][l].min(bw[l][u]);
-                            let max_lat = lat_us[u][l].max(lat_us[l][u]) / 1e6;
-                            b_intra = b_intra.min(min_bw);
-                            lat_intra_secs = lat_intra_secs.max(max_lat);
-                        }
-                    }
-                    if b_intra <= 0.0 {
-                        b_intra = 1e-6;
-                    }
-                    let sz_f = members.len() as f64;
-                    let t_intra = 2.0 * (sz_f - 1.0) * lat_intra_secs
-                        + 2.0 * ((sz_f - 1.0) / sz_f) * (sync_bytes as f64 / (b_intra * 1e9));
+                    let isl_idx: Vec<usize> = members.iter().map(|&r| r as usize).collect();
+                    let t_intra = ring_allreduce_time_secs(
+                        &isl_idx,
+                        &bw,
+                        &lat_us,
+                        ring_table.as_ref(),
+                        sync_bytes,
+                    );
                     t_intra_max = t_intra_max.max(t_intra);
                 }
             }
 
-            let num_leaders = leaders.len();
-            let mut leader_links = Vec::with_capacity(num_leaders * (num_leaders - 1));
-            for (i, &li) in leaders.iter().enumerate() {
-                for (j, &lj) in leaders.iter().enumerate() {
-                    if i != j {
-                        leader_links.push(LinkInfo {
-                            src_rank: i as u32,
-                            dst_rank: j as u32,
-                            bandwidth_gbps: bw[li as usize][lj as usize],
-                            transport: tr[li as usize][lj as usize],
-                            loopback: if li == lj { 1 } else { 0 },
-                            latency_us: lat_us[li as usize][lj as usize],
-                        });
-                    }
-                }
-            }
-            let leader_ring_idx = solve_optimal_ring(num_leaders, &leader_links);
-            let mut b_lead = f64::INFINITY;
-            let mut lat_lead_secs = 0.0f64;
-            for i in 0..leader_ring_idx.len() {
-                let idx_u = leader_ring_idx[i] as usize;
-                let idx_v = leader_ring_idx[(i + 1) % leader_ring_idx.len()] as usize;
-                let u = leaders[idx_u] as usize;
-                let v = leaders[idx_v] as usize;
-                b_lead = b_lead.min(bw[u][v]);
-                lat_lead_secs = lat_lead_secs.max(lat_us[u][v] / 1e6);
-            }
-            if b_lead <= 0.0 {
-                b_lead = 1e-6;
-            }
-            let k_f = num_leaders as f64;
-            let t_lead = 2.0 * (k_f - 1.0) * lat_lead_secs
-                + 2.0 * ((k_f - 1.0) / k_f) * (sync_bytes as f64 / (b_lead * 1e9));
+            let lead_idx: Vec<usize> = leaders.iter().map(|&r| r as usize).collect();
+            let t_lead = ring_allreduce_time_secs(&lead_idx, &bw, &lat_us, ring_table.as_ref(), sync_bytes);
 
             let t_hier = t_intra_max + t_lead;
             if t_hier < best_time * (1.0 - 1e-6) {
@@ -544,7 +511,7 @@ pub fn detect_islands_for_payload(
         .into_iter()
         .enumerate()
         .map(|(id, members)| {
-            let best_leader = pick_leader(&members, profiles, &bw, ranks);
+            let best_leader = pick_leader(&members, profiles, &bw, &lat_us, ranks, sync_bytes);
             let internal_transport = if members.len() == 1 {
                 let m = members[0] as usize;
                 let mut best_out_tr = TRANSPORT_PEER_TO_PEER;
@@ -658,6 +625,7 @@ mod tests {
             device_type: 2, // discrete
             vram_bytes: 8 * 1024 * 1024 * 1024,
             compute_gflops: gflops,
+            vram_bandwidth_gbps: 200.0,
         }
     }
 
@@ -856,5 +824,24 @@ mod tests {
         // Flat ring across 2 GB/s bridge with 4 ranks: 2*(3/4)*(64MB / 2GB/s) = 48ms;
         // Hierarchical (intra 25 GB/s + inter 2 GB/s across 2 leaders): 2*(1/2)*(64MB/25GB/s + 64MB/2GB/s) ~= 34.56ms!
         assert!(ms < 40.0, "expected hierarchical dendrogram sync < 40ms, got {ms}");
+    }
+
+    #[test]
+    fn pick_leader_prefers_lowest_worst_case_outbound_hockney_latency() {
+        let devices = vec![
+            make_profile(0, 12_000.0), // higher GFLOP/s but slow outbound bridge
+            make_profile(1, 10_000.0), // slightly lower GFLOP/s but fast outbound bridge
+            make_profile(2, 10_000.0),
+        ];
+        let mut bw = vec![vec![25.0; 3]; 3];
+        let mut lat = vec![vec![2.0; 3]; 3];
+        // Rank 0 -> Rank 2 slow bridge; Rank 1 -> Rank 2 fast bridge.
+        bw[0][2] = 1.0;
+        lat[0][2] = 200.0;
+        bw[1][2] = 15.0;
+        lat[1][2] = 5.0;
+
+        let leader = super::pick_mst_leader(&[0, 1], &[0, 1, 2], &devices, &bw, &lat, 64 << 20);
+        assert_eq!(leader, 1, "leader must minimize worst-case outbound Hockney time");
     }
 }

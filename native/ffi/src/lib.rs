@@ -76,13 +76,14 @@ mod tests {
         assert_eq!(offset_of!(LinkInfo, loopback), 20);
         assert_eq!(offset_of!(LinkInfo, latency_us), 24);
 
-        // DeviceProfileC: 32 B
-        assert_eq!(size_of::<DeviceProfileC>(), 32);
+        // DeviceProfileC: 40 B
+        assert_eq!(size_of::<DeviceProfileC>(), 40);
         assert_eq!(align_of::<DeviceProfileC>(), 8);
         assert_eq!(offset_of!(DeviceProfileC, rank), 0);
         assert_eq!(offset_of!(DeviceProfileC, device_type), 12);
         assert_eq!(offset_of!(DeviceProfileC, vram_bytes), 16);
         assert_eq!(offset_of!(DeviceProfileC, compute_gflops), 24);
+        assert_eq!(offset_of!(DeviceProfileC, vram_bandwidth_gbps), 32);
 
         // IslandHeaderC: 16 B
         assert_eq!(size_of::<IslandHeaderC>(), 16);
@@ -182,6 +183,7 @@ mod tests {
                 device_type: 2,
                 vram_bytes: 8 << 30,
                 compute_gflops: 40_000.0,
+                vram_bandwidth_gbps: 900.0,
             },
             DeviceProfileC {
                 rank: 1,
@@ -190,6 +192,7 @@ mod tests {
                 device_type: 1,
                 vram_bytes: 8 << 30,
                 compute_gflops: 120.0,
+                vram_bandwidth_gbps: 40.0,
             },
         ];
         let links = [

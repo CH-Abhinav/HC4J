@@ -6,7 +6,7 @@
 use std::path::{Path, PathBuf};
 
 /// Versioned plain-text header.
-pub const CACHE_HEADER: &str = "HC4J_TOPO_V2";
+pub const CACHE_HEADER: &str = "HC4J_TOPO_V4";
 
 /// A cached device entry.
 #[derive(Debug, Clone, PartialEq)]
@@ -14,6 +14,7 @@ pub struct CachedDevice {
     pub phys_idx: usize,
     pub vram_bytes: u64,
     pub compute_gflops: f64,
+    pub vram_bandwidth_gbps: f64,
 }
 
 /// A cached edge entry.
@@ -22,6 +23,7 @@ pub struct CachedEdge {
     pub src_phys_idx: usize,
     pub dst_phys_idx: usize,
     pub transport: u32,
+    pub handle_type: String,
     pub bandwidth_gbps: f64,
     pub latency_us: f64,
 }
@@ -141,14 +143,19 @@ pub fn serialize_cache(devices: &[CachedDevice], edges: &[CachedEdge]) -> String
 
     for dev in devices {
         out.push_str(&format!(
-            "DEV\t{}\t{}\t{:.4}\n",
-            dev.phys_idx, dev.vram_bytes, dev.compute_gflops
+            "DEV\t{}\t{}\t{:.4}\t{:.4}\n",
+            dev.phys_idx, dev.vram_bytes, dev.compute_gflops, dev.vram_bandwidth_gbps
         ));
     }
     for edge in edges {
         out.push_str(&format!(
-            "EDGE\t{}\t{}\t{}\t{:.4}\t{:.2}\n",
-            edge.src_phys_idx, edge.dst_phys_idx, edge.transport, edge.bandwidth_gbps, edge.latency_us
+            "EDGE\t{}\t{}\t{}\t{:.4}\t{:.2}\t{}\n",
+            edge.src_phys_idx,
+            edge.dst_phys_idx,
+            edge.transport,
+            edge.bandwidth_gbps,
+            edge.latency_us,
+            edge.handle_type,
         ));
     }
     out
@@ -173,22 +180,25 @@ pub fn parse_cache(content: &str, expected_phys_devices: usize) -> Option<Cached
         }
         let parts: Vec<&str> = trimmed.split('\t').collect();
         match parts.first().copied() {
-            Some("DEV") if parts.len() == 4 => {
+            Some("DEV") if parts.len() == 5 => {
                 let phys_idx: usize = parts[1].parse().ok()?;
                 let vram_bytes: u64 = parts[2].parse().ok()?;
                 let compute_gflops: f64 = parts[3].parse().ok()?;
+                let vram_bandwidth_gbps: f64 = parts[4].parse().ok()?;
                 devices.push(CachedDevice {
                     phys_idx,
                     vram_bytes,
                     compute_gflops,
+                    vram_bandwidth_gbps,
                 });
             }
-            Some("EDGE") if parts.len() == 6 => {
+            Some("EDGE") if parts.len() == 7 => {
                 let src_phys_idx: usize = parts[1].parse().ok()?;
                 let dst_phys_idx: usize = parts[2].parse().ok()?;
                 let transport: u32 = parts[3].parse().ok()?;
                 let bandwidth_gbps: f64 = parts[4].parse().ok()?;
                 let latency_us: f64 = parts[5].parse().ok()?;
+                let handle_type = parts[6].to_string();
 
                 if src_phys_idx >= expected_phys_devices || dst_phys_idx >= expected_phys_devices {
                     return None;
@@ -201,6 +211,7 @@ pub fn parse_cache(content: &str, expected_phys_devices: usize) -> Option<Cached
                     src_phys_idx,
                     dst_phys_idx,
                     transport,
+                    handle_type,
                     bandwidth_gbps,
                     latency_us,
                 });
@@ -255,11 +266,13 @@ mod tests {
                 phys_idx: 0,
                 vram_bytes: 4 * 1024 * 1024 * 1024,
                 compute_gflops: 185.5,
+                vram_bandwidth_gbps: 38.4,
             },
             CachedDevice {
                 phys_idx: 1,
                 vram_bytes: 8 * 1024 * 1024 * 1024,
                 compute_gflops: 500.0,
+                vram_bandwidth_gbps: 256.0,
             },
         ];
         let edges = vec![
@@ -267,6 +280,7 @@ mod tests {
                 src_phys_idx: 0,
                 dst_phys_idx: 1,
                 transport: 1,
+                handle_type: "OPAQUE_FD".to_string(),
                 bandwidth_gbps: 22.5,
                 latency_us: 150.0,
             },
@@ -274,6 +288,7 @@ mod tests {
                 src_phys_idx: 1,
                 dst_phys_idx: 0,
                 transport: 1,
+                handle_type: "OPAQUE_FD".to_string(),
                 bandwidth_gbps: 22.0,
                 latency_us: 180.0,
             },
@@ -286,9 +301,11 @@ mod tests {
         assert_eq!(loaded.devices, devices);
         assert_eq!(loaded.edges, edges);
 
-        // Verify that old V1 cache fails to load
+        // Verify that old V1/V2 caches fail to load
         let v1_content = "HC4J_TOPO_V1\nDEV\t0\t8589934592\t1000.0000\nDEV\t1\t8589934592\t800.0000\nEDGE\t0\t1\t1\t25.0000\nEDGE\t1\t0\t1\t22.0000\n";
         assert!(parse_cache(v1_content, 2).is_none());
+        let v2_content = "HC4J_TOPO_V2\nDEV\t0\t8589934592\t1000.0000\nDEV\t1\t8589934592\t800.0000\n";
+        assert!(parse_cache(v2_content, 2).is_none());
 
         // Cleanup
         let _ = std::fs::remove_file(&path);
@@ -301,15 +318,15 @@ mod tests {
         let path = temp_dir.join("corrupt.cache");
 
         // Malformed header
-        let _ = write_cache_atomic(&path, "NOT_HC4J\nDEV\t0\t100\t100");
+        let _ = write_cache_atomic(&path, "NOT_HC4J\nDEV\t0\t100\t100\t50");
         assert!(load_cache(&path, 1).is_none());
 
         // Malformed lines
-        let _ = write_cache_atomic(&path, "HC4J_TOPO_V2\nDEV\tinvalid\t100\t100");
+        let _ = write_cache_atomic(&path, "HC4J_TOPO_V4\nDEV\tinvalid\t100\t100\t50");
         assert!(load_cache(&path, 1).is_none());
 
         // Incomplete device count
-        let _ = write_cache_atomic(&path, "HC4J_TOPO_V2\nDEV\t0\t100\t100\n");
+        let _ = write_cache_atomic(&path, "HC4J_TOPO_V4\nDEV\t0\t100\t100\t50\n");
         assert!(load_cache(&path, 2).is_none());
 
         let _ = std::fs::remove_file(&path);
@@ -352,11 +369,13 @@ mod tests {
                 phys_idx: 0,
                 vram_bytes: 8 * 1024 * 1024 * 1024,
                 compute_gflops: 500.0,
+                vram_bandwidth_gbps: 200.0,
             },
             CachedDevice {
                 phys_idx: 1,
                 vram_bytes: 8 * 1024 * 1024 * 1024,
                 compute_gflops: 500.0,
+                vram_bandwidth_gbps: 200.0,
             },
         ];
         // 4 edges: (0,0), (0,1), (1,0), (1,1)
@@ -365,6 +384,7 @@ mod tests {
                 src_phys_idx: 0,
                 dst_phys_idx: 0,
                 transport: 0,
+                handle_type: "HOST_STAGED".to_string(),
                 bandwidth_gbps: 500.0,
                 latency_us: 1.0,
             },
@@ -372,6 +392,7 @@ mod tests {
                 src_phys_idx: 0,
                 dst_phys_idx: 1,
                 transport: 1,
+                handle_type: "OPAQUE_WIN32".to_string(),
                 bandwidth_gbps: 25.0,
                 latency_us: 100.0,
             },
@@ -379,6 +400,7 @@ mod tests {
                 src_phys_idx: 1,
                 dst_phys_idx: 0,
                 transport: 1,
+                handle_type: "OPAQUE_WIN32".to_string(),
                 bandwidth_gbps: 25.0,
                 latency_us: 100.0,
             },
@@ -386,6 +408,7 @@ mod tests {
                 src_phys_idx: 1,
                 dst_phys_idx: 1,
                 transport: 0,
+                handle_type: "HOST_STAGED".to_string(),
                 bandwidth_gbps: 500.0,
                 latency_us: 1.0,
             },

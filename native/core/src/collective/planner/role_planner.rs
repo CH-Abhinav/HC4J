@@ -47,48 +47,80 @@ impl Ord for KvHeapEntry {
     }
 }
 
-fn solve_kv_minimax(workers: &[KvWorker], total_tokens: u64) -> Vec<u64> {
+fn solve_kv_bisection(workers: &[KvWorker], total_tokens: u64) -> (Vec<u64>, f64) {
     let m = workers.len();
     let mut result = vec![0u64; m];
     if m == 0 || total_tokens == 0 {
-        return result;
+        return (result, 0.0);
     }
+
+    let contrib = |t: f64, out: &mut [u64]| -> u64 {
+        let mut sum = 0u64;
+        for (i, w) in workers.iter().enumerate() {
+            let threshold = w.l_rpc + w.r_attn;
+            let p = if w.max_tokens == 0 || t < threshold {
+                0
+            } else if w.r_attn <= 0.0 {
+                w.max_tokens
+            } else {
+                (((t - w.l_rpc) / w.r_attn).floor() as u64).min(w.max_tokens)
+            };
+            out[i] = p;
+            sum = sum.saturating_add(p);
+        }
+        sum
+    };
 
     let mut t_low = 0.0f64;
     let mut t_high = 1.0f64;
     for w in workers {
-        t_high = t_high.max(w.l_rpc + (total_tokens as f64) * w.r_attn);
+        let cap = w.max_tokens.min(total_tokens) as f64;
+        t_high = t_high.max(w.l_rpc + cap * w.r_attn + w.r_attn);
+    }
+    let mut scratch = vec![0u64; m];
+    for _ in 0..64 {
+        if contrib(t_high, &mut scratch) >= total_tokens {
+            break;
+        }
+        t_high *= 2.0;
     }
 
-    for _ in 0..64 {
+    for _ in 0..72 {
         let t_mid = t_low + (t_high - t_low) * 0.5;
-        let mut sum_tokens = 0.0f64;
-        for w in workers {
-            if t_mid > w.l_rpc {
-                let tokens = (t_mid - w.l_rpc) / w.r_attn;
-                sum_tokens += tokens.min(w.max_tokens as f64);
-            }
-        }
-        if sum_tokens >= total_tokens as f64 {
+        if contrib(t_mid, &mut scratch) >= total_tokens {
             t_high = t_mid;
         } else {
             t_low = t_mid;
         }
     }
 
-    let t_opt = t_high;
-    let mut current_sum = 0u64;
-    for (i, w) in workers.iter().enumerate() {
-        let mut tokens = 0u64;
-        if t_opt > w.l_rpc {
-            let raw = ((t_opt - w.l_rpc) / w.r_attn).floor() as u64;
-            tokens = raw.min(w.max_tokens);
+    let current_sum = contrib(t_high, &mut result);
+    if current_sum > total_tokens {
+        // Trim any exact tie overshoot starting from the highest-time workers so makespan stays <= t_high.
+        let mut excess = current_sum - total_tokens;
+        let mut order: Vec<(f64, usize)> = result
+            .iter()
+            .enumerate()
+            .filter(|&(_, &t)| t > 0)
+            .map(|(i, &t)| (workers[i].l_rpc + (t as f64) * workers[i].r_attn, i))
+            .collect();
+        while excess > 0 && !order.is_empty() {
+            order.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+            for (_, i) in &mut order {
+                if excess == 0 {
+                    break;
+                }
+                if result[*i] > 0 {
+                    result[*i] -= 1;
+                    excess -= 1;
+                }
+            }
+            order.retain(|&(_, i)| result[i] > 0);
+            for (tm, i) in &mut order {
+                *tm = workers[*i].l_rpc + (result[*i] as f64) * workers[*i].r_attn;
+            }
         }
-        result[i] = tokens;
-        current_sum = current_sum.saturating_add(tokens);
-    }
-
-    if total_tokens > current_sum {
+    } else if current_sum < total_tokens {
         let mut deficit = total_tokens - current_sum;
         let mut pq = BinaryHeap::with_capacity(m);
         for (i, w) in workers.iter().enumerate() {
@@ -99,7 +131,6 @@ fn solve_kv_minimax(workers: &[KvWorker], total_tokens: u64) -> Vec<u64> {
                 });
             }
         }
-
         while deficit > 0 {
             let Some(top) = pq.pop() else { break };
             result[top.index] += 1;
@@ -114,7 +145,14 @@ fn solve_kv_minimax(workers: &[KvWorker], total_tokens: u64) -> Vec<u64> {
         }
     }
 
-    result
+    let mut max_time = 0.0f64;
+    for (w, &tokens) in workers.iter().zip(&result) {
+        if tokens > 0 {
+            max_time = max_time.max(w.l_rpc + (tokens as f64 * w.r_attn));
+        }
+    }
+
+    (result, max_time)
 }
 
 /// Computes the combined Tensor Parallel + Zero-Waste Split-KV role assignment plan.
@@ -170,7 +208,15 @@ pub fn plan_roles(
         max_kv_tokens[i] = avail_kv_vram / kv_spec.kv_bytes_per_token;
 
         let c_gflops = d.compute_gflops.max(EPSILON);
-        let mem_bw = (c_gflops * 0.1).max(50.0);
+        let mem_bw = if d.vram_bandwidth_gbps > 0.0 && d.vram_bandwidth_gbps.is_finite() {
+            d.vram_bandwidth_gbps
+        } else {
+            match d.device_type {
+                2 => 100.0,
+                1 => 35.0,
+                _ => 50.0,
+            }
+        };
         let t_comp = kv_spec.attention_flops_per_token / (c_gflops * 1e9);
         let t_mem = (kv_spec.kv_bytes_per_token as f64) / (mem_bw * 1e9);
         r_attn[i] = t_comp.max(t_mem) * 1000.0;
@@ -220,67 +266,25 @@ pub fn plan_roles(
         });
     }
 
-    let mut best_worker_set: Option<Vec<KvWorker>> = None;
-    let mut best_kv_alloc: Option<Vec<u64>> = None;
-    let mut best_attn_ms = f64::MAX;
+    let mut token_map: HashMap<i32, u64> = HashMap::new();
+    let best_attn_ms: f64;
 
     if total_kv == 0 {
         best_attn_ms = 0.0;
     } else {
-        let w_count = all_workers.len();
-        if w_count <= 12 {
-            let max_kv_subsets = 1usize << w_count;
-            let mut cand_workers = Vec::with_capacity(w_count);
-            for mask in 1usize..max_kv_subsets {
-                cand_workers.clear();
-                let mut cand_cap = 0u64;
-                for (i, &w) in all_workers.iter().enumerate() {
-                    if (mask & (1usize << i)) != 0 {
-                        cand_workers.push(w);
-                        cand_cap = cand_cap.saturating_add(w.max_tokens);
-                    }
-                }
-                if cand_cap < total_kv {
-                    continue;
-                }
-
-                let alloc = solve_kv_minimax(&cand_workers, total_kv);
-                let mut max_time = 0.0f64;
-                for (w, &tokens) in cand_workers.iter().zip(&alloc) {
-                    let time = if tokens > 0 { w.l_rpc + (tokens as f64 * w.r_attn) } else { 0.0 };
-                    max_time = max_time.max(time);
-                }
-
-                if max_time < best_attn_ms * (1.0 - 1e-6) {
-                    best_attn_ms = max_time;
-                    best_worker_set = Some(cand_workers.clone());
-                    best_kv_alloc = Some(alloc);
-                }
-            }
-        } else {
-            let total_cap: u64 = all_workers.iter().fold(0u64, |acc, w| acc.saturating_add(w.max_tokens));
-            if total_cap >= total_kv {
-                let alloc = solve_kv_minimax(&all_workers, total_kv);
-                let mut max_time = 0.0f64;
-                for (w, &tokens) in all_workers.iter().zip(&alloc) {
-                    let time = if tokens > 0 { w.l_rpc + (tokens as f64 * w.r_attn) } else { 0.0 };
-                    max_time = max_time.max(time);
-                }
-                best_attn_ms = max_time;
-                best_worker_set = Some(all_workers);
-                best_kv_alloc = Some(alloc);
-            }
-        }
-
-        if best_worker_set.is_none() {
+        let total_cap: u64 = all_workers
+            .iter()
+            .fold(0u64, |acc, w| acc.saturating_add(w.max_tokens));
+        if total_cap < total_kv {
             return Err(Hc4jError::OutOfMemory);
         }
-    }
 
-    let mut token_map: HashMap<i32, u64> = HashMap::new();
-    if let (Some(workers), Some(alloc)) = (&best_worker_set, &best_kv_alloc) {
-        for (w, &t) in workers.iter().zip(alloc) {
-            token_map.insert(w.rank, t);
+        let (alloc, attn_ms) = solve_kv_bisection(&all_workers, total_kv);
+        best_attn_ms = attn_ms;
+        for (w, &t) in all_workers.iter().zip(&alloc) {
+            if t > 0 {
+                token_map.insert(w.rank, t);
+            }
         }
     }
 
@@ -387,6 +391,7 @@ mod tests {
                 device_type: 2,
                 vram_bytes: 8 << 30,
                 compute_gflops: 40_000.0,
+                vram_bandwidth_gbps: 900.0,
             },
             DeviceProfileC {
                 rank: 1,
@@ -395,6 +400,7 @@ mod tests {
                 device_type: 1,
                 vram_bytes: 8 << 30,
                 compute_gflops: 100.0,
+                vram_bandwidth_gbps: 40.0,
             },
         ];
         let topology = vec![
@@ -432,5 +438,45 @@ mod tests {
         assert_eq!(roles.split_kv_assignments[1].role, DeviceRole::SplitKvReclaimed);
         let sum_kv: u64 = roles.split_kv_assignments.iter().map(|a| a.kv_tokens).sum();
         assert_eq!(sum_kv, 1200);
+    }
+
+    #[test]
+    fn split_kv_role_solver_scales_beyond_12_workers_without_exponential_search() {
+        let count = 24u32;
+        let devices: Vec<DeviceProfileC> = (0..count)
+            .map(|r| DeviceProfileC {
+                rank: r,
+                vendor_id: 0x10DE,
+                device_id: r,
+                device_type: if r < 16 { 2 } else { 1 },
+                vram_bytes: 16 << 30,
+                compute_gflops: if r < 16 { 30_000.0 } else { 800.0 },
+                vram_bandwidth_gbps: if r < 16 { 900.0 } else { 40.0 },
+            })
+            .collect();
+        let mut links = Vec::new();
+        for s in 0..count {
+            for d in 0..count {
+                if s != d {
+                    links.push(LinkInfo {
+                        src_rank: s,
+                        dst_rank: d,
+                        bandwidth_gbps: if s < 16 && d < 16 { 20.0 } else { 2.0 },
+                        transport: TRANSPORT_HOST_STAGED,
+                        loopback: 0,
+                        latency_us: if s < 16 && d < 16 { 5.0 } else { 60.0 },
+                    });
+                }
+            }
+        }
+        let tp_spec = WorkloadSpec::new(4096, 2e9, 4096, 32 << 20);
+        let kv_spec = SplitKvSpec::new(100_000, 512 << 10, 1e6, 64 << 10);
+
+        let started = std::time::Instant::now();
+        let roles = plan_roles(&devices, &links, &tp_spec, &kv_spec).unwrap();
+        let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+        let sum_kv: u64 = roles.split_kv_assignments.iter().map(|a| a.kv_tokens).sum();
+        assert_eq!(sum_kv, 100_000);
+        assert!(elapsed_ms < 500.0, "24-worker Split-KV bisection took {elapsed_ms:.2} ms");
     }
 }

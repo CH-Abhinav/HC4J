@@ -231,6 +231,39 @@ public final class DistributedExecutor {
     // --- Workload 2: Distributed Megatron-LM Tensor-Parallel Transformer MLP ---
 
     /**
+     * Opens a persistent distributed 2-layer Megatron-LM MLP session pre-uploading weight shards once.
+     *
+     * @param collective collective instance
+     * @param plan workload partitioning plan across hidden dimension H
+     * @param w1 first projection weights {@code [Din, H]}
+     * @param b1 optional bias {@code [H]} (may be null)
+     * @param w2 second projection weights {@code [H, Dout]}
+     * @param b2 optional output bias {@code [Dout]} (may be null)
+     * @param activation activation function (null for NONE, or GELU, SILU, RELU)
+     * @return opened persistent {@link DistributedMlpSession}
+     */
+    public static DistributedMlpSession openMlpSession(
+            Collective collective, WorkloadPlan plan, Tensor w1, Tensor b1, Tensor w2, Tensor b2, Activation activation) {
+        return DistributedMlpSession.open(collective, plan, w1, b1, w2, b2, activation);
+    }
+
+    /**
+     * Opens a persistent distributed SwiGLU MLP session pre-uploading gate, up, and down shards once.
+     *
+     * @param collective collective instance
+     * @param plan workload partitioning plan across hidden dimension H
+     * @param wGate gate projection weights
+     * @param wUp up projection weights
+     * @param wDown down projection weights
+     * @param transposedWeights true if weights use {@code [outFeatures, inFeatures]} linear layout
+     * @return opened persistent {@link DistributedMlpSession}
+     */
+    public static DistributedMlpSession openSwigluMlpSession(
+            Collective collective, WorkloadPlan plan, Tensor wGate, Tensor wUp, Tensor wDown, boolean transposedWeights) {
+        return DistributedMlpSession.openSwiglu(collective, plan, wGate, wUp, wDown, transposedWeights);
+    }
+
+    /**
      * Executes a distributed 2-layer Megatron-LM Tensor Parallel Transformer MLP:
      * {@code act(X * W1 + b1) * W2 + b2} across active collective ranks with active-subset AllReduce.
      *
@@ -271,218 +304,21 @@ public final class DistributedExecutor {
         if (w2Shape[0] != h) {
             throw new IllegalArgumentException("W2 rows (" + w2Shape[0] + ") != W1 columns (" + h + ")");
         }
-        int dOut = w2Shape[1];
-
-        if (b1 != null && (b1.getSize() != h)) {
+        if (b1 != null && b1.getSize() != h) {
             throw new IllegalArgumentException("b1 elements (" + b1.getSize() + ") != H (" + h + ")");
         }
-        if (b2 != null && (b2.getSize() != dOut)) {
+        int dOut = w2Shape[1];
+        if (b2 != null && b2.getSize() != dOut) {
             throw new IllegalArgumentException("b2 elements (" + b2.getSize() + ") != Dout (" + dOut + ")");
         }
         if (plan.totalUnits() != h) {
             throw new IllegalArgumentException("plan.totalUnits() (" + plan.totalUnits() + ") != H (" + h + ")");
         }
 
-        long startWall = System.nanoTime();
-
-        Tensor contigX = x.isContiguous() ? x : x.contiguous();
-        Tensor contigW1 = w1.isContiguous() ? w1 : w1.contiguous();
-        Tensor contigW2 = w2.isContiguous() ? w2 : w2.contiguous();
-        Tensor contigB1 = (b1 != null && !b1.isContiguous()) ? b1.contiguous() : b1;
-
-        List<Integer> executedGpuRanks = new ArrayList<>();
-        List<Integer> prunedRanks = new ArrayList<>();
-        long cpuUnits = 0L;
-
-        List<CollectiveBuffer> activeYBuffers = Collections.synchronizedList(new ArrayList<>());
-        List<CollectiveBuffer> allAllocatedBuffers = Collections.synchronizedList(new ArrayList<>());
-
-        MemorySegment yGpuSeg;
-        float[] yCpu = null;
-
-        long computeStart = System.nanoTime();
-
-        try (Arena stageArena = Arena.ofShared();
-             ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor()) {
-
-            MemorySegment xSeg = stageArena.allocate((long) m * dIn * 4L, 16);
-            MemorySegment w1Seg = stageArena.allocate((long) dIn * h * 4L, 16);
-            MemorySegment w2Seg = stageArena.allocate((long) h * dOut * 4L, 16);
-            MemorySegment b1Seg = (contigB1 != null) ? stageArena.allocate((long) h * 4L, 16) : null;
-
-            contigX.copyTo(xSeg);
-            contigW1.copyTo(w1Seg);
-            contigW2.copyTo(w2Seg);
-            if (contigB1 != null) {
-                contigB1.copyTo(b1Seg);
-            }
-
-            yGpuSeg = Arena.ofAuto().allocate((long) m * dOut * 4L, 16);
-
-            List<CompletableFuture<float[]>> cpuFutures = new ArrayList<>();
-            List<CompletableFuture<CollectiveBuffer>> gpuFutures = new ArrayList<>();
-
-            int hOffset = 0;
-            for (ShardAllocation alloc : plan.allocations()) {
-                int units = (int) alloc.units();
-                if (units <= 0) {
-                    if (alloc.rank() >= 0) {
-                        prunedRanks.add(alloc.rank());
-                    }
-                    continue;
-                }
-
-                int hStart = hOffset;
-                hOffset += units;
-                int rank = alloc.rank();
-
-                if (rank == ShardAllocation.HOST_CPU_RANK) {
-                    cpuUnits += units;
-                    cpuFutures.add(CompletableFuture.supplyAsync(() ->
-                            CpuFallbackKernels.computeCpuMlpSlice(
-                                    xSeg, w1Seg, b1Seg, w2Seg, m, dIn, h, dOut, hStart, units, activation), executor));
-                } else {
-                    executedGpuRanks.add(rank);
-                    gpuFutures.add(CompletableFuture.supplyAsync(() -> {
-                        CollectiveBuffer bufX = null;
-                        CollectiveBuffer bufW1 = null;
-                        CollectiveBuffer bufB1 = null;
-                        CollectiveBuffer bufH = null;
-                        CollectiveBuffer bufW2 = null;
-                        CollectiveBuffer bufY = null;
-                        try {
-                            MemorySegment w1ColSlice = stageArena.allocate((long) dIn * units * 4L, 16);
-                            for (int r = 0; r < dIn; r++) {
-                                long srcOff = ((long) r * h + hStart) * 4L;
-                                long dstOff = (long) r * units * 4L;
-                                MemorySegment.copy(w1Seg, srcOff, w1ColSlice, dstOff, (long) units * 4L);
-                            }
-
-                            MemorySegment w2RowSlice = w2Seg.asSlice((long) hStart * dOut * 4L, (long) units * dOut * 4L);
-
-                            bufX = collective.allocate(rank, (long) m * dIn);
-                            bufW1 = collective.allocate(rank, (long) dIn * units);
-                            bufH = collective.allocate(rank, (long) m * units);
-                            bufW2 = collective.allocate(rank, (long) units * dOut);
-                            bufY = collective.allocate(rank, (long) m * dOut);
-
-                            allAllocatedBuffers.add(bufX);
-                            allAllocatedBuffers.add(bufW1);
-                            allAllocatedBuffers.add(bufH);
-                            allAllocatedBuffers.add(bufW2);
-                            allAllocatedBuffers.add(bufY);
-
-                            bufX.write(xSeg);
-                            bufW1.write(w1ColSlice);
-                            bufW2.write(w2RowSlice);
-
-                            if (b1Seg != null) {
-                                MemorySegment b1Slice = b1Seg.asSlice((long) hStart * 4L, (long) units * 4L);
-                                bufB1 = collective.allocate(rank, units);
-                                allAllocatedBuffers.add(bufB1);
-                                bufB1.write(b1Slice);
-                                collective.gemmBiasAct(rank, bufX, bufW1, bufB1, bufH, m, units, dIn, true, activation);
-                            } else {
-                                collective.gemmBiasAct(rank, bufX, bufW1, null, bufH, m, units, dIn, false, activation);
-                            }
-
-                            bufX.close(); allAllocatedBuffers.remove(bufX);
-                            bufW1.close(); allAllocatedBuffers.remove(bufW1);
-                            if (bufB1 != null) { bufB1.close(); allAllocatedBuffers.remove(bufB1); }
-
-                            collective.gemmBiasAct(rank, bufH, bufW2, null, bufY, m, dOut, units, false, null);
-
-                            bufH.close(); allAllocatedBuffers.remove(bufH);
-                            bufW2.close(); allAllocatedBuffers.remove(bufW2);
-
-                            return bufY;
-                        } catch (Throwable t) {
-                            if (bufX != null) { try { bufX.close(); } catch (Throwable ignored) {} }
-                            if (bufW1 != null) { try { bufW1.close(); } catch (Throwable ignored) {} }
-                            if (bufB1 != null) { try { bufB1.close(); } catch (Throwable ignored) {} }
-                            if (bufH != null) { try { bufH.close(); } catch (Throwable ignored) {} }
-                            if (bufW2 != null) { try { bufW2.close(); } catch (Throwable ignored) {} }
-                            if (bufY != null) { try { bufY.close(); } catch (Throwable ignored) {} }
-                            throw t;
-                        }
-                    }, executor));
-                }
-            }
-
-            for (CompletableFuture<CollectiveBuffer> gf : gpuFutures) {
-                activeYBuffers.add(gf.join());
-            }
-
-            for (CompletableFuture<float[]> cf : cpuFutures) {
-                float[] partialCpu = cf.join();
-                if (yCpu == null) {
-                    yCpu = partialCpu;
-                } else {
-                    for (int i = 0; i < yCpu.length; i++) {
-                        yCpu[i] += partialCpu[i];
-                    }
-                }
-            }
+        try (DistributedMlpSession session = DistributedMlpSession.open(
+                collective, plan, m, w1, b1, w2, b2, activation)) {
+            return session.forwardWithReport(x);
         }
-
-        long computeEnd = System.nanoTime();
-        long syncStart = System.nanoTime();
-
-        try {
-            if (!activeYBuffers.isEmpty()) {
-                collective.allReduceSumSubset(activeYBuffers);
-                activeYBuffers.getFirst().read(yGpuSeg);
-            }
-        } finally {
-            for (CollectiveBuffer b : activeYBuffers) {
-                try { b.close(); } catch (Throwable ignored) {}
-            }
-            for (CollectiveBuffer bRem : allAllocatedBuffers) {
-                try { bRem.close(); } catch (Throwable ignored) {}
-            }
-        }
-
-        long syncEnd = System.nanoTime();
-
-        // Merge CPU and optional bias b2
-        if (yCpu != null) {
-            for (int i = 0; i < m * dOut; i++) {
-                float base = (!activeYBuffers.isEmpty()) ? yGpuSeg.get(ValueLayout.JAVA_FLOAT, (long) i * 4L) : 0.0f;
-                yGpuSeg.set(ValueLayout.JAVA_FLOAT, (long) i * 4L, base + yCpu[i]);
-            }
-        }
-
-        if (b2 != null) {
-            float[] b2Vals = b2.toFloatArray();
-            for (int r = 0; r < m; r++) {
-                long rOff = (long) r * dOut;
-                for (int c = 0; c < dOut; c++) {
-                    float cur = yGpuSeg.get(ValueLayout.JAVA_FLOAT, (rOff + c) * 4L);
-                    yGpuSeg.set(ValueLayout.JAVA_FLOAT, (rOff + c) * 4L, cur + b2Vals[c]);
-                }
-            }
-        }
-
-        long endWall = System.nanoTime();
-
-        double wallMs = (endWall - startWall) / 1e6;
-        double computeMs = (computeEnd - computeStart) / 1e6;
-        double syncMs = (syncEnd - syncStart) / 1e6;
-
-        ExecutionReport report = new ExecutionReport(
-                "transformerMlp",
-                plan,
-                null,
-                wallMs,
-                computeMs,
-                syncMs,
-                executedGpuRanks,
-                prunedRanks,
-                cpuUnits
-        );
-
-        Tensor resultTensor = Tensor.fromSegment(yGpuSeg, DType.f32, m, dOut);
-        return new DistributedResult<>(resultTensor, report);
     }
 
     /**

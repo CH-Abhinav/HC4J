@@ -311,11 +311,326 @@ fn run_fma_benchmark(
     Ok(gflops)
 }
 
+/// Measures sustained device-local VRAM bandwidth (GB/s) using a WGSL STREAM-copy compute shader.
+pub(crate) fn measure_vram_bandwidth_gbps(node: &GpuNode) -> Hc4jResult<f64> {
+    const WORKGROUP_SIZE: u32 = 256;
+
+    let vram = query_vram_bytes(node);
+    let max_range = u64::from(node.props.limits.max_storage_buffer_range);
+    let initial_target = if vram >= (1u64 << 30) {
+        64u64 << 20
+    } else if vram >= (512u64 << 20) {
+        32u64 << 20
+    } else {
+        (vram / 16).max(4u64 << 20)
+    };
+    let mut copy_bytes = ((initial_target.min(max_range.max(1u64 << 20))) / 4096).max(1) * 4096;
+
+    let spv_bytes = include_bytes!(concat!(env!("OUT_DIR"), "/collective_bench_vram_bw.spv"));
+    let mut cursor = std::io::Cursor::new(spv_bytes);
+    let spv_words = ash::util::read_spv(&mut cursor)
+        .map_err(|e| Hc4jError::Device(format!("failed to parse bench_vram_bw SPIR-V bytecode: {e}")))?;
+
+    let sm_ci = vk::ShaderModuleCreateInfo::default().code(&spv_words);
+    let shader_module = unsafe { node.device.create_shader_module(&sm_ci, None) }
+        .map_err(|e| Hc4jError::Device(format!("create_shader_module bench_vram_bw failed: {e}")))?;
+
+    let mut alloc_pair: Option<(BufMem, BufMem)> = None;
+    let mut last_err = None;
+    for _ in 0..5 {
+        match (
+            alloc_device_local(
+                node,
+                copy_bytes,
+                vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+            ),
+            alloc_device_local(node, copy_bytes, vk::BufferUsageFlags::STORAGE_BUFFER),
+        ) {
+            (Ok(src), Ok(dst)) => {
+                alloc_pair = Some((src, dst));
+                break;
+            }
+            (Ok(src), Err(e)) => {
+                destroy_buf(node, &src);
+                last_err = Some(e);
+            }
+            (Err(e), _) => {
+                last_err = Some(e);
+            }
+        }
+        if copy_bytes <= (4u64 << 20) {
+            break;
+        }
+        copy_bytes = ((copy_bytes / 2) / 4096).max(1) * 4096;
+    }
+
+    let (src_buf, dst_buf) = match alloc_pair {
+        Some(pair) => pair,
+        None => {
+            unsafe { node.device.destroy_shader_module(shader_module, None) };
+            return Err(last_err.unwrap_or(Hc4jError::OutOfMemory));
+        }
+    };
+
+    let uniform_buf = match alloc_staging(
+        node,
+        16,
+        vk::BufferUsageFlags::UNIFORM_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+    ) {
+        Ok(b) => b,
+        Err(e) => {
+            destroy_buf(node, &dst_buf);
+            destroy_buf(node, &src_buf);
+            unsafe { node.device.destroy_shader_module(shader_module, None) };
+            return Err(e);
+        }
+    };
+
+    let count_vec4 = (copy_bytes / 16) as u32;
+    let write_res = write_iterations(node, &uniform_buf, count_vec4);
+    let result = match write_res {
+        Ok(()) => {
+            let max_wg = node.props.limits.max_compute_work_group_count[0].max(1);
+            let workgroups = count_vec4.div_ceil(WORKGROUP_SIZE).clamp(1, max_wg.min(16384));
+            run_vram_bw_benchmark(node, shader_module, &src_buf, &dst_buf, &uniform_buf, copy_bytes, workgroups)
+        }
+        Err(e) => Err(e),
+    };
+
+    destroy_buf(node, &uniform_buf);
+    destroy_buf(node, &dst_buf);
+    destroy_buf(node, &src_buf);
+    unsafe {
+        node.device.destroy_shader_module(shader_module, None);
+    }
+
+    result
+}
+
+fn run_vram_bw_benchmark(
+    node: &GpuNode,
+    shader_module: vk::ShaderModule,
+    src_buf: &BufMem,
+    dst_buf: &BufMem,
+    uniform_buf: &BufMem,
+    copy_bytes: u64,
+    workgroups: u32,
+) -> Hc4jResult<f64> {
+    let bindings = [
+        vk::DescriptorSetLayoutBinding {
+            binding: 0,
+            descriptor_type: vk::DescriptorType::UNIFORM_BUFFER,
+            descriptor_count: 1,
+            stage_flags: vk::ShaderStageFlags::COMPUTE,
+            p_immutable_samplers: std::ptr::null(),
+            _marker: std::marker::PhantomData,
+        },
+        vk::DescriptorSetLayoutBinding {
+            binding: 1,
+            descriptor_type: vk::DescriptorType::STORAGE_BUFFER,
+            descriptor_count: 1,
+            stage_flags: vk::ShaderStageFlags::COMPUTE,
+            p_immutable_samplers: std::ptr::null(),
+            _marker: std::marker::PhantomData,
+        },
+        vk::DescriptorSetLayoutBinding {
+            binding: 2,
+            descriptor_type: vk::DescriptorType::STORAGE_BUFFER,
+            descriptor_count: 1,
+            stage_flags: vk::ShaderStageFlags::COMPUTE,
+            p_immutable_samplers: std::ptr::null(),
+            _marker: std::marker::PhantomData,
+        },
+    ];
+
+    let dsl_ci = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
+    let desc_set_layout = unsafe { node.device.create_descriptor_set_layout(&dsl_ci, None) }
+        .map_err(|e| Hc4jError::Device(format!("create_descriptor_set_layout bench_vram_bw failed: {e}")))?;
+
+    let layout_ci = vk::PipelineLayoutCreateInfo::default()
+        .set_layouts(std::slice::from_ref(&desc_set_layout));
+    let pipe_layout = match unsafe { node.device.create_pipeline_layout(&layout_ci, None) } {
+        Ok(l) => l,
+        Err(e) => {
+            unsafe { node.device.destroy_descriptor_set_layout(desc_set_layout, None) };
+            return Err(Hc4jError::Device(format!("create_pipeline_layout bench_vram_bw failed: {e}")));
+        }
+    };
+
+    let stage = vk::PipelineShaderStageCreateInfo::default()
+        .stage(vk::ShaderStageFlags::COMPUTE)
+        .module(shader_module)
+        .name(c"main");
+    let pipe_ci = vk::ComputePipelineCreateInfo::default()
+        .stage(stage)
+        .layout(pipe_layout);
+
+    let pipeline = match unsafe {
+        node.device.create_compute_pipelines(vk::PipelineCache::null(), &[pipe_ci], None)
+    } {
+        Ok(pipes) => pipes[0],
+        Err((_, e)) => {
+            unsafe {
+                node.device.destroy_pipeline_layout(pipe_layout, None);
+                node.device.destroy_descriptor_set_layout(desc_set_layout, None);
+            }
+            return Err(Hc4jError::Device(format!("create_compute_pipelines bench_vram_bw failed: {e:?}")));
+        }
+    };
+
+    let pool_sizes = [
+        vk::DescriptorPoolSize {
+            ty: vk::DescriptorType::UNIFORM_BUFFER,
+            descriptor_count: 1,
+        },
+        vk::DescriptorPoolSize {
+            ty: vk::DescriptorType::STORAGE_BUFFER,
+            descriptor_count: 2,
+        },
+    ];
+    let pool_ci = vk::DescriptorPoolCreateInfo::default()
+        .max_sets(1)
+        .pool_sizes(&pool_sizes);
+    let desc_pool = match unsafe { node.device.create_descriptor_pool(&pool_ci, None) } {
+        Ok(p) => p,
+        Err(e) => {
+            unsafe {
+                node.device.destroy_pipeline(pipeline, None);
+                node.device.destroy_pipeline_layout(pipe_layout, None);
+                node.device.destroy_descriptor_set_layout(desc_set_layout, None);
+            }
+            return Err(Hc4jError::Device(format!("create_descriptor_pool bench_vram_bw failed: {e}")));
+        }
+    };
+
+    let alloc_info = vk::DescriptorSetAllocateInfo::default()
+        .descriptor_pool(desc_pool)
+        .set_layouts(std::slice::from_ref(&desc_set_layout));
+    let desc_set = match unsafe { node.device.allocate_descriptor_sets(&alloc_info) } {
+        Ok(sets) => sets[0],
+        Err(e) => {
+            unsafe {
+                node.device.destroy_descriptor_pool(desc_pool, None);
+                node.device.destroy_pipeline(pipeline, None);
+                node.device.destroy_pipeline_layout(pipe_layout, None);
+                node.device.destroy_descriptor_set_layout(desc_set_layout, None);
+            }
+            return Err(Hc4jError::Device(format!("allocate_descriptor_sets bench_vram_bw failed: {e}")));
+        }
+    };
+
+    let uniform_info = [vk::DescriptorBufferInfo {
+        buffer: uniform_buf.buffer,
+        offset: 0,
+        range: 16,
+    }];
+    let src_info = [vk::DescriptorBufferInfo {
+        buffer: src_buf.buffer,
+        offset: 0,
+        range: src_buf.size,
+    }];
+    let dst_info = [vk::DescriptorBufferInfo {
+        buffer: dst_buf.buffer,
+        offset: 0,
+        range: dst_buf.size,
+    }];
+
+    let writes = [
+        vk::WriteDescriptorSet::default()
+            .dst_set(desc_set)
+            .dst_binding(0)
+            .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+            .buffer_info(&uniform_info),
+        vk::WriteDescriptorSet::default()
+            .dst_set(desc_set)
+            .dst_binding(1)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .buffer_info(&src_info),
+        vk::WriteDescriptorSet::default()
+            .dst_set(desc_set)
+            .dst_binding(2)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .buffer_info(&dst_info),
+    ];
+    unsafe {
+        node.device.update_descriptor_sets(&writes, &[]);
+    }
+
+    let barrier = vk::MemoryBarrier::default()
+        .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+        .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE);
+
+    let dispatch_passes = |passes: u32| -> Hc4jResult<f64> {
+        let t0 = Instant::now();
+        one_shot_submit(node, |cb| unsafe {
+            node.device.cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, pipeline);
+            node.device.cmd_bind_descriptor_sets(
+                cb,
+                vk::PipelineBindPoint::COMPUTE,
+                pipe_layout,
+                0,
+                &[desc_set],
+                &[],
+            );
+            for p in 0..passes {
+                if p > 0 {
+                    node.device.cmd_pipeline_barrier(
+                        cb,
+                        vk::PipelineStageFlags::COMPUTE_SHADER,
+                        vk::PipelineStageFlags::COMPUTE_SHADER,
+                        vk::DependencyFlags::empty(),
+                        &[barrier],
+                        &[],
+                        &[],
+                    );
+                }
+                node.device.cmd_dispatch(cb, workgroups, 1, 1);
+            }
+        })?;
+        Ok(t0.elapsed().as_secs_f64())
+    };
+
+    // Warm-up run
+    let res = (|| -> Hc4jResult<f64> {
+        let _ = dispatch_passes(2)?;
+
+        let mut passes = 4u32;
+        let mut elapsed = dispatch_passes(passes)?;
+        if elapsed < 0.004 {
+            passes = 16;
+            elapsed = dispatch_passes(passes)?;
+            if elapsed < 0.004 {
+                passes = 64;
+                elapsed = dispatch_passes(passes)?;
+            }
+        }
+
+        // STREAM COPY performs 1 read + 1 write = 2 * copy_bytes DRAM traffic per pass.
+        let total_bytes = 2.0 * (copy_bytes as f64) * (passes as f64);
+        let gbps = if elapsed > 0.0 {
+            (total_bytes / elapsed / 1e9).max(0.1)
+        } else {
+            0.1
+        };
+        Ok(gbps)
+    })();
+
+    unsafe {
+        node.device.destroy_descriptor_pool(desc_pool, None);
+        node.device.destroy_pipeline(pipeline, None);
+        node.device.destroy_pipeline_layout(pipe_layout, None);
+        node.device.destroy_descriptor_set_layout(desc_set_layout, None);
+    }
+
+    res
+}
+
 /// Profiles a GPU node and creates a DeviceProfileC.
 #[allow(dead_code)]
 pub(crate) fn profile_node(rank: u32, node: &GpuNode) -> Hc4jResult<DeviceProfileC> {
     let vram_bytes = query_vram_bytes(node);
     let compute_gflops = measure_compute_gflops(node)?;
+    let vram_bandwidth_gbps = measure_vram_bandwidth_gbps(node)?;
 
     Ok(DeviceProfileC {
         rank,
@@ -324,5 +639,6 @@ pub(crate) fn profile_node(rank: u32, node: &GpuNode) -> Hc4jResult<DeviceProfil
         device_type: map_device_type(node.props.device_type),
         vram_bytes,
         compute_gflops,
+        vram_bandwidth_gbps,
     })
 }

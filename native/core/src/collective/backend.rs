@@ -66,10 +66,10 @@ pub fn is_peer_class(gbps: f64) -> bool {
 }
 
 // ============================================================================
-// DeviceProfileC matching the exact 32-byte C-ABI DeviceProfile layout
+// DeviceProfileC matching the exact 40-byte C-ABI DeviceProfile layout
 // ============================================================================
 
-/// Hardware profile of a single GPU rank (exact 32-byte C-ABI layout).
+/// Hardware profile of a single GPU rank (exact 40-byte C-ABI layout).
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct DeviceProfileC {
@@ -79,6 +79,7 @@ pub struct DeviceProfileC {
     pub device_type: u32, // 0=Other, 1=Integrated, 2=Discrete, 3=Virtual, 4=Cpu
     pub vram_bytes: u64,
     pub compute_gflops: f64,
+    pub vram_bandwidth_gbps: f64,
 }
 
 pub type DeviceProfileInfo = DeviceProfileC;
@@ -133,6 +134,15 @@ pub trait CollectiveBackend: Send + Sync {
         scale: f32,
     ) -> Hc4jResult<()>;
 
+    fn elem_mul(
+        &self,
+        rank: usize,
+        buf_a: u64,
+        buf_b: u64,
+        buf_out: u64,
+        count: u32,
+    ) -> Hc4jResult<()>;
+
     // Step 3D: Profiling, Ring Order & Islands
     fn device_profiles(&self) -> &[DeviceProfileC];
     fn ring_order(&self) -> &[u32];
@@ -146,5 +156,6 @@ mod tests {
     #[test]
     fn test_link_info_c_abi_layout_size() {
         assert_eq!(std::mem::size_of::<LinkInfo>(), 32);
+        assert_eq!(std::mem::size_of::<DeviceProfileC>(), 40);
     }
 }

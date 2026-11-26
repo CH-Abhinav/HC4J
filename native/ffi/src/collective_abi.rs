@@ -1,8 +1,10 @@
 //! C-ABI entry points for multi-GPU collective communication, topology
-//! inspection, fused GEMM+bias+activation, Split-KV decode attention, and
-//! lossless online-softmax Split-KV merging (20 symbols).
+//! inspection, fused GEMM+bias+activation, Split-KV decode attention,
+//! lossless online-softmax Split-KV merging, and multi-threaded SIMD CPU-in-Place kernels.
 
-use hc4rs::collective::{self, merge_split_kv_f32};
+use hc4rs::collective::{
+    self, cpu_gemm_f32, cpu_gemm_f32_f16, cpu_mlp_slice_f32, cpu_split_kv_attn_f32, merge_split_kv_f32,
+};
 use hc4rs::engine::error::{HC4J_SUCCESS, Hc4jError, ffi_guard};
 use hc4rs::{DeviceProfileC, LinkInfo};
 
@@ -432,5 +434,190 @@ pub unsafe extern "C" fn hc4j_collective_merge_split_kv_f32(
 
         let out_slice = unsafe { std::slice::from_raw_parts_mut(ptr_out, o_len) };
         merge_split_kv_f32(num_heads, head_dim, &partials_o, &partials_stats, out_slice)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn hc4j_collective_elem_mul(
+    handle: u64,
+    rank: u32,
+    buf_a: u64,
+    buf_b: u64,
+    buf_out: u64,
+    count: u32,
+) -> i32 {
+    ffi_guard("hc4j_collective_elem_mul", || {
+        collective::with_backend(handle, |b| b.elem_mul(rank as usize, buf_a, buf_b, buf_out, count))
+    })
+}
+
+/// # Safety
+/// All matrix pointers must be valid for the respective `[M,K]`, `[K,N]` (or transposed), and `[M,N]` shapes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn hc4j_cpu_gemm_f32(
+    ptr_a: *const f32,
+    ptr_b: *const f32,
+    ptr_out: *mut f32,
+    m: u32,
+    n: u32,
+    k: u32,
+    flags: u32,
+) -> i32 {
+    ffi_guard("hc4j_cpu_gemm_f32", || {
+        if ptr_a.is_null() || ptr_b.is_null() || ptr_out.is_null() {
+            return Err(Hc4jError::InvalidParam("null pointer in hc4j_cpu_gemm_f32"));
+        }
+        let mu = m as usize;
+        let nu = n as usize;
+        let ku = k as usize;
+        let a_len = mu.checked_mul(ku).ok_or(Hc4jError::InvalidParam("A size overflow"))?;
+        let b_len = ku.checked_mul(nu).ok_or(Hc4jError::InvalidParam("B size overflow"))?;
+        let c_len = mu.checked_mul(nu).ok_or(Hc4jError::InvalidParam("out size overflow"))?;
+        let a = unsafe { std::slice::from_raw_parts(ptr_a, a_len) };
+        let b = unsafe { std::slice::from_raw_parts(ptr_b, b_len) };
+        let out = unsafe { std::slice::from_raw_parts_mut(ptr_out, c_len) };
+        cpu_gemm_f32(a, b, out, mu, nu, ku, flags)
+    })
+}
+
+/// # Safety
+/// `ptr_b_f16` must point to `k * n` IEEE-754 `u16` half elements matching `flags`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn hc4j_cpu_gemm_f32_f16(
+    ptr_a: *const f32,
+    ptr_b_f16: *const u16,
+    ptr_out: *mut f32,
+    m: u32,
+    n: u32,
+    k: u32,
+    flags: u32,
+) -> i32 {
+    ffi_guard("hc4j_cpu_gemm_f32_f16", || {
+        if ptr_a.is_null() || ptr_b_f16.is_null() || ptr_out.is_null() {
+            return Err(Hc4jError::InvalidParam("null pointer in hc4j_cpu_gemm_f32_f16"));
+        }
+        let mu = m as usize;
+        let nu = n as usize;
+        let ku = k as usize;
+        let a_len = mu.checked_mul(ku).ok_or(Hc4jError::InvalidParam("A size overflow"))?;
+        let b_len = ku.checked_mul(nu).ok_or(Hc4jError::InvalidParam("B size overflow"))?;
+        let c_len = mu.checked_mul(nu).ok_or(Hc4jError::InvalidParam("out size overflow"))?;
+        let a = unsafe { std::slice::from_raw_parts(ptr_a, a_len) };
+        let b = unsafe { std::slice::from_raw_parts(ptr_b_f16, b_len) };
+        let out = unsafe { std::slice::from_raw_parts_mut(ptr_out, c_len) };
+        cpu_gemm_f32_f16(a, b, out, mu, nu, ku, flags)
+    })
+}
+
+/// # Safety
+/// Pointers must be valid for `x [m, d_in]`, `w1 [d_in, h]`, optional `b1 [h]`, `w2 [h, d_out]`, and `out [m, d_out]`.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn hc4j_cpu_mlp_slice_f32(
+    ptr_x: *const f32,
+    ptr_w1: *const f32,
+    ptr_b1: *const f32,
+    ptr_w2: *const f32,
+    ptr_out: *mut f32,
+    m: u32,
+    d_in: u32,
+    h: u32,
+    d_out: u32,
+    h_start: u32,
+    units: u32,
+    act_code: i32,
+) -> i32 {
+    ffi_guard("hc4j_cpu_mlp_slice_f32", || {
+        if ptr_x.is_null() || ptr_w1.is_null() || ptr_w2.is_null() || ptr_out.is_null() {
+            return Err(Hc4jError::InvalidParam("null pointer in hc4j_cpu_mlp_slice_f32"));
+        }
+        let mu = m as usize;
+        let di = d_in as usize;
+        let hu = h as usize;
+        let do_ = d_out as usize;
+        let x_len = mu.checked_mul(di).ok_or(Hc4jError::InvalidParam("x size overflow"))?;
+        let w1_len = di.checked_mul(hu).ok_or(Hc4jError::InvalidParam("w1 size overflow"))?;
+        let w2_len = hu.checked_mul(do_).ok_or(Hc4jError::InvalidParam("w2 size overflow"))?;
+        let out_len = mu.checked_mul(do_).ok_or(Hc4jError::InvalidParam("out size overflow"))?;
+
+        let x = unsafe { std::slice::from_raw_parts(ptr_x, x_len) };
+        let w1 = unsafe { std::slice::from_raw_parts(ptr_w1, w1_len) };
+        let b1 = if ptr_b1.is_null() {
+            None
+        } else {
+            Some(unsafe { std::slice::from_raw_parts(ptr_b1, hu) })
+        };
+        let w2 = unsafe { std::slice::from_raw_parts(ptr_w2, w2_len) };
+        let out = unsafe { std::slice::from_raw_parts_mut(ptr_out, out_len) };
+        cpu_mlp_slice_f32(
+            x,
+            w1,
+            b1,
+            w2,
+            out,
+            mu,
+            di,
+            hu,
+            do_,
+            h_start as usize,
+            units as usize,
+            act_code,
+        )
+    })
+}
+
+/// # Safety
+/// Pointers must be valid for `q [num_heads, head_dim]`, `k_shard`/`v_shard [num_kv_heads, tokens, head_dim]`,
+/// `out_o [num_heads, head_dim]`, and `out_stats [num_heads, 2]`.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn hc4j_cpu_split_kv_attn_f32(
+    ptr_q: *const f32,
+    ptr_k_shard: *const f32,
+    ptr_v_shard: *const f32,
+    ptr_out_o: *mut f32,
+    ptr_out_stats: *mut f32,
+    tokens: u32,
+    num_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    scale_bits: u32,
+) -> i32 {
+    ffi_guard("hc4j_cpu_split_kv_attn_f32", || {
+        if ptr_q.is_null()
+            || ptr_k_shard.is_null()
+            || ptr_v_shard.is_null()
+            || ptr_out_o.is_null()
+            || ptr_out_stats.is_null()
+        {
+            return Err(Hc4jError::InvalidParam("null pointer in hc4j_cpu_split_kv_attn_f32"));
+        }
+        let tu = tokens as usize;
+        let nh = num_heads as usize;
+        let nkv = num_kv_heads as usize;
+        let hd = head_dim as usize;
+        let q_len = nh.checked_mul(hd).ok_or(Hc4jError::InvalidParam("q size overflow"))?;
+        let kv_len = nkv
+            .checked_mul(tu)
+            .and_then(|v| v.checked_mul(hd))
+            .ok_or(Hc4jError::InvalidParam("kv size overflow"))?;
+        let s_len = nh.checked_mul(2).ok_or(Hc4jError::InvalidParam("stats size overflow"))?;
+        let q = unsafe { std::slice::from_raw_parts(ptr_q, q_len) };
+        let k_shard = unsafe { std::slice::from_raw_parts(ptr_k_shard, kv_len) };
+        let v_shard = unsafe { std::slice::from_raw_parts(ptr_v_shard, kv_len) };
+        let out_o = unsafe { std::slice::from_raw_parts_mut(ptr_out_o, q_len) };
+        let out_stats = unsafe { std::slice::from_raw_parts_mut(ptr_out_stats, s_len) };
+        cpu_split_kv_attn_f32(
+            q,
+            k_shard,
+            v_shard,
+            out_o,
+            out_stats,
+            tu,
+            nh,
+            nkv,
+            hd,
+            f32::from_bits(scale_bits),
+        )
     })
 }

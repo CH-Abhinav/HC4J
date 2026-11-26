@@ -265,6 +265,12 @@ fn collective_reduce_shader() {
 }
 
 #[test]
+fn collective_vram_bw_and_elem_mul_shaders() {
+    validate("collective_bench_vram_bw", include_str!("../../collective/vulkan/bench_vram_bw.wgsl"));
+    validate("collective_elem_mul", include_str!("../../collective/vulkan/elem_mul.wgsl"));
+}
+
+#[test]
 fn f16_and_transformer_shaders() {
     // Pure f32 transformer primitives validate with zero capabilities:
     validate("embedding_f32", crate::kernels::nn::embedding::EMBEDDING_F32_WGSL);

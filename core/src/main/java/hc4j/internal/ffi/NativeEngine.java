@@ -94,6 +94,7 @@ public final class NativeEngine {
     private static MethodHandle collAllReduceSubsetHandle;
     private static MethodHandle collGemmBiasActHandle;
     private static MethodHandle collSplitKvAttnHandle;
+    private static MethodHandle collElemMulHandle;
 
     private NativeEngine() {
         throw new AssertionError("No instances of NativeEngine");
@@ -324,6 +325,10 @@ public final class NativeEngine {
                 FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.JAVA_LONG, ValueLayout.JAVA_INT,
                         ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG,
                         ValueLayout.JAVA_INT, ValueLayout.JAVA_INT, ValueLayout.JAVA_INT, ValueLayout.JAVA_INT, ValueLayout.JAVA_INT));
+
+        collElemMulHandle = linker.downcallHandle(lookup.find("hc4j_collective_elem_mul").orElseThrow(),
+                FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.JAVA_LONG, ValueLayout.JAVA_INT,
+                        ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG, ValueLayout.JAVA_INT));
     }
 
     /**
@@ -1060,6 +1065,18 @@ public final class NativeEngine {
             if (t instanceof RuntimeException re) throw re;
             if (t instanceof Error err) throw err;
             throw new RuntimeException("HC4J collective splitKvAttention failed", t);
+        }
+    }
+
+    public static void elemMul(long handle, int rank, long bufA, long bufB, long bufOut, int count) {
+        ensureInitialized();
+        try {
+            int status = (int) collElemMulHandle.invokeExact(handle, rank, bufA, bufB, bufOut, count);
+            checkStatus(status, "Collective.elemMul");
+        } catch (Throwable t) {
+            if (t instanceof RuntimeException re) throw re;
+            if (t instanceof Error err) throw err;
+            throw new RuntimeException("HC4J collective elemMul failed", t);
         }
     }
 }

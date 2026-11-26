@@ -22,12 +22,15 @@ import hc4j.Slice;
 import hc4j.Tensor;
 import hc4j.collective.Collective;
 import hc4j.collective.DistributedExecutor;
+import hc4j.collective.DistributedMlpSession;
 import hc4j.collective.DistributedResult;
 import hc4j.collective.ExecutionReport;
 import hc4j.collective.HostCpuProfile;
 import hc4j.collective.RolePlan;
+import hc4j.collective.ShardAllocation;
 import hc4j.collective.SplitKvAssignment;
 import hc4j.collective.SplitKvSpec;
+import hc4j.collective.WorkloadPlan;
 import hc4j.collective.WorkloadPlanner;
 import hc4j.collective.WorkloadSpec;
 import hc4j.nn.Nn;
@@ -63,6 +66,8 @@ public final class LlamaRunner implements AutoCloseable {
     // VRAM-resident KV caches per layer: [numKvHeads, maxSeqLen, headDim]
     private final Tensor[] kCaches;
     private final Tensor[] vCaches;
+    // Persistent distributed SwiGLU MLP sessions per layer (pre-sharded once; re-sharded only on morph)
+    private final DistributedMlpSession[] mlpSessions;
 
     // Telemetry trace recording phase transitions, role plans, and Split-KV execution reports
     private final List<PhaseEvent> morphTrace = new ArrayList<>();
@@ -176,6 +181,7 @@ public final class LlamaRunner implements AutoCloseable {
         int headDim = config.headDim();
         this.kCaches = new Tensor[numLayers];
         this.vCaches = new Tensor[numLayers];
+        this.mlpSessions = new DistributedMlpSession[numLayers];
         try {
             for (int l = 0; l < numLayers; l++) {
                 this.kCaches[l] = Tensor.empty(DType.f32, numKvHeads, maxSeqLen, headDim);
@@ -460,6 +466,8 @@ public final class LlamaRunner implements AutoCloseable {
 
         RolePlan rolePlan = null;
         boolean useSplitKvDecode = false;
+        boolean useTpMlp = false;
+        WorkloadPlan decodeMlpPlan = null;
         if (collective != null && rolePlanner != null) {
             WorkloadSpec tpSpec = buildTpSpec(phase, seqLen);
             SplitKvSpec kvSpec = buildSplitKvSpec(totalLen);
@@ -472,6 +480,18 @@ public final class LlamaRunner implements AutoCloseable {
                     }
                 }
                 useSplitKvDecode = (activeWorkers >= 2);
+                int activeTpWorkers = 0;
+                if (rolePlan.tpPlan() != null) {
+                    for (ShardAllocation a : rolePlan.tpPlan().allocations()) {
+                        if (a.units() > 0) {
+                            activeTpWorkers++;
+                        }
+                    }
+                }
+                if (activeTpWorkers >= 2) {
+                    useTpMlp = true;
+                    decodeMlpPlan = scalePlanToHiddenWidth(rolePlan.tpPlan(), config.intermediateSize());
+                }
             }
         }
 
@@ -483,7 +503,7 @@ public final class LlamaRunner implements AutoCloseable {
         float ropeTheta = config.ropeTheta();
         float scale = (float) (1.0 / Math.sqrt(headDim));
 
-        List<ExecutionReport> layerReports = useSplitKvDecode
+        List<ExecutionReport> layerReports = (useSplitKvDecode || useTpMlp)
                 ? new ArrayList<>(config.numHiddenLayers())
                 : null;
 
@@ -570,11 +590,28 @@ public final class LlamaRunner implements AutoCloseable {
                     Tensor outAttn = layerScope.track(hidden.add(projOut));
 
                     Tensor normX2 = layerScope.track(outAttn.rmsNorm(lw.postAttentionNorm(), eps));
-                    Tensor gateProj = layerScope.track(Nn.linearTransposed(normX2, lw.gateProj(), null));
-                    Tensor gate = layerScope.track(gateProj.silu());
-                    Tensor up = layerScope.track(Nn.linearTransposed(normX2, lw.upProj(), null));
-                    Tensor mlp = layerScope.track(gate.mul(up));
-                    Tensor down = layerScope.track(Nn.linearTransposed(mlp, lw.downProj(), null));
+                    Tensor down;
+                    if (useTpMlp) {
+                        DistributedMlpSession session = mlpSessions[l];
+                        if (session == null) {
+                            session = DistributedMlpSession.openSwiglu(
+                                    collective, decodeMlpPlan, lw.gateProj(), lw.upProj(), lw.downProj(), true);
+                            mlpSessions[l] = session;
+                        } else {
+                            session.morph(decodeMlpPlan);
+                        }
+                        DistributedResult<Tensor> mlpRes = session.forwardWithReport(normX2);
+                        down = layerScope.track(mlpRes.value());
+                        if (!useSplitKvDecode) {
+                            layerReports.add(mlpRes.report());
+                        }
+                    } else {
+                        Tensor gateProj = layerScope.track(Nn.linearTransposed(normX2, lw.gateProj(), null));
+                        Tensor gate = layerScope.track(gateProj.silu());
+                        Tensor up = layerScope.track(Nn.linearTransposed(normX2, lw.upProj(), null));
+                        Tensor mlp = layerScope.track(gate.mul(up));
+                        down = layerScope.track(Nn.linearTransposed(mlp, lw.downProj(), null));
+                    }
 
                     Tensor nextHidden = outerScope.track(outAttn.add(down));
                     hidden.close();
@@ -656,12 +693,64 @@ public final class LlamaRunner implements AutoCloseable {
         );
     }
 
+    private static WorkloadPlan scalePlanToHiddenWidth(WorkloadPlan plan, int hiddenWidth) {
+        if (plan.totalUnits() == hiddenWidth) {
+            return plan;
+        }
+        long sumActive = 0L;
+        int lastActiveIdx = -1;
+        List<ShardAllocation> src = plan.allocations();
+        for (int i = 0; i < src.size(); i++) {
+            long u = src.get(i).units();
+            if (u > 0) {
+                sumActive += u;
+                lastActiveIdx = i;
+            }
+        }
+        if (sumActive <= 0 || lastActiveIdx < 0) {
+            return plan;
+        }
+        long[] scaled = new long[src.size()];
+        long assigned = 0L;
+        for (int i = 0; i < src.size(); i++) {
+            long u = src.get(i).units();
+            if (u > 0) {
+                long s = (hiddenWidth * u) / sumActive;
+                scaled[i] = s;
+                assigned += s;
+            }
+        }
+        scaled[lastActiveIdx] += (hiddenWidth - assigned);
+
+        List<ShardAllocation> outAllocs = new ArrayList<>(src.size());
+        for (int i = 0; i < src.size(); i++) {
+            ShardAllocation a = src.get(i);
+            long u = scaled[i];
+            double ratio = (hiddenWidth > 0) ? ((double) u / hiddenWidth) : 0.0;
+            outAllocs.add(new ShardAllocation(
+                    a.rank(), u, ratio, a.estimatedComputeMs(), a.estimatedMemoryBytes(), a.excludedAsStraggler(),
+                    a.vramUnits(), a.hostStreamUnits(), a.diskStreamUnits(),
+                    (a.rank() == ShardAllocation.HOST_CPU_RANK) ? u : 0L));
+        }
+        return new WorkloadPlan(hiddenWidth, outAllocs, plan.activeRanks(),
+                plan.estimatedMakespanMs(), plan.estimatedComputeMs(), plan.estimatedSyncMs());
+    }
+
     private void releaseCaches() {
         for (int i = 0; i < kCaches.length; i++) {
             closeQuietly(kCaches[i]);
             kCaches[i] = null;
             closeQuietly(vCaches[i]);
             vCaches[i] = null;
+        }
+        for (int i = 0; i < mlpSessions.length; i++) {
+            if (mlpSessions[i] != null) {
+                try {
+                    mlpSessions[i].close();
+                } catch (Throwable ignored) {
+                }
+                mlpSessions[i] = null;
+            }
         }
     }
 

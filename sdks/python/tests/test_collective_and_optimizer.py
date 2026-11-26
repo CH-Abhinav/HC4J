@@ -80,7 +80,10 @@ class CollectiveAndOptimizerTest(unittest.TestCase):
         self.assertIn("out of memory", str(ctx.exception).lower())
 
     def test_optimizer_plan_roles_short_vs_long_context(self) -> None:
-        devs = [_gpu(0, 24, 90_000.0), _gpu(1, 16, 400.0, "Integrated")]
+        devs = [
+            DeviceProfile(0, "GPU-0", "Discrete", 0x10DE, 0x2684, 24 << 30, 90_000.0, 1000.0),
+            DeviceProfile(1, "GPU-1", "Integrated", 0x8086, 0x9A49, 16 << 30, 400.0, 40.0),
+        ]
         links = _mesh(2, 2.0, 80.0, Transport.HOST_STAGED)
         tp_spec = WorkloadSpec(total_units=4096, flops_per_unit=2e9, bytes_per_unit=4096, sync_bytes=64 << 20)
 

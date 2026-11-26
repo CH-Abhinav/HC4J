@@ -15,6 +15,10 @@ use std::sync::Arc;
 pub use collective::backend::{
     DeviceProfileC, LinkInfo, TRANSPORT_HOST_SHARED_DMA, TRANSPORT_HOST_STAGED, TRANSPORT_PEER_TO_PEER,
 };
+pub use collective::cpu_kernels::{
+    CPU_ACT_GELU, CPU_ACT_NONE, CPU_ACT_RELU, CPU_ACT_SILU, cpu_gemm_f32, cpu_gemm_f32_f16,
+    cpu_mlp_slice_f32, cpu_split_kv_attn_f32,
+};
 pub use collective::distributed::merge_split_kv_f32;
 pub use collective::planner::{
     AllSubsetsRingTable, DEFAULT_VRAM_UTILIZATION, DeviceRole, HOST_CPU_RANK, HostCpuProfile, IslandInfo, RolePlan,
@@ -652,6 +656,77 @@ impl Collective {
         out: &mut [f32],
     ) -> Hc4jResult<()> {
         collective::merge_split_kv_f32(num_heads, head_dim, partials_o, partials_stats, out)
+    }
+
+    pub fn elem_mul(&self, rank: u32, buf_a: u64, buf_b: u64, buf_out: u64, count: u32) -> Hc4jResult<()> {
+        collective::with_backend(self.handle, |b| b.elem_mul(rank as usize, buf_a, buf_b, buf_out, count))
+    }
+}
+
+/// Safe Rust facade for multi-threaded SIMD CPU-in-Place kernels.
+pub struct Cpu;
+
+impl Cpu {
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_f32(
+        a: &[f32],
+        b: &[f32],
+        out: &mut [f32],
+        m: usize,
+        n: usize,
+        k: usize,
+        flags: u32,
+    ) -> Hc4jResult<()> {
+        collective::cpu_gemm_f32(a, b, out, m, n, k, flags)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_f32_f16(
+        a: &[f32],
+        b_f16: &[u16],
+        out: &mut [f32],
+        m: usize,
+        n: usize,
+        k: usize,
+        flags: u32,
+    ) -> Hc4jResult<()> {
+        collective::cpu_gemm_f32_f16(a, b_f16, out, m, n, k, flags)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn mlp_slice_f32(
+        x: &[f32],
+        w1: &[f32],
+        b1: Option<&[f32]>,
+        w2: &[f32],
+        out: &mut [f32],
+        m: usize,
+        d_in: usize,
+        h: usize,
+        d_out: usize,
+        h_start: usize,
+        units: usize,
+        act_code: i32,
+    ) -> Hc4jResult<()> {
+        collective::cpu_mlp_slice_f32(x, w1, b1, w2, out, m, d_in, h, d_out, h_start, units, act_code)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn split_kv_attn_f32(
+        q: &[f32],
+        k_shard: &[f32],
+        v_shard: &[f32],
+        out_o: &mut [f32],
+        out_stats: &mut [f32],
+        tokens: usize,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        scale: f32,
+    ) -> Hc4jResult<()> {
+        collective::cpu_split_kv_attn_f32(
+            q, k_shard, v_shard, out_o, out_stats, tokens, num_heads, num_kv_heads, head_dim, scale,
+        )
     }
 }
 

@@ -159,6 +159,7 @@ def _marshal_devices(devices: Sequence[DeviceProfile]) -> Any:
             device_type=DEVICE_TYPE_CODES.get(d.device_type, 0),
             vram_bytes=d.vram_bytes,
             compute_gflops=d.compute_gflops,
+            vram_bandwidth_gbps=d.vram_bandwidth_gbps,
         )
     return arr
 

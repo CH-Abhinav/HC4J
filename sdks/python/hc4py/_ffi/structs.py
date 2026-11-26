@@ -87,7 +87,7 @@ class LinkInfo(ctypes.Structure):
 
 
 class DeviceProfileC(ctypes.Structure):
-    """Hardware compute/VRAM capability profile for one rank (32 bytes)."""
+    """Hardware compute/VRAM capability profile for one rank (40 bytes)."""
 
     _fields_ = [
         ("rank", ctypes.c_uint32),
@@ -96,6 +96,7 @@ class DeviceProfileC(ctypes.Structure):
         ("device_type", ctypes.c_uint32),
         ("vram_bytes", ctypes.c_uint64),
         ("compute_gflops", ctypes.c_double),
+        ("vram_bandwidth_gbps", ctypes.c_double),
     ]
 
 

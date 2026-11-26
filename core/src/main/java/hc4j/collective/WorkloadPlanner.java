@@ -206,16 +206,31 @@ public final class WorkloadPlanner {
 
     static AllSubsetsRingTable precomputeAllSubsetsRing(int n, double[][] bw, double[][] latUs) {
         BottleneckTspSolver.RingTable t = BottleneckTspSolver.precomputeAllSubsetsRing(n, bw, latUs);
-        return new AllSubsetsRingTable(t.bottleneckGbps(), t.maxHopLatencyUs());
+        return new AllSubsetsRingTable(t.bottleneckGbps(), t.maxHopLatencyUs(), t.hockneyCostUs());
     }
 
-    record AllSubsetsRingTable(double[] bottleneckGbps, double[] maxHopLatencyUs) {
+    static AllSubsetsRingTable precomputeAllSubsetsRingForPayload(
+            int n, double[][] bw, double[][] latUs, long syncBytes) {
+        BottleneckTspSolver.RingTable t =
+                BottleneckTspSolver.precomputeAllSubsetsRingForPayload(n, bw, latUs, syncBytes);
+        return new AllSubsetsRingTable(t.bottleneckGbps(), t.maxHopLatencyUs(), t.hockneyCostUs());
+    }
+
+    record AllSubsetsRingTable(double[] bottleneckGbps, double[] maxHopLatencyUs, double[] hockneyCostUs) {
+        AllSubsetsRingTable(double[] bottleneckGbps, double[] maxHopLatencyUs) {
+            this(bottleneckGbps, maxHopLatencyUs, new double[bottleneckGbps.length]);
+        }
+
         double bottleneck(int mask) {
             return (mask >= 0 && mask < bottleneckGbps.length) ? bottleneckGbps[mask] : 1.0;
         }
 
         double latencyUs(int mask) {
             return (mask >= 0 && mask < maxHopLatencyUs.length) ? maxHopLatencyUs[mask] : 0.0;
+        }
+
+        double hockneyUs(int mask) {
+            return (mask >= 0 && hockneyCostUs != null && mask < hockneyCostUs.length) ? hockneyCostUs[mask] : 0.0;
         }
     }
 }

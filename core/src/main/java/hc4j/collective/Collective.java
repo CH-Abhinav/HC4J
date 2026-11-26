@@ -55,7 +55,8 @@ public final class Collective implements AutoCloseable {
             JAVA_INT.withName("device_id"),
             JAVA_INT.withName("device_type"),
             JAVA_LONG.withName("vram_bytes"),
-            JAVA_DOUBLE.withName("compute_gflops"));
+            JAVA_DOUBLE.withName("compute_gflops"),
+            JAVA_DOUBLE.withName("vram_bandwidth_gbps"));
 
     static final StructLayout ISLAND_HEADER_LAYOUT = MemoryLayout.structLayout(
             JAVA_INT.withName("id"),
@@ -215,8 +216,9 @@ public final class Collective implements AutoCloseable {
                 String typeStr = deviceTypeString(slot.get(JAVA_INT, 12));
                 long vram = slot.get(JAVA_LONG, 16);
                 double gflops = slot.get(JAVA_DOUBLE, 24);
+                double vramBw = slot.get(JAVA_DOUBLE, 32);
                 String name = deviceName(i);
-                profiles.add(new DeviceProfile(rank, name, typeStr, vendorId, deviceId, vram, gflops));
+                profiles.add(new DeviceProfile(rank, name, typeStr, vendorId, deviceId, vram, gflops, vramBw));
             }
         }
         deviceProfiles = List.copyOf(profiles);
@@ -604,6 +606,42 @@ public final class Collective implements AutoCloseable {
         int scaleBits = Float.floatToRawIntBits(scale);
         NativeEngine.splitKvAttn(handle, rank, q.handleUnsafe(), kCache.handleUnsafe(), vCache.handleUnsafe(),
                 outO.handleUnsafe(), outStats.handleUnsafe(), numHeads, numKvHeads, headDim, localTokens, scaleBits);
+    }
+
+    /**
+     * Executes elementwise float32 multiplication {@code out[i] = a[i] * b[i]} on a specific rank.
+     *
+     * @param rank target rank executing the kernel
+     * @param a first input buffer on {@code rank}
+     * @param b second input buffer on {@code rank}
+     * @param out output buffer on {@code rank}
+     * @param count number of elements to multiply
+     */
+    public void elemMul(int rank, CollectiveBuffer a, CollectiveBuffer b, CollectiveBuffer out, int count) {
+        ensureOpen();
+        checkRank(rank);
+        Objects.requireNonNull(a, "a buffer must not be null");
+        Objects.requireNonNull(b, "b buffer must not be null");
+        Objects.requireNonNull(out, "out buffer must not be null");
+        a.ensureOpen();
+        b.ensureOpen();
+        out.ensureOpen();
+        if (a.collective() != this || b.collective() != this || out.collective() != this) {
+            throw new IllegalArgumentException("all buffers must belong to this collective");
+        }
+        if (a.rank() != rank || b.rank() != rank || out.rank() != rank) {
+            throw new IllegalArgumentException("all buffers must reside on target rank " + rank);
+        }
+        if (count < 0) {
+            throw new IllegalArgumentException("count must be non-negative: " + count);
+        }
+        if (count == 0) {
+            return;
+        }
+        if (a.elements() < count || b.elements() < count || out.elements() < count) {
+            throw new IllegalArgumentException("elemMul buffer capacity smaller than count=" + count);
+        }
+        NativeEngine.elemMul(handle, rank, a.handleUnsafe(), b.handleUnsafe(), out.handleUnsafe(), count);
     }
 
     @Override

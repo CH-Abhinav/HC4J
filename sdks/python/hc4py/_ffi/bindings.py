@@ -1,7 +1,7 @@
 # Copyright 2026 Abhinav Chinnala (chinnala.abhinav5@gmail.com)
 # SPDX-License-Identifier: Apache-2.0
 
-"""Explicit ctypes argtypes/restype bindings for all 107 C-ABI functions in ``native/include/hc4x.h``."""
+"""Explicit ctypes argtypes/restype bindings for all 112 C-ABI functions in ``native/include/hc4x.h``."""
 
 from __future__ import annotations
 
@@ -144,7 +144,13 @@ def bind_all(lib: ctypes.CDLL) -> None:
         ("hc4j_collective_island_count", [u64], i32),
         ("hc4j_collective_island", [u64, u32, ctypes.POINTER(IslandHeaderC), voidp, u32], i32),
         ("hc4j_collective_merge_split_kv_f32", [u32, u32, u32, voidp, voidp, voidp], i32),
-        # 10. Exact Theorems 1-4 Workload & Split-KV Role Optimizer (2 symbols)
+        ("hc4j_collective_elem_mul", [u64, u32, u64, u64, u64, u32], i32),
+        # 10. Multi-Threaded SIMD CPU-in-Place Kernels (4 symbols)
+        ("hc4j_cpu_gemm_f32", [voidp, voidp, voidp, u32, u32, u32, u32], i32),
+        ("hc4j_cpu_gemm_f32_f16", [voidp, voidp, voidp, u32, u32, u32, u32], i32),
+        ("hc4j_cpu_mlp_slice_f32", [voidp, voidp, voidp, voidp, voidp, u32, u32, u32, u32, u32, u32, i32], i32),
+        ("hc4j_cpu_split_kv_attn_f32", [voidp, voidp, voidp, voidp, voidp, u32, u32, u32, u32, u32], i32),
+        # 11. Exact Theorems 1-4 Workload & Split-KV Role Optimizer (2 symbols)
         (
             "hc4j_optimizer_plan_work",
             [

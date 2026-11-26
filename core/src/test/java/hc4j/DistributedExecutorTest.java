@@ -25,6 +25,7 @@ import hc4j.collective.Collective;
 import hc4j.collective.CollectiveBuffer;
 import hc4j.collective.DeviceRole;
 import hc4j.collective.DistributedExecutor;
+import hc4j.collective.DistributedMlpSession;
 import hc4j.collective.DistributedResult;
 import hc4j.collective.ExecutionReport;
 import hc4j.collective.RolePlan;
@@ -691,5 +692,115 @@ class DistributedExecutorTest {
             }
             default -> throw new UnsupportedOperationException("Unsupported activation: " + activation);
         };
+    }
+
+    @Test
+    @DisplayName("DistributedMlpSession: persistent weight shards across decode forwards + morph + SwiGLU")
+    void testDistributedMlpSessionPersistentWeightsAndMorph() {
+        try (Collective ring = Collective.open(2)) {
+            int m = 2;
+            int dIn = 8;
+            int h = 16;
+            int dOut = 8;
+
+            float[] w1Data = generateDeterministicFloats(dIn * h, 501);
+            float[] b1Data = generateDeterministicFloats(h, 502);
+            float[] w2Data = generateDeterministicFloats(h * dOut, 503);
+            float[] b2Data = generateDeterministicFloats(dOut, 504);
+
+            WorkloadPlan initPlan = new WorkloadPlan(
+                    h,
+                    List.of(new ShardAllocation(0, 8, 0.5, 0.0, 0L, false),
+                            new ShardAllocation(1, 4, 0.25, 0.0, 0L, false),
+                            new ShardAllocation(ShardAllocation.HOST_CPU_RANK, 4, 0.25, 0.0, 0L, false)),
+                    List.of(0, 1, ShardAllocation.HOST_CPU_RANK),
+                    0.0, 0.0, 0.0);
+
+            try (Tensor w1 = Tensor.fromArray(w1Data, dIn, h);
+                 Tensor b1 = Tensor.fromArray(b1Data, h);
+                 Tensor w2 = Tensor.fromArray(w2Data, h, dOut);
+                 Tensor b2 = Tensor.fromArray(b2Data, dOut);
+                 DistributedMlpSession session = DistributedMlpSession.open(
+                         ring, initPlan, w1, b1, w2, b2, Activation.GELU)) {
+
+                assertEquals(1L, session.weightUploadCount());
+                for (int step = 0; step < 4; step++) {
+                    float[] xData = generateDeterministicFloats(m * dIn, 600 + step);
+                    float[] ref = cpuReferenceMlp(xData, w1Data, b1Data, w2Data, b2Data, m, dIn, h, dOut, Activation.GELU);
+                    try (Tensor x = Tensor.fromArray(xData, m, dIn);
+                         Tensor out = session.step(x)) {
+                        TestAssertions.assertArrayClose(ref, out.toFloatArray(), 1e-4f, 1e-4f);
+                    }
+                }
+                assertEquals(4L, session.forwardCount());
+                assertEquals(1L, session.weightUploadCount(), "Weights must NOT be re-uploaded between decode steps");
+
+                // Morphing to an identical partition must be a no-op
+                session.morph(initPlan);
+                assertEquals(1L, session.weightUploadCount());
+
+                // Morphing to a new GPU-only partition triggers one re-shard upload
+                WorkloadPlan morphPlan = new WorkloadPlan(
+                        h,
+                        List.of(new ShardAllocation(0, 10, 10.0 / h, 0.0, 0L, false),
+                                new ShardAllocation(1, 6, 6.0 / h, 0.0, 0L, false)),
+                        List.of(0, 1),
+                        0.0, 0.0, 0.0);
+                session.morph(morphPlan);
+                assertEquals(2L, session.weightUploadCount());
+
+                float[] xDataAfter = generateDeterministicFloats(m * dIn, 777);
+                float[] refAfter = cpuReferenceMlp(xDataAfter, w1Data, b1Data, w2Data, b2Data, m, dIn, h, dOut, Activation.GELU);
+                try (Tensor x = Tensor.fromArray(xDataAfter, m, dIn);
+                     Tensor out = session.forward(x)) {
+                    TestAssertions.assertArrayClose(refAfter, out.toFloatArray(), 1e-4f, 1e-4f);
+                }
+            }
+
+            // Verify SwiGLU persistent session matches exact CPU SwiGLU reference
+            float[] wgData = generateDeterministicFloats(h * dIn, 801);
+            float[] wuData = generateDeterministicFloats(h * dIn, 802);
+            float[] wdData = generateDeterministicFloats(dOut * h, 803);
+            WorkloadPlan tpPlan = new WorkloadPlan(
+                    h,
+                    List.of(new ShardAllocation(0, 8, 0.5, 0.0, 0L, false),
+                            new ShardAllocation(1, 8, 0.5, 0.0, 0L, false)),
+                    List.of(0, 1),
+                    0.0, 0.0, 0.0);
+
+            try (Tensor wg = Tensor.fromArray(wgData, h, dIn);
+                 Tensor wu = Tensor.fromArray(wuData, h, dIn);
+                 Tensor wd = Tensor.fromArray(wdData, dOut, h);
+                 DistributedMlpSession swiglu = DistributedMlpSession.openSwiglu(ring, tpPlan, wg, wu, wd, true)) {
+
+                float[] xData = generateDeterministicFloats(m * dIn, 901);
+                float[] refSwiglu = new float[m * dOut];
+                for (int r = 0; r < m; r++) {
+                    float[] hidden = new float[h];
+                    for (int j = 0; j < h; j++) {
+                        float gSum = 0.0f;
+                        float uSum = 0.0f;
+                        for (int p = 0; p < dIn; p++) {
+                            gSum += xData[r * dIn + p] * wgData[j * dIn + p];
+                            uSum += xData[r * dIn + p] * wuData[j * dIn + p];
+                        }
+                        hidden[j] = applyActivation(gSum, Activation.SILU) * uSum;
+                    }
+                    for (int c = 0; c < dOut; c++) {
+                        float dSum = 0.0f;
+                        for (int j = 0; j < h; j++) {
+                            dSum += hidden[j] * wdData[c * h + j];
+                        }
+                        refSwiglu[r * dOut + c] = dSum;
+                    }
+                }
+
+                try (Tensor x = Tensor.fromArray(xData, m, dIn);
+                     Tensor out = swiglu.forward(x)) {
+                    TestAssertions.assertArrayClose(refSwiglu, out.toFloatArray(), 1e-4f, 1e-4f);
+                }
+                assertEquals(1L, swiglu.weightUploadCount());
+            }
+        }
     }
 }

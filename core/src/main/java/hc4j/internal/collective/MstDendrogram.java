@@ -79,6 +79,35 @@ public final class MstDendrogram {
         return new TopologyMatrices(bw, latUs, tr);
     }
 
+    private static double ringAllreduceTimeSecs(
+            List<Integer> indices,
+            double[][] bw,
+            double[][] latUs,
+            BottleneckTspSolver.RingTable ringTable,
+            long syncBytes) {
+        int m = indices.size();
+        if (m <= 1 || syncBytes == 0) {
+            return 0.0;
+        }
+        double mF = m;
+        if (ringTable != null) {
+            int mask = 0;
+            for (int idx : indices) {
+                mask |= (1 << idx);
+            }
+            double hUs = ringTable.hockneyUs(mask);
+            if (hUs > 0.0) {
+                return 2.0 * (mF - 1.0) * (hUs / 1e6);
+            }
+            double ringBw = Math.max(ringTable.bottleneck(mask), 1e-6);
+            double ringLatSecs = ringTable.latencyUs(mask) / 1e6;
+            return 2.0 * (mF - 1.0) * ringLatSecs
+                    + 2.0 * ((mF - 1.0) / mF) * (syncBytes / (ringBw * 1e9));
+        }
+        double hockneyUs = BottleneckTspSolver.solveRingHockneyGreedy(indices, bw, latUs, syncBytes);
+        return 2.0 * (mF - 1.0) * (hockneyUs / 1e6);
+    }
+
     /**
      * Estimates the minimum AllReduce synchronization duration across all MST dendrogram cuts.
      *
@@ -104,20 +133,7 @@ public final class MstDendrogram {
             return 0.0;
         }
 
-        int mask = 0;
-        for (int idx : activeIndices) {
-            mask |= (1 << idx);
-        }
-
-        double ringBw = (ringTable != null) ? ringTable.bottleneck(mask) : BottleneckTspSolver.solveRingBottleneck(activeIndices, bw);
-        double ringLatSecs = (ringTable != null) ? (ringTable.latencyUs(mask) / 1e6) : 0.0;
-        if (ringBw <= 0.0) {
-            ringBw = 1e-6;
-        }
-
-        double mF = m;
-        double tFlat = 2.0 * (mF - 1.0) * ringLatSecs
-                + 2.0 * ((mF - 1.0) / mF) * (syncBytes / (ringBw * 1e9));
+        double tFlat = ringAllreduceTimeSecs(activeIndices, bw, latUs, ringTable, syncBytes);
         double bestTimeSecs = tFlat;
 
         boolean allEdgesUniform = true;
@@ -206,45 +222,15 @@ public final class MstDendrogram {
             double tIntraMax = 0.0;
 
             for (List<Integer> isl : islands) {
-                int leader = pickLeader(isl, activeIndices, devices, bw);
+                int leader = pickLeader(isl, activeIndices, devices, bw, latUs, syncBytes);
                 leaders.add(leader);
                 if (isl.size() > 1) {
-                    double bIntra = Double.MAX_VALUE;
-                    double latIntraSecs = 0.0;
-                    for (int member : isl) {
-                        if (member != leader) {
-                            double minB = Math.min(bw[member][leader], bw[leader][member]);
-                            double maxL = Math.max(latUs[member][leader], latUs[leader][member]) / 1e6;
-                            bIntra = Math.min(bIntra, minB);
-                            latIntraSecs = Math.max(latIntraSecs, maxL);
-                        }
-                    }
-                    if (bIntra <= 0.0) {
-                        bIntra = 1e-6;
-                    }
-                    double szF = isl.size();
-                    double tIntra = 2.0 * (szF - 1.0) * latIntraSecs
-                            + 2.0 * ((szF - 1.0) / szF) * (syncBytes / (bIntra * 1e9));
+                    double tIntra = ringAllreduceTimeSecs(isl, bw, latUs, ringTable, syncBytes);
                     tIntraMax = Math.max(tIntraMax, tIntra);
                 }
             }
 
-            int numLeaders = leaders.size();
-            int leaderMask = 0;
-            for (int l : leaders) {
-                leaderMask |= (1 << l);
-            }
-
-            double bLead = (ringTable != null) ? ringTable.bottleneck(leaderMask) : BottleneckTspSolver.solveRingBottleneck(leaders, bw);
-            double latLeadSecs = (ringTable != null) ? (ringTable.latencyUs(leaderMask) / 1e6) : 0.0;
-            if (bLead <= 0.0) {
-                bLead = 1e-6;
-            }
-
-            double kF = numLeaders;
-            double tLead = 2.0 * (kF - 1.0) * latLeadSecs
-                    + 2.0 * ((kF - 1.0) / kF) * (syncBytes / (bLead * 1e9));
-
+            double tLead = ringAllreduceTimeSecs(leaders, bw, latUs, ringTable, syncBytes);
             double tHier = tIntraMax + tLead;
             if (tHier < bestTimeSecs * (1.0 - 1e-6)) {
                 bestTimeSecs = tHier;
@@ -254,36 +240,49 @@ public final class MstDendrogram {
         return bestTimeSecs * 1000.0;
     }
 
-    private static int pickLeader(List<Integer> members, List<Integer> activeIndices, List<DeviceProfile> devices, double[][] bw) {
+    private static int pickLeader(
+            List<Integer> members,
+            List<Integer> activeIndices,
+            List<DeviceProfile> devices,
+            double[][] bw,
+            double[][] latUs,
+            long syncBytes) {
         int best = members.getFirst();
+        double bestWorstOutT = Double.POSITIVE_INFINITY;
         double bestGflops = -1.0;
-        double bestMeanOut = -1.0;
 
         for (int m : members) {
             double gflops = (m < devices.size()) ? devices.get(m).computeGflops() : 0.0;
-            double outSum = 0.0;
-            int outCount = 0;
+            double worstOutT = 0.0;
+            boolean hasOutbound = false;
             for (int o : activeIndices) {
                 if (!members.contains(o)) {
-                    outSum += bw[m][o];
-                    outCount++;
+                    hasOutbound = true;
+                    double linkT = (latUs[m][o] / 1e6) + ((double) syncBytes / (Math.max(bw[m][o], 1e-6) * 1e9));
+                    worstOutT = Math.max(worstOutT, linkT);
                 }
             }
-            double meanOut = (outCount > 0) ? outSum / outCount : 0.0;
+            if (!hasOutbound) {
+                worstOutT = 0.0;
+            }
 
+            double scale = Math.max(worstOutT, Math.max(bestWorstOutT, 1e-9));
+            double diff = worstOutT - bestWorstOutT;
             boolean better;
-            if (Math.abs(gflops - bestGflops) > 1e-4) {
+            if (diff < -1e-6 * scale) {
+                better = true;
+            } else if (diff > 1e-6 * scale) {
+                better = false;
+            } else if (Math.abs(gflops - bestGflops) > 1e-4) {
                 better = gflops > bestGflops;
-            } else if (Math.abs(meanOut - bestMeanOut) > 1e-4) {
-                better = meanOut > bestMeanOut;
             } else {
                 better = m < best;
             }
 
             if (better) {
                 best = m;
+                bestWorstOutT = worstOutT;
                 bestGflops = gflops;
-                bestMeanOut = meanOut;
             }
         }
         return best;

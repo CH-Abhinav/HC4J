@@ -9,7 +9,9 @@ pub mod role_planner;
 
 pub use convex_spill::plan_work;
 pub use mst_islands::{IslandInfo, chunk_range, detect_islands, detect_islands_for_payload};
-pub use ring_tsp::{AllSubsetsRingTable, precompute_all_subsets_ring, solve_optimal_ring};
+pub use ring_tsp::{
+    AllSubsetsRingTable, precompute_all_subsets_ring, precompute_all_subsets_ring_for_payload, solve_optimal_ring,
+};
 pub use role_planner::plan_roles;
 
 use crate::collective::backend::{DeviceProfileC, LinkInfo};

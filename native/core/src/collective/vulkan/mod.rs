@@ -83,12 +83,13 @@ impl VulkanP2pBackend {
                 format!("{:.1} MiB", p.vram_bytes as f64 / (1024.0 * 1024.0))
             };
             eprintln!(
-                "[HC4J] collective rank {}: {} | {} | VRAM={} | {:.1} GFLOP/s",
+                "[HC4J] collective rank {}: {} | {} | VRAM={} | {:.1} GFLOP/s | {:.1} GB/s",
                 i,
                 device_name(&node.props),
                 device_type_str(node.props.device_type),
                 vram_str,
-                p.compute_gflops
+                p.compute_gflops,
+                p.vram_bandwidth_gbps
             );
         }
         for link in &graph.links {
@@ -506,6 +507,38 @@ impl CollectiveBackend for VulkanP2pBackend {
         )
     }
 
+    fn elem_mul(
+        &self,
+        rank: usize,
+        buf_a: u64,
+        buf_b: u64,
+        buf_out: u64,
+        count: u32,
+    ) -> Hc4jResult<()> {
+        if rank >= self.nodes.len() {
+            return Err(Hc4jError::InvalidParam("rank out of range"));
+        }
+        if count == 0 {
+            return Ok(());
+        }
+        let node = &self.nodes[rank];
+        let (raw_a, raw_b, raw_out) = {
+            let map = self.buffers.lock().unwrap();
+            let (r_a, b_a, elems_a) = map.get(&buf_a).copied().ok_or(Hc4jError::InvalidParam("invalid buf_a"))?;
+            let (r_b, b_b, elems_b) = map.get(&buf_b).copied().ok_or(Hc4jError::InvalidParam("invalid buf_b"))?;
+            let (r_o, b_o, elems_o) = map.get(&buf_out).copied().ok_or(Hc4jError::InvalidParam("invalid buf_out"))?;
+            if r_a != rank || r_b != rank || r_o != rank {
+                return Err(Hc4jError::InvalidParam("elem_mul buffers must belong to specified rank"));
+            }
+            if elems_a < count as usize || elems_b < count as usize || elems_o < count as usize {
+                return Err(Hc4jError::InvalidParam("elem_mul buffer size too small"));
+            }
+            (b_a.buffer, b_b.buffer, b_o.buffer)
+        };
+        let pipes = self.rank_pipelines[rank].lock().unwrap();
+        pipes.elem_mul.dispatch(node, raw_a, raw_b, raw_out, count)
+    }
+
     fn device_profiles(&self) -> &[DeviceProfileC] {
         &self.profiles
     }
@@ -792,6 +825,7 @@ mod tests {
         for p in profiles {
             assert!(p.vram_bytes > 0, "vram_bytes should be > 0, got {}", p.vram_bytes);
             assert!(p.compute_gflops > 0.0, "compute_gflops should be > 0.0, got {}", p.compute_gflops);
+            assert!(p.vram_bandwidth_gbps > 0.0, "vram_bandwidth_gbps should be > 0.0, got {}", p.vram_bandwidth_gbps);
         }
 
         let ring = backend.ring_order();

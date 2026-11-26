@@ -69,6 +69,7 @@ class DeviceProfile:
     device_id: int
     vram_bytes: int
     compute_gflops: float
+    vram_bandwidth_gbps: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -275,6 +276,7 @@ class Collective:
                     device_id=int(raw.device_id),
                     vram_bytes=int(raw.vram_bytes),
                     compute_gflops=float(raw.compute_gflops),
+                    vram_bandwidth_gbps=float(raw.vram_bandwidth_gbps),
                 )
             )
         return out
@@ -403,6 +405,28 @@ class Collective:
                 scale_bits,
             ),
             "hc4j_collective_split_kv_attn",
+            self._lib,
+        )
+
+    def elem_mul(
+        self,
+        rank: int,
+        buf_a: CollectiveBuffer,
+        buf_b: CollectiveBuffer,
+        buf_out: CollectiveBuffer,
+        count: int,
+    ) -> None:
+        self.ensure_open()
+        check_status(
+            self._lib.hc4j_collective_elem_mul(
+                self._handle,
+                rank,
+                buf_a.handle,
+                buf_b.handle,
+                buf_out.handle,
+                count,
+            ),
+            "hc4j_collective_elem_mul",
             self._lib,
         )
 

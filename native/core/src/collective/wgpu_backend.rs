@@ -30,6 +30,7 @@ pub struct Node {
     add: wgpu::ComputePipeline,
     pub(crate) gemm_bias_act: wgpu::ComputePipeline,
     pub(crate) split_kv_attn: wgpu::ComputePipeline,
+    pub(crate) elem_mul: wgpu::ComputePipeline,
     pub(crate) dummy_bias: wgpu::Buffer,
     max_workgroups: u32,
 }
@@ -129,6 +130,22 @@ impl Node {
             cache: None,
         });
 
+        let elem_mul_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("HC4J Collective ElemMul"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("vulkan/elem_mul.wgsl").into()),
+        });
+        let elem_mul = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("HC4J Collective ElemMul"),
+            layout: None,
+            module: &elem_mul_module,
+            entry_point: Some("main"),
+            compilation_options: wgpu::PipelineCompilationOptions {
+                zero_initialize_workgroup_memory: false,
+                ..Default::default()
+            },
+            cache: None,
+        });
+
         let dummy_bias = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("HC4J Dummy Bias"),
             size: 16,
@@ -145,6 +162,7 @@ impl Node {
             add,
             gemm_bias_act,
             split_kv_attn,
+            elem_mul,
             dummy_bias,
             max_workgroups: limits.max_compute_workgroups_per_dimension,
         })
@@ -383,6 +401,12 @@ impl WgpuStagedBackend {
                 4 => 20.0,
                 _ => 50.0,
             };
+            let vram_bandwidth_gbps = match dev_type {
+                2 => 200.0,
+                1 => 40.0,
+                4 => 20.0,
+                _ => 50.0,
+            };
             profiles.push(DeviceProfileC {
                 rank: node.rank as u32,
                 vendor_id: node.info.vendor,
@@ -390,6 +414,7 @@ impl WgpuStagedBackend {
                 device_type: dev_type,
                 vram_bytes,
                 compute_gflops,
+                vram_bandwidth_gbps,
             });
         }
 
@@ -792,6 +817,73 @@ impl WgpuStagedBackend {
 
         Ok(())
     }
+
+    pub fn elem_mul(
+        &self,
+        rank: usize,
+        buf_a: u64,
+        buf_b: u64,
+        buf_out: u64,
+        count: u32,
+    ) -> Hc4jResult<()> {
+        if rank >= self.nodes.len() {
+            return Err(Hc4jError::InvalidParam("rank out of range"));
+        }
+        if count == 0 {
+            return Ok(());
+        }
+
+        let node = &self.nodes[rank];
+        let guard = self.buffers.lock().unwrap_or_else(|p| p.into_inner());
+        let b_a = guard.get(&buf_a).ok_or(Hc4jError::InvalidParam("invalid buf_a"))?;
+        let b_b = guard.get(&buf_b).ok_or(Hc4jError::InvalidParam("invalid buf_b"))?;
+        let b_o = guard.get(&buf_out).ok_or(Hc4jError::InvalidParam("invalid buf_out"))?;
+
+        if b_a.rank != rank || b_b.rank != rank || b_o.rank != rank {
+            return Err(Hc4jError::InvalidParam("buffers must belong to specified rank"));
+        }
+        if b_a.elements < count as u64 || b_b.elements < count as u64 || b_o.elements < count as u64 {
+            return Err(Hc4jError::InvalidParam("buffer size too small for elem_mul"));
+        }
+
+        let params: [u32; 4] = [count, 0, 0, 0];
+        let uniform = node.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("HC4J ElemMul Params"),
+            size: 16,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        node.queue.write_buffer(&uniform, 0, bytemuck::cast_slice(&params));
+
+        let bind_group = node.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("HC4J ElemMul BindGroup"),
+            layout: &node.elem_mul.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: uniform.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: b_a.buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: b_b.buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: b_o.buffer.as_entire_binding() },
+            ],
+        });
+
+        let wgs = count.div_ceil(WORKGROUP_SIZE).clamp(1, 65_535);
+        let mut encoder = node
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("HC4J ElemMul Encoder") });
+        {
+            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("HC4J ElemMul Pass"),
+                timestamp_writes: None,
+            });
+            cpass.set_pipeline(&node.elem_mul);
+            cpass.set_bind_group(0, &bind_group, &[]);
+            cpass.dispatch_workgroups(wgs, 1, 1);
+        }
+        node.queue.submit(Some(encoder.finish()));
+        node.wait()?;
+
+        Ok(())
+    }
 }
 
 impl CollectiveBackend for WgpuStagedBackend {
@@ -877,6 +969,17 @@ impl CollectiveBackend for WgpuStagedBackend {
             local_tokens,
             scale,
         )
+    }
+
+    fn elem_mul(
+        &self,
+        rank: usize,
+        buf_a: u64,
+        buf_b: u64,
+        buf_out: u64,
+        count: u32,
+    ) -> Hc4jResult<()> {
+        self.elem_mul(rank, buf_a, buf_b, buf_out, count)
     }
 
     fn device_profiles(&self) -> &[DeviceProfileC] {

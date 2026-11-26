@@ -34,6 +34,8 @@ fn main() {
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR must be set"));
     compile_wgsl_to_spv("src/collective/vulkan/reduce.wgsl", &out_dir.join("collective_reduce.spv"));
     compile_wgsl_to_spv("src/collective/vulkan/bench_fma.wgsl", &out_dir.join("collective_bench_fma.spv"));
+    compile_wgsl_to_spv("src/collective/vulkan/bench_vram_bw.wgsl", &out_dir.join("collective_bench_vram_bw.spv"));
     compile_wgsl_to_spv("src/collective/vulkan/gemm_bias_act.wgsl", &out_dir.join("collective_gemm_bias_act.spv"));
     compile_wgsl_to_spv("src/collective/vulkan/split_kv_attn.wgsl", &out_dir.join("collective_split_kv_attn.spv"));
+    compile_wgsl_to_spv("src/collective/vulkan/elem_mul.wgsl", &out_dir.join("collective_elem_mul.spv"));
 }

@@ -105,7 +105,13 @@ public final class SplitKvRoleSolver {
             maxKvTokens[i] = availKvVram / kvSpec.kvBytesPerToken();
 
             double cGflops = Math.max(d.computeGflops(), EPSILON);
-            double memBw = Math.max(50.0, cGflops * 0.1);
+            double memBw = (d.vramBandwidthGbps() > 0.0 && Double.isFinite(d.vramBandwidthGbps()))
+                    ? d.vramBandwidthGbps()
+                    : switch (d.deviceType()) {
+                        case "Discrete" -> 100.0;
+                        case "Integrated" -> 35.0;
+                        default -> 50.0;
+                    };
             double tComp = kvSpec.attentionFlopsPerToken() / (cGflops * 1e9);
             double tMem = kvSpec.kvBytesPerToken() / (memBw * 1e9);
             rAttn[i] = Math.max(tComp, tMem) * 1000.0;
@@ -147,58 +153,22 @@ public final class SplitKvRoleSolver {
 
         List<KvWorker> bestWorkerSet = null;
         long[] bestKvAlloc = null;
-        double bestAttnMs = Double.MAX_VALUE;
+        double bestAttnMs = 0.0;
 
-        if (totalKv == 0) {
-            bestAttnMs = 0.0;
-        } else {
-            int wCount = allWorkers.size();
-            if (wCount <= 12) {
-                int maxKvSubsets = 1 << wCount;
-                for (int mask = 1; mask < maxKvSubsets; mask++) {
-                    List<KvWorker> candWorkers = new ArrayList<>();
-                    long candCap = 0;
-                    for (int i = 0; i < wCount; i++) {
-                        if ((mask & (1 << i)) != 0) {
-                            KvWorker w = allWorkers.get(i);
-                            candWorkers.add(w);
-                            candCap = ConvexSpillSolver.addSaturating(candCap, w.maxTokens);
-                        }
-                    }
-                    if (candCap < totalKv) {
-                        continue;
-                    }
-
-                    long[] alloc = solveKvMinimax(candWorkers, totalKv);
-                    double maxTime = 0.0;
-                    for (int i = 0; i < candWorkers.size(); i++) {
-                        KvWorker w = candWorkers.get(i);
-                        long tokens = alloc[i];
-                        double time = (tokens > 0) ? w.lRpc + (tokens * w.rAttn) : 0.0;
-                        maxTime = Math.max(maxTime, time);
-                    }
-
-                    if (maxTime < bestAttnMs * (1.0 - 1e-6)) {
-                        bestAttnMs = maxTime;
-                        bestWorkerSet = candWorkers;
-                        bestKvAlloc = alloc;
-                    }
-                }
-            } else {
-                long totalCap = 0;
-                for (KvWorker w : allWorkers) {
-                    totalCap = ConvexSpillSolver.addSaturating(totalCap, w.maxTokens);
-                }
-                if (totalCap >= totalKv) {
-                    bestWorkerSet = allWorkers;
-                    bestKvAlloc = solveKvMinimax(allWorkers, totalKv);
-                    bestAttnMs = 0.0;
-                    for (int i = 0; i < allWorkers.size(); i++) {
-                        KvWorker w = allWorkers.get(i);
-                        long tokens = bestKvAlloc[i];
-                        double time = (tokens > 0) ? w.lRpc + (tokens * w.rAttn) : 0.0;
-                        bestAttnMs = Math.max(bestAttnMs, time);
-                    }
+        if (totalKv > 0) {
+            long totalCap = 0;
+            for (KvWorker w : allWorkers) {
+                totalCap = ConvexSpillSolver.addSaturating(totalCap, w.maxTokens);
+            }
+            if (totalCap >= totalKv) {
+                bestWorkerSet = allWorkers;
+                bestKvAlloc = solveKvBisection(allWorkers, totalKv);
+                bestAttnMs = 0.0;
+                for (int i = 0; i < allWorkers.size(); i++) {
+                    KvWorker w = allWorkers.get(i);
+                    long tokens = bestKvAlloc[i];
+                    double time = (tokens > 0) ? w.lRpc + (tokens * w.rAttn) : 0.0;
+                    bestAttnMs = Math.max(bestAttnMs, time);
                 }
             }
 
@@ -282,7 +252,27 @@ public final class SplitKvRoleSolver {
                 regime);
     }
 
-    private static long[] solveKvMinimax(List<KvWorker> workers, long totalTokens) {
+    private static long kvContrib(List<KvWorker> workers, double t, long[] out) {
+        long sum = 0;
+        for (int i = 0; i < workers.size(); i++) {
+            KvWorker w = workers.get(i);
+            double threshold = w.lRpc + w.rAttn;
+            long p;
+            if (w.maxTokens == 0 || t < threshold) {
+                p = 0;
+            } else if (w.rAttn <= 0.0) {
+                p = w.maxTokens;
+            } else {
+                long fl = (long) Math.floor((t - w.lRpc) / w.rAttn);
+                p = Math.min(Math.max(0L, fl), w.maxTokens);
+            }
+            out[i] = p;
+            sum = ConvexSpillSolver.addSaturating(sum, p);
+        }
+        return sum;
+    }
+
+    private static long[] solveKvBisection(List<KvWorker> workers, long totalTokens) {
         int m = workers.size();
         long[] result = new long[m];
         if (m == 0 || totalTokens == 0) {
@@ -292,40 +282,51 @@ public final class SplitKvRoleSolver {
         double tLow = 0.0;
         double tHigh = 1.0;
         for (KvWorker w : workers) {
-            tHigh = Math.max(tHigh, w.lRpc + (totalTokens * w.rAttn));
+            double cap = (double) Math.min(w.maxTokens, totalTokens);
+            tHigh = Math.max(tHigh, w.lRpc + cap * w.rAttn + w.rAttn);
+        }
+        long[] scratch = new long[m];
+        for (int s = 0; s < 64; s++) {
+            if (kvContrib(workers, tHigh, scratch) >= totalTokens) {
+                break;
+            }
+            tHigh *= 2.0;
         }
 
-        for (int step = 0; step < 64; step++) {
+        for (int step = 0; step < 72; step++) {
             double tMid = tLow + (tHigh - tLow) * 0.5;
-            double sumTokens = 0.0;
-            for (KvWorker w : workers) {
-                if (tMid > w.lRpc) {
-                    double tokens = (tMid - w.lRpc) / w.rAttn;
-                    sumTokens += Math.min(tokens, w.maxTokens);
-                }
-            }
-            if (sumTokens >= totalTokens) {
+            if (kvContrib(workers, tMid, scratch) >= totalTokens) {
                 tHigh = tMid;
             } else {
                 tLow = tMid;
             }
         }
 
-        double tOpt = tHigh;
-        long currentSum = 0;
-        for (int i = 0; i < m; i++) {
-            KvWorker w = workers.get(i);
-            long tokens = 0;
-            if (tOpt > w.lRpc) {
-                tokens = (long) Math.floor((tOpt - w.lRpc) / w.rAttn);
-                tokens = Math.max(0, Math.min(tokens, w.maxTokens));
+        long currentSum = kvContrib(workers, tHigh, result);
+        if (currentSum > totalTokens) {
+            long excess = currentSum - totalTokens;
+            List<Integer> active = new ArrayList<>();
+            for (int i = 0; i < m; i++) {
+                if (result[i] > 0) active.add(i);
             }
-            result[i] = tokens;
-            currentSum += tokens;
-        }
-
-        long deficit = totalTokens - currentSum;
-        if (deficit > 0) {
+            while (excess > 0 && !active.isEmpty()) {
+                active.sort((a, b) -> {
+                    double ta = workers.get(a).lRpc + result[a] * workers.get(a).rAttn;
+                    double tb = workers.get(b).lRpc + result[b] * workers.get(b).rAttn;
+                    int cmp = Double.compare(tb, ta);
+                    return (cmp != 0) ? cmp : Integer.compare(a, b);
+                });
+                for (int idx : active) {
+                    if (excess == 0) break;
+                    if (result[idx] > 0) {
+                        result[idx]--;
+                        excess--;
+                    }
+                }
+                active.removeIf(idx -> result[idx] <= 0);
+            }
+        } else if (currentSum < totalTokens) {
+            long deficit = totalTokens - currentSum;
             record HeapEntry(int index, double nextTime) implements Comparable<HeapEntry> {
                 @Override
                 public int compareTo(HeapEntry o) {
@@ -334,7 +335,7 @@ public final class SplitKvRoleSolver {
                 }
             }
 
-            PriorityQueue<HeapEntry> pq = new PriorityQueue<>();
+            PriorityQueue<HeapEntry> pq = new PriorityQueue<>(m);
             for (int i = 0; i < m; i++) {
                 KvWorker w = workers.get(i);
                 if (result[i] < w.maxTokens) {

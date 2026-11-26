@@ -2,12 +2,14 @@
 pub mod vulkan;
 
 pub mod backend;
+pub mod cpu_kernels;
 pub mod distributed;
 pub mod planner;
 pub mod topology_cache;
 pub mod wgpu_backend;
 
 pub use backend::*;
+pub use cpu_kernels::*;
 pub use distributed::*;
 pub use planner::*;
 pub use topology_cache::*;

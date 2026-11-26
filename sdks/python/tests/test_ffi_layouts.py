@@ -1,7 +1,7 @@
 # Copyright 2026 Abhinav Chinnala (chinnala.abhinav5@gmail.com)
 # SPDX-License-Identifier: Apache-2.0
 
-"""Verifies 1-to-1 ctypes struct layouts, 107 C-ABI symbol bindings, and hc4j_last_error."""
+"""Verifies 1-to-1 ctypes struct layouts, 112 C-ABI symbol bindings, and hc4j_last_error."""
 
 import ctypes
 import unittest
@@ -29,10 +29,10 @@ from hc4py._ffi import (
 
 
 class FfiLayoutsTest(unittest.TestCase):
-    def test_all_107_symbols_bound_and_resolvable(self) -> None:
+    def test_all_112_symbols_bound_and_resolvable(self) -> None:
         lib = get_library()
-        self.assertEqual(len(BOUND_SYMBOLS), 107)
-        self.assertEqual(len(set(BOUND_SYMBOLS)), 107)
+        self.assertEqual(len(BOUND_SYMBOLS), 112)
+        self.assertEqual(len(set(BOUND_SYMBOLS)), 112)
         for name in BOUND_SYMBOLS:
             fn = getattr(lib, name, None)
             self.assertIsNotNone(fn, f"Missing symbol {name}")
@@ -43,7 +43,7 @@ class FfiLayoutsTest(unittest.TestCase):
             EngineStats: 104,
             AdapterInfoC: 668,
             LinkInfo: 32,
-            DeviceProfileC: 32,
+            DeviceProfileC: 40,
             IslandHeaderC: 16,
             HostCpuProfileC: 32,
             WorkloadSpecC: 120,
@@ -57,6 +57,7 @@ class FfiLayoutsTest(unittest.TestCase):
         for cls, sz in expected_sizes.items():
             self.assertEqual(ctypes.sizeof(cls), sz, f"Size mismatch for {cls.__name__}")
 
+        self.assertEqual(DeviceProfileC.vram_bandwidth_gbps.offset, 32)
         self.assertEqual(WorkloadSpecC.allow_spilling.offset, 84)
         self.assertEqual(WorkloadSpecC.host_cpu.offset, 88)
         self.assertEqual(ShardAllocationC.units.offset, 8)

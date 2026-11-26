@@ -46,7 +46,7 @@ pub(crate) struct ExtSupport {
 
     #[cfg(target_os = "windows")]
     pub external_memory_win32: bool,
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
     pub external_memory_host: bool,
 
     pub timeline_semaphore: bool,
@@ -72,19 +72,48 @@ pub(crate) struct GpuNode {
     pub cmd_pool: vk::CommandPool,
     pub props: vk::PhysicalDeviceProperties,
     pub mem_props: vk::PhysicalDeviceMemoryProperties,
+    #[allow(dead_code)]
+    pub driver_uuid: [u8; 16],
+    #[allow(dead_code)]
+    pub device_uuid: [u8; 16],
     pub ext: ExtSupport,
 
     #[cfg(target_os = "linux")]
     pub fd_fn: Option<khr::external_memory_fd::Device>,
     #[cfg(target_os = "linux")]
+    #[allow(dead_code)]
     pub sem_fd_fn: Option<khr::external_semaphore_fd::Device>,
 
     #[cfg(target_os = "windows")]
     pub win32_fn: Option<khr::external_memory_win32::Device>,
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
     pub host_fn: Option<ash::ext::external_memory_host::Device>,
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
     pub min_host_ptr_align: vk::DeviceSize,
+}
+
+#[cfg(any(target_os = "linux", test))]
+pub(crate) fn same_driver_identity_uuids(
+    vendor_a: u32,
+    driver_uuid_a: &[u8; 16],
+    vendor_b: u32,
+    driver_uuid_b: &[u8; 16],
+) -> bool {
+    if vendor_a != vendor_b {
+        return false;
+    }
+    let has_uuid_a = driver_uuid_a.iter().any(|&x| x != 0);
+    let has_uuid_b = driver_uuid_b.iter().any(|&x| x != 0);
+    if has_uuid_a && has_uuid_b {
+        driver_uuid_a == driver_uuid_b
+    } else {
+        true
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn same_driver_identity(a: &GpuNode, b: &GpuNode) -> bool {
+    same_driver_identity_uuids(a.props.vendor_id, &a.driver_uuid, b.props.vendor_id, &b.driver_uuid)
 }
 
 impl GpuNode {
@@ -142,7 +171,7 @@ pub(crate) fn probe_extensions(instance: &ash::Instance, phd: vk::PhysicalDevice
 
         #[cfg(target_os = "windows")]
         external_memory_win32: has_ext(&exts, khr::external_memory_win32::NAME),
-        #[cfg(target_os = "windows")]
+        #[cfg(any(target_os = "windows", target_os = "linux"))]
         external_memory_host: has_ext(&exts, ash::ext::external_memory_host::NAME),
 
         timeline_semaphore: {
@@ -191,6 +220,9 @@ pub(crate) fn create_device(
         if ext.external_semaphore_fd {
             ext_names.push(khr::external_semaphore_fd::NAME.as_ptr());
         }
+        if ext.external_memory_host {
+            ext_names.push(ash::ext::external_memory_host::NAME.as_ptr());
+        }
     }
     #[cfg(target_os = "windows")]
     {
@@ -228,6 +260,11 @@ pub(crate) fn build_node(
 
     let props = unsafe { instance.get_physical_device_properties(phd) };
     let mem_props = unsafe { instance.get_physical_device_memory_properties(phd) };
+    let mut id_props = vk::PhysicalDeviceIDProperties::default();
+    let mut props2_id = vk::PhysicalDeviceProperties2::default().push_next(&mut id_props);
+    unsafe { instance.get_physical_device_properties2(phd, &mut props2_id) };
+    let driver_uuid = id_props.driver_uuid;
+    let device_uuid = id_props.device_uuid;
 
     let pool_ci = vk::CommandPoolCreateInfo::default()
         .queue_family_index(qf)
@@ -249,7 +286,7 @@ pub(crate) fn build_node(
         .external_memory_win32
         .then(|| khr::external_memory_win32::Device::new(instance, &device));
 
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
     let (host_fn, min_host_ptr_align) = if ext.external_memory_host {
         let loader = ash::ext::external_memory_host::Device::new(instance, &device);
         let mut host_props = vk::PhysicalDeviceExternalMemoryHostPropertiesEXT::default();
@@ -269,6 +306,8 @@ pub(crate) fn build_node(
         cmd_pool,
         props,
         mem_props,
+        driver_uuid,
+        device_uuid,
         ext,
         #[cfg(target_os = "linux")]
         fd_fn,
@@ -276,9 +315,9 @@ pub(crate) fn build_node(
         sem_fd_fn,
         #[cfg(target_os = "windows")]
         win32_fn,
-        #[cfg(target_os = "windows")]
+        #[cfg(any(target_os = "windows", target_os = "linux"))]
         host_fn,
-        #[cfg(target_os = "windows")]
+        #[cfg(any(target_os = "windows", target_os = "linux"))]
         min_host_ptr_align,
     })
 }

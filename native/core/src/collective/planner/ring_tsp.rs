@@ -4,12 +4,13 @@
 
 use crate::collective::backend::LinkInfo;
 
-/// Precomputed exact bottleneck bandwidth (GB/s) and maximum hop latency (microseconds)
-/// for every non-empty device subset bitmask in `0..(1 << n)`.
+/// Precomputed exact bottleneck bandwidth (GB/s), maximum hop latency (microseconds),
+/// and per-round Hockney cost (microseconds) for every non-empty device subset bitmask in `0..(1 << n)`.
 #[derive(Debug, Clone)]
 pub struct AllSubsetsRingTable {
     pub bottleneck_gbps: Vec<f64>,
     pub max_hop_latency_us: Vec<f64>,
+    pub hockney_cost_us: Vec<f64>,
 }
 
 impl AllSubsetsRingTable {
@@ -22,41 +23,103 @@ impl AllSubsetsRingTable {
     pub fn latency_us(&self, mask: usize) -> f64 {
         self.max_hop_latency_us.get(mask).copied().unwrap_or(0.0)
     }
+
+    #[inline]
+    pub fn hockney_us(&self, mask: usize) -> f64 {
+        self.hockney_cost_us.get(mask).copied().unwrap_or(0.0)
+    }
+}
+
+#[inline]
+fn edge_hockney_us(bw_gbps: f64, lat_us: f64, m: usize, sync_bytes: u64) -> f64 {
+    let tx_us = if sync_bytes > 0 {
+        (sync_bytes as f64) / ((m as f64) * bw_gbps.max(1e-9) * 1000.0)
+    } else {
+        0.0
+    };
+    lat_us + tx_us
 }
 
 /// Precomputes exact bottleneck bandwidth and maximum hop latency for all `2^n` subsets
-/// in `O(n^2 2^n)` using a shared-root cycle dynamic program.
+/// in `O(n^2 2^n)` using a shared-root cycle dynamic program (bandwidth-first asymptotic limit).
 ///
-/// Mirrors Java `WorkloadPlanner.precomputeAllSubsetsRing` bit-for-bit.
+/// Mirrors Java `BottleneckTspSolver.precomputeAllSubsetsRing` bit-for-bit.
 pub fn precompute_all_subsets_ring(n: usize, bw: &[Vec<f64>], lat_us: &[Vec<f64>]) -> AllSubsetsRingTable {
+    precompute_all_subsets_ring_impl(n, bw, lat_us, None)
+}
+
+/// Precomputes exact per-round Hockney bottleneck cycles across all `2^n` subsets
+/// for a specific collective payload `sync_bytes` by partitioning cardinalities `m in 2..=n`
+/// into equivalence classes sharing the same sorted edge ranking of `w_m(e) = lambda_e + D / (m * B_e)`.
+pub fn precompute_all_subsets_ring_for_payload(
+    n: usize,
+    bw: &[Vec<f64>],
+    lat_us: &[Vec<f64>],
+    sync_bytes: u64,
+) -> AllSubsetsRingTable {
+    precompute_all_subsets_ring_impl(n, bw, lat_us, Some(sync_bytes))
+}
+
+fn precompute_all_subsets_ring_impl(
+    n: usize,
+    bw: &[Vec<f64>],
+    lat_us: &[Vec<f64>],
+    payload_bytes: Option<u64>,
+) -> AllSubsetsRingTable {
     let num_subsets = 1usize << n;
     let mut bottleneck_gbps = vec![0.0f64; num_subsets];
     let mut max_hop_latency_us = vec![0.0f64; num_subsets];
+    let mut hockney_cost_us = vec![0.0f64; num_subsets];
 
     // 1-element subsets
     for i in 0..n {
         bottleneck_gbps[1usize << i] = 25.0;
         max_hop_latency_us[1usize << i] = 0.0;
+        hockney_cost_us[1usize << i] = 0.0;
     }
 
-    // 2-element subsets
+    // 2-element subsets (unique 2-cycle u <-> v)
     for u in 0..n {
         for v in (u + 1)..n {
             let mask = (1usize << u) | (1usize << v);
-            bottleneck_gbps[mask] = bw[u][v].min(bw[v][u]);
-            max_hop_latency_us[mask] = lat_us[u][v].max(lat_us[v][u]);
+            match payload_bytes {
+                Some(d) => {
+                    let w_uv = edge_hockney_us(bw[u][v], lat_us[u][v], 2, d);
+                    let w_vu = edge_hockney_us(bw[v][u], lat_us[v][u], 2, d);
+                    if w_uv >= w_vu {
+                        hockney_cost_us[mask] = w_uv;
+                        bottleneck_gbps[mask] = bw[u][v];
+                        max_hop_latency_us[mask] = lat_us[u][v];
+                    } else {
+                        hockney_cost_us[mask] = w_vu;
+                        bottleneck_gbps[mask] = bw[v][u];
+                        max_hop_latency_us[mask] = lat_us[v][u];
+                    }
+                }
+                None => {
+                    bottleneck_gbps[mask] = bw[u][v].min(bw[v][u]);
+                    max_hop_latency_us[mask] = lat_us[u][v].max(lat_us[v][u]);
+                }
+            }
         }
     }
 
-    // DP for subsets of size >= 3: iterate over root s0 in 0..n-2
-    if n >= 3 {
+    if n < 3 {
+        return AllSubsetsRingTable {
+            bottleneck_gbps,
+            max_hop_latency_us,
+            hockney_cost_us,
+        };
+    }
+
+    let Some(sync_d) = payload_bytes else {
+        // Asymptotic bandwidth-first DP (D -> infinity limit)
         for s0 in 0..(n - 2) {
             let r = n - 1 - s0;
             let num_sub_masks = 1usize << r;
             let mut dp_bw = vec![-1.0f64; num_sub_masks * r];
             let mut dp_lat = vec![0.0f64; num_sub_masks * r];
 
-            // Base cases: paths of length 1 from s0 to s0 + 1 + u
             for u in 0..r {
                 let target = s0 + 1 + u;
                 let idx = (1usize << u) * r + u;
@@ -96,7 +159,6 @@ pub fn precompute_all_subsets_ring(n: usize, bw: &[Vec<f64>], lat_us: &[Vec<f64>
                     }
                 }
 
-                // If sub_mask has at least 2 vertices, we can close cycles of size >= 3 back to s0.
                 if sub_mask.count_ones() >= 2 {
                     let global_mask = (1usize << s0) | (sub_mask << (s0 + 1));
                     let mut best_cycle_bw = -1.0f64;
@@ -124,15 +186,270 @@ pub fn precompute_all_subsets_ring(n: usize, bw: &[Vec<f64>], lat_us: &[Vec<f64>
                 }
             }
         }
+
+        return AllSubsetsRingTable {
+            bottleneck_gbps,
+            max_hop_latency_us,
+            hockney_cost_us,
+        };
+    };
+
+    // Exact Hockney edge cost equivalence-class partitioning over m in 2..=n.
+    struct EquivClass {
+        rep_m: usize,
+        card_mask: u32,
+        edge_rank: Vec<u16>,
+    }
+
+    let mut classes: Vec<EquivClass> = Vec::new();
+    let mut directed_edges: Vec<(usize, usize)> = Vec::with_capacity(n * (n - 1));
+    for u in 0..n {
+        for v in 0..n {
+            if u != v {
+                directed_edges.push((u, v));
+            }
+        }
+    }
+
+    for m in 2..=n {
+        let mut sorted = directed_edges.clone();
+        sorted.sort_by(|&(u1, v1), &(u2, v2)| {
+            let w1 = edge_hockney_us(bw[u1][v1], lat_us[u1][v1], m, sync_d);
+            let w2 = edge_hockney_us(bw[u2][v2], lat_us[u2][v2], m, sync_d);
+            let diff = w1 - w2;
+            let scale = w1.abs().max(w2.abs()).max(1e-9);
+            if diff.abs() > 1e-12 * scale {
+                w1.total_cmp(&w2)
+            } else {
+                bw[u2][v2]
+                    .total_cmp(&bw[u1][v1])
+                    .then_with(|| lat_us[u1][v1].total_cmp(&lat_us[u2][v2]))
+                    .then_with(|| u1.cmp(&u2))
+                    .then_with(|| v1.cmp(&v2))
+            }
+        });
+
+        let mut rank_vec = vec![0u16; n * n];
+        let mut cur_rank = 0u16;
+        let mut prev_w: Option<f64> = None;
+        let mut prev_bw = 0.0f64;
+        let mut prev_lat = 0.0f64;
+        for (u, v) in sorted {
+            let w = edge_hockney_us(bw[u][v], lat_us[u][v], m, sync_d);
+            if let Some(pw) = prev_w {
+                let scale = w.abs().max(pw.abs()).max(1e-9);
+                if (w - pw).abs() > 1e-12 * scale
+                    || (bw[u][v] - prev_bw).abs() > 1e-9
+                    || (lat_us[u][v] - prev_lat).abs() > 1e-9
+                {
+                    cur_rank += 1;
+                }
+            }
+            rank_vec[u * n + v] = cur_rank;
+            prev_w = Some(w);
+            prev_bw = bw[u][v];
+            prev_lat = lat_us[u][v];
+        }
+
+        if let Some(existing) = classes.iter_mut().find(|c| c.edge_rank == rank_vec) {
+            existing.card_mask |= 1u32 << m;
+        } else {
+            classes.push(EquivClass {
+                rep_m: m,
+                card_mask: 1u32 << m,
+                edge_rank: rank_vec,
+            });
+        }
+    }
+
+    for cls in classes {
+        // Subsets of size 2 are already exact; skip DP if this class only contains m == 2.
+        if (cls.card_mask & !0b111u32) == 0 {
+            continue;
+        }
+        let rep_m = cls.rep_m;
+        let er = &cls.edge_rank;
+
+        for s0 in 0..(n - 2) {
+            let r = n - 1 - s0;
+            let num_sub_masks = 1usize << r;
+            let mut dp_rank = vec![u16::MAX; num_sub_masks * r];
+            let mut dp_bw = vec![0.0f64; num_sub_masks * r];
+            let mut dp_lat = vec![0.0f64; num_sub_masks * r];
+
+            for u in 0..r {
+                let target = s0 + 1 + u;
+                let idx = (1usize << u) * r + u;
+                dp_rank[idx] = er[s0 * n + target];
+                dp_bw[idx] = bw[s0][target];
+                dp_lat[idx] = lat_us[s0][target];
+            }
+
+            for sub_mask in 1usize..num_sub_masks {
+                let row_off = sub_mask * r;
+                for u in 0..r {
+                    if (sub_mask & (1usize << u)) == 0 {
+                        continue;
+                    }
+                    let cur_rank = dp_rank[row_off + u];
+                    if cur_rank == u16::MAX {
+                        continue;
+                    }
+                    let cur_bw = dp_bw[row_off + u];
+                    let cur_lat = dp_lat[row_off + u];
+                    let u_rank = s0 + 1 + u;
+
+                    for v in 0..r {
+                        if (sub_mask & (1usize << v)) == 0 {
+                            let next_mask = sub_mask | (1usize << v);
+                            let next_idx = next_mask * r + v;
+                            let v_rank = s0 + 1 + v;
+                            let e_rank = er[u_rank * n + v_rank];
+                            let (cand_rank, cand_bw, cand_lat) = if e_rank > cur_rank {
+                                (e_rank, bw[u_rank][v_rank], lat_us[u_rank][v_rank])
+                            } else {
+                                (cur_rank, cur_bw, cur_lat)
+                            };
+
+                            let exist_rank = dp_rank[next_idx];
+                            let better = if cand_rank != exist_rank {
+                                cand_rank < exist_rank
+                            } else {
+                                let cw = edge_hockney_us(cand_bw, cand_lat, rep_m, sync_d);
+                                let ew = edge_hockney_us(dp_bw[next_idx], dp_lat[next_idx], rep_m, sync_d);
+                                cw < ew
+                            };
+                            if better {
+                                dp_rank[next_idx] = cand_rank;
+                                dp_bw[next_idx] = cand_bw;
+                                dp_lat[next_idx] = cand_lat;
+                            }
+                        }
+                    }
+                }
+
+                let m = 1 + sub_mask.count_ones() as usize;
+                if m >= 3 && ((cls.card_mask >> m) & 1) != 0 {
+                    let global_mask = (1usize << s0) | (sub_mask << (s0 + 1));
+                    let mut best_rank = u16::MAX;
+                    let mut best_bw = 0.0f64;
+                    let mut best_lat = f64::MAX;
+
+                    for u in 0..r {
+                        if (sub_mask & (1usize << u)) != 0 {
+                            let cur_rank = dp_rank[row_off + u];
+                            if cur_rank == u16::MAX {
+                                continue;
+                            }
+                            let u_rank = s0 + 1 + u;
+                            let back_rank = er[u_rank * n + s0];
+                            let (cyc_rank, cyc_bw, cyc_lat) = if back_rank > cur_rank {
+                                (back_rank, bw[u_rank][s0], lat_us[u_rank][s0])
+                            } else {
+                                (cur_rank, dp_bw[row_off + u], dp_lat[row_off + u])
+                            };
+
+                            let better = if cyc_rank != best_rank {
+                                cyc_rank < best_rank
+                            } else {
+                                let cw = edge_hockney_us(cyc_bw, cyc_lat, m, sync_d);
+                                let bw_cost = edge_hockney_us(best_bw, best_lat, m, sync_d);
+                                cw < bw_cost
+                            };
+                            if better {
+                                best_rank = cyc_rank;
+                                best_bw = cyc_bw;
+                                best_lat = cyc_lat;
+                            }
+                        }
+                    }
+
+                    if best_rank != u16::MAX {
+                        bottleneck_gbps[global_mask] = best_bw;
+                        max_hop_latency_us[global_mask] = best_lat;
+                        hockney_cost_us[global_mask] = edge_hockney_us(best_bw, best_lat, m, sync_d);
+                    }
+                }
+            }
+        }
     }
 
     AllSubsetsRingTable {
         bottleneck_gbps,
         max_hop_latency_us,
+        hockney_cost_us,
     }
 }
 
-/// Scalable greedy bottleneck-ring estimator for subsets of size > 12.
+/// Scalable greedy Hockney-cost bottleneck-ring estimator for subsets of size > 12.
+pub fn solve_ring_hockney_greedy(
+    indices: &[usize],
+    bw: &[Vec<f64>],
+    lat_us: &[Vec<f64>],
+    sync_bytes: u64,
+) -> (f64, f64, f64) {
+    let m = indices.len();
+    if m == 0 {
+        return (1.0, 0.0, 0.0);
+    }
+    if m == 1 {
+        return (25.0, 0.0, 0.0);
+    }
+    if m == 2 {
+        let u = indices[0];
+        let v = indices[1];
+        let w_uv = edge_hockney_us(bw[u][v], lat_us[u][v], 2, sync_bytes);
+        let w_vu = edge_hockney_us(bw[v][u], lat_us[v][u], 2, sync_bytes);
+        return if w_uv >= w_vu {
+            (bw[u][v], lat_us[u][v], w_uv)
+        } else {
+            (bw[v][u], lat_us[v][u], w_vu)
+        };
+    }
+
+    let mut visited = vec![false; m];
+    visited[0] = true;
+    let mut cur = 0usize;
+    let mut worst_bw = 0.0f64;
+    let mut worst_lat = 0.0f64;
+    let mut worst_hockney = -1.0f64;
+
+    for _ in 1..m {
+        let mut best_next: Option<usize> = None;
+        let mut best_w = f64::MAX;
+        let cur_rank = indices[cur];
+        for next in 0..m {
+            if !visited[next] {
+                let next_rank = indices[next];
+                let w = edge_hockney_us(bw[cur_rank][next_rank], lat_us[cur_rank][next_rank], m, sync_bytes);
+                if w < best_w {
+                    best_w = w;
+                    best_next = Some(next);
+                }
+            }
+        }
+        let next_idx = best_next.unwrap_or(0);
+        let next_rank = indices[next_idx];
+        visited[next_idx] = true;
+        if best_w > worst_hockney {
+            worst_hockney = best_w;
+            worst_bw = bw[cur_rank][next_rank];
+            worst_lat = lat_us[cur_rank][next_rank];
+        }
+        cur = next_idx;
+    }
+
+    let back_w = edge_hockney_us(bw[indices[cur]][indices[0]], lat_us[indices[cur]][indices[0]], m, sync_bytes);
+    if back_w > worst_hockney {
+        worst_hockney = back_w;
+        worst_bw = bw[indices[cur]][indices[0]];
+        worst_lat = lat_us[indices[cur]][indices[0]];
+    }
+    let eff_bw = if worst_bw > 0.0 { worst_bw } else { 1.0 };
+    (eff_bw, worst_lat, worst_hockney.max(0.0))
+}
+
+/// Scalable greedy bottleneck-ring estimator for subsets of size > 12 (bandwidth-first).
 pub fn solve_ring_bottleneck_greedy(indices: &[usize], bw: &[Vec<f64>]) -> f64 {
     let m = indices.len();
     if m == 0 {
@@ -457,5 +774,38 @@ mod tests {
         let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
         println!("Theorem 1 N=12 precompute_all_subsets_ring solve time: {elapsed_ms:.3} ms");
         assert!(table.bottleneck((1 << n) - 1) >= 4.0);
+    }
+
+    #[test]
+    fn decode_small_payload_prefers_low_latency_over_high_bandwidth() {
+        // Two edge-disjoint directed Hamiltonian cycles over 4 ranks:
+        // Cycle A (0->1->2->3->0): 4 GB/s, 2 us latency (optimal for small decode sync_bytes)
+        // Cycle B (0->3->2->1->0): 25 GB/s, 150 us latency (optimal for large prefill sync_bytes)
+        let n = 4usize;
+        let mut bw = vec![vec![0.5; n]; n];
+        let mut lat = vec![vec![500.0; n]; n];
+        for i in 0..n {
+            bw[i][i] = 25.0;
+            lat[i][i] = 0.0;
+        }
+        for &(u, v) in &[(0, 1), (1, 2), (2, 3), (3, 0)] {
+            bw[u][v] = 4.0;
+            lat[u][v] = 2.0;
+        }
+        for &(u, v) in &[(0, 3), (3, 2), (2, 1), (1, 0)] {
+            bw[u][v] = 25.0;
+            lat[u][v] = 150.0;
+        }
+
+        let tiny_table = super::precompute_all_subsets_ring_for_payload(n, &bw, &lat, 16 * 1024);
+        let small_table = super::precompute_all_subsets_ring_for_payload(n, &bw, &lat, 4096);
+        let large_table = super::precompute_all_subsets_ring_for_payload(n, &bw, &lat, 256 << 20);
+        let full_mask = 0b1111;
+        assert!((tiny_table.bottleneck(full_mask) - 4.0).abs() < 1e-9);
+        assert!((tiny_table.latency_us(full_mask) - 2.0).abs() < 1e-9);
+        assert!((small_table.bottleneck(full_mask) - 4.0).abs() < 1e-9);
+        assert!((small_table.latency_us(full_mask) - 2.0).abs() < 1e-9);
+        assert!((large_table.bottleneck(full_mask) - 25.0).abs() < 1e-9);
+        assert!((large_table.latency_us(full_mask) - 150.0).abs() < 1e-9);
     }
 }

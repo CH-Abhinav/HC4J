@@ -43,6 +43,17 @@ public final class CpuFallbackKernels {
      */
     public static void computeCpuGemm(MemorySegment aSeg, MemorySegment bSeg, MemorySegment outSeg,
                                       int rStart, int units, int n, int k) {
+        if (units <= 0 || n <= 0 || k <= 0) {
+            return;
+        }
+        if (NativeOptimizerBridge.isCpuKernelsAvailable()) {
+            long aBytes = (long) units * k * 4L;
+            long outBytes = (long) units * n * 4L;
+            MemorySegment aSlice = aSeg.asSlice((long) rStart * k * 4L, aBytes);
+            MemorySegment outSlice = outSeg.asSlice((long) rStart * n * 4L, outBytes);
+            NativeOptimizerBridge.cpuGemmF32(aSlice, bSeg, outSlice, units, n, k, 0);
+            return;
+        }
         for (int i = 0; i < units; i++) {
             int globalRow = rStart + i;
             long aRowOff = (long) globalRow * k;
@@ -79,6 +90,15 @@ public final class CpuFallbackKernels {
     public static float[] computeCpuMlpSlice(MemorySegment xSeg, MemorySegment w1Seg, MemorySegment b1Seg,
                                              MemorySegment w2Seg, int m, int dIn, int h, int dOut,
                                              int hStart, int units, Activation activation) {
+        int actCode = activationCodeOrMinValue(activation);
+        if (actCode != Integer.MIN_VALUE && m > 0 && dIn > 0 && h > 0 && dOut > 0 && units > 0
+                && NativeOptimizerBridge.isCpuKernelsAvailable()) {
+            float[] yCpu = new float[m * dOut];
+            NativeOptimizerBridge.cpuMlpSliceF32(
+                    xSeg, w1Seg, b1Seg, w2Seg, MemorySegment.ofArray(yCpu),
+                    m, dIn, h, dOut, hStart, units, actCode);
+            return yCpu;
+        }
         float[] hSlice = new float[m * units];
 
         for (int i = 0; i < m; i++) {
@@ -135,6 +155,12 @@ public final class CpuFallbackKernels {
     public static void computeCpuAttention(MemorySegment qSeg, MemorySegment kShard, MemorySegment vShard,
                                            int tokens, int numHeads, int numKvHeads, int headDim, float scale,
                                            float[] outO, float[] outStats) {
+        if (tokens > 0 && numHeads > 0 && numKvHeads > 0 && headDim > 0
+                && NativeOptimizerBridge.isCpuKernelsAvailable()) {
+            NativeOptimizerBridge.cpuSplitKvAttnF32(
+                    qSeg, kShard, vShard, outO, outStats, tokens, numHeads, numKvHeads, headDim, scale);
+            return;
+        }
         int groupSize = numHeads / numKvHeads;
         float[] scores = new float[tokens];
 
@@ -226,6 +252,18 @@ public final class CpuFallbackKernels {
                 outSeg.set(ValueLayout.JAVA_FLOAT, ((long) h * headDim + d) * 4L, val);
             }
         }
+    }
+
+    private static int activationCodeOrMinValue(Activation activation) {
+        if (activation == null) {
+            return -1;
+        }
+        return switch (activation) {
+            case RELU -> 0;
+            case GELU -> 3;
+            case SILU -> 4;
+            default -> Integer.MIN_VALUE;
+        };
     }
 
     private static float applyActivation(float x, Activation activation) {

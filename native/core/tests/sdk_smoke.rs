@@ -83,6 +83,7 @@ fn optimizer_and_merge_smoke() {
             device_type: 2,
             vram_bytes: 8 << 30,
             compute_gflops: 40_000.0,
+            vram_bandwidth_gbps: 900.0,
         },
         DeviceProfileC {
             rank: 1,
@@ -91,6 +92,7 @@ fn optimizer_and_merge_smoke() {
             device_type: 1,
             vram_bytes: 8 << 30,
             compute_gflops: 120.0,
+            vram_bandwidth_gbps: 40.0,
         },
     ];
     let links = vec![

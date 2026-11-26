@@ -205,7 +205,7 @@ typedef struct LinkInfo {
     double latency_us;
 } LinkInfo;
 
-/** Hardware compute/VRAM capability profile for one rank (32 bytes). */
+/** Hardware compute/VRAM capability profile for one rank (40 bytes). */
 typedef struct DeviceProfileC {
     uint32_t rank;
     uint32_t vendor_id;
@@ -213,6 +213,7 @@ typedef struct DeviceProfileC {
     uint32_t device_type;
     uint64_t vram_bytes;
     double compute_gflops;
+    double vram_bandwidth_gbps;
 } DeviceProfileC;
 
 /** Header for one detected fast collective island (16 bytes). */
@@ -566,9 +567,33 @@ int32_t hc4j_collective_island(uint64_t handle, uint32_t index, IslandHeaderC* o
 int32_t hc4j_collective_merge_split_kv_f32(uint32_t num_heads, uint32_t head_dim, uint32_t worker_count,
                                            const float* const* ptr_partials_o,
                                            const float* const* ptr_partials_stats, float* ptr_out);
+int32_t hc4j_collective_elem_mul(uint64_t handle, uint32_t rank, uint64_t buf_a, uint64_t buf_b,
+                                 uint64_t buf_out, uint32_t count);
 
 /* ========================================================================= */
-/* 10. Exact Theorems 1–4 Workload & Split-KV Role Optimizer (2 symbols)     */
+/* 10. Multi-Threaded SIMD CPU-in-Place Kernels (4 symbols)                  */
+/* ========================================================================= */
+
+#define HC4J_CPU_ACT_NONE (-1)
+#define HC4J_CPU_ACT_RELU 0
+#define HC4J_CPU_ACT_GELU 3
+#define HC4J_CPU_ACT_SILU 4
+
+int32_t hc4j_cpu_gemm_f32(const float* ptr_a, const float* ptr_b, float* ptr_out,
+                          uint32_t m, uint32_t n, uint32_t k, uint32_t flags);
+int32_t hc4j_cpu_gemm_f32_f16(const float* ptr_a, const uint16_t* ptr_b_f16, float* ptr_out,
+                              uint32_t m, uint32_t n, uint32_t k, uint32_t flags);
+int32_t hc4j_cpu_mlp_slice_f32(const float* ptr_x, const float* ptr_w1, const float* ptr_b1,
+                               const float* ptr_w2, float* ptr_out,
+                               uint32_t m, uint32_t d_in, uint32_t h, uint32_t d_out,
+                               uint32_t h_start, uint32_t units, int32_t act_code);
+int32_t hc4j_cpu_split_kv_attn_f32(const float* ptr_q, const float* ptr_k_shard, const float* ptr_v_shard,
+                                   float* ptr_out_o, float* ptr_out_stats,
+                                   uint32_t tokens, uint32_t num_heads, uint32_t num_kv_heads,
+                                   uint32_t head_dim, uint32_t scale_bits);
+
+/* ========================================================================= */
+/* 11. Exact Theorems 1–4 Workload & Split-KV Role Optimizer (2 symbols)     */
 /* ========================================================================= */
 
 int32_t hc4j_optimizer_plan_work(uint32_t device_count, const DeviceProfileC* ptr_devices,

@@ -8,6 +8,8 @@ use crate::engine::error::{Hc4jError, Hc4jResult};
 
 /// SPIR-V bytecode generated from `reduce.wgsl` at build time.
 pub(crate) const REDUCE_SHADER_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/collective_reduce.spv"));
+/// SPIR-V bytecode generated from `elem_mul.wgsl` at build time.
+pub(crate) const ELEM_MUL_SHADER_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/collective_elem_mul.spv"));
 
 pub(crate) const WG_SIZE: u32 = 256;
 
@@ -840,10 +842,251 @@ impl SplitKvPipeline {
     }
 }
 
+pub(crate) struct ElemMulPipeline {
+    pub pipeline: vk::Pipeline,
+    pub layout: vk::PipelineLayout,
+    pub desc_set_layout: vk::DescriptorSetLayout,
+    pub desc_pool: vk::DescriptorPool,
+    pub desc_set: vk::DescriptorSet,
+    pub shader_module: vk::ShaderModule,
+    pub uniform_buf: BufMem,
+}
+
+impl ElemMulPipeline {
+    pub fn new(node: &GpuNode) -> Hc4jResult<Self> {
+        let mut cursor = std::io::Cursor::new(ELEM_MUL_SHADER_SPV);
+        let code = ash::util::read_spv(&mut cursor)
+            .map_err(|e| Hc4jError::Device(format!("failed to parse elem_mul SPIR-V bytecode: {e}")))?;
+
+        let module_ci = vk::ShaderModuleCreateInfo::default().code(&code);
+        let shader_module = unsafe { node.device.create_shader_module(&module_ci, None) }
+            .map_err(|e| Hc4jError::Device(format!("create_shader_module for elem_mul failed: {e}")))?;
+
+        let bindings = [
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(0)
+                .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::COMPUTE),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(1)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::COMPUTE),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(2)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::COMPUTE),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(3)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::COMPUTE),
+        ];
+
+        let dsl_ci = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
+        let desc_set_layout = unsafe { node.device.create_descriptor_set_layout(&dsl_ci, None) }
+            .map_err(|e| {
+                unsafe { node.device.destroy_shader_module(shader_module, None) };
+                Hc4jError::Device(format!("create_descriptor_set_layout for elem_mul failed: {e}"))
+            })?;
+
+        let layout_ci = vk::PipelineLayoutCreateInfo::default()
+            .set_layouts(std::slice::from_ref(&desc_set_layout));
+        let layout = unsafe { node.device.create_pipeline_layout(&layout_ci, None) }
+            .map_err(|e| {
+                unsafe {
+                    node.device.destroy_descriptor_set_layout(desc_set_layout, None);
+                    node.device.destroy_shader_module(shader_module, None);
+                }
+                Hc4jError::Device(format!("create_pipeline_layout for elem_mul failed: {e}"))
+            })?;
+
+        let stage = vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::COMPUTE)
+            .module(shader_module)
+            .name(c"main");
+
+        let pipe_ci = vk::ComputePipelineCreateInfo::default().stage(stage).layout(layout);
+        let pipeline = unsafe {
+            node.device.create_compute_pipelines(vk::PipelineCache::null(), &[pipe_ci], None)
+        }
+        .map_err(|e| {
+            unsafe {
+                node.device.destroy_pipeline_layout(layout, None);
+                node.device.destroy_descriptor_set_layout(desc_set_layout, None);
+                node.device.destroy_shader_module(shader_module, None);
+            }
+            Hc4jError::Device(format!("create_compute_pipelines for elem_mul failed: {e:?}"))
+        })?[0];
+
+        let pool_sizes = [
+            vk::DescriptorPoolSize {
+                ty: vk::DescriptorType::UNIFORM_BUFFER,
+                descriptor_count: 1,
+            },
+            vk::DescriptorPoolSize {
+                ty: vk::DescriptorType::STORAGE_BUFFER,
+                descriptor_count: 3,
+            },
+        ];
+        let pool_ci = vk::DescriptorPoolCreateInfo::default()
+            .max_sets(1)
+            .pool_sizes(&pool_sizes);
+        let desc_pool = unsafe { node.device.create_descriptor_pool(&pool_ci, None) }
+            .map_err(|e| {
+                unsafe {
+                    node.device.destroy_pipeline(pipeline, None);
+                    node.device.destroy_pipeline_layout(layout, None);
+                    node.device.destroy_descriptor_set_layout(desc_set_layout, None);
+                    node.device.destroy_shader_module(shader_module, None);
+                }
+                Hc4jError::Device(format!("create_descriptor_pool for elem_mul failed: {e}"))
+            })?;
+
+        let alloc_info = vk::DescriptorSetAllocateInfo::default()
+            .descriptor_pool(desc_pool)
+            .set_layouts(std::slice::from_ref(&desc_set_layout));
+        let desc_set = unsafe { node.device.allocate_descriptor_sets(&alloc_info) }
+            .map_err(|e| {
+                unsafe {
+                    node.device.destroy_descriptor_pool(desc_pool, None);
+                    node.device.destroy_pipeline(pipeline, None);
+                    node.device.destroy_pipeline_layout(layout, None);
+                    node.device.destroy_descriptor_set_layout(desc_set_layout, None);
+                    node.device.destroy_shader_module(shader_module, None);
+                }
+                Hc4jError::Device(format!("allocate_descriptor_sets for elem_mul failed: {e}"))
+            })?[0];
+
+        let uniform_buf = alloc_staging(
+            node,
+            16,
+            vk::BufferUsageFlags::UNIFORM_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+        )?;
+
+        Ok(Self {
+            pipeline,
+            layout,
+            desc_set_layout,
+            desc_pool,
+            desc_set,
+            shader_module,
+            uniform_buf,
+        })
+    }
+
+    pub fn dispatch(
+        &self,
+        node: &GpuNode,
+        buf_a: vk::Buffer,
+        buf_b: vk::Buffer,
+        buf_out: vk::Buffer,
+        count: u32,
+    ) -> Hc4jResult<()> {
+        if count == 0 {
+            return Ok(());
+        }
+
+        let params: [u32; 4] = [count, 0, 0, 0];
+        unsafe {
+            let ptr = node.device.map_memory(self.uniform_buf.memory, 0, 16, vk::MemoryMapFlags::empty())
+                .map_err(|e| Hc4jError::Device(format!("map uniform_buf failed: {e}")))? as *mut u32;
+            std::ptr::copy_nonoverlapping(params.as_ptr(), ptr, 4);
+            node.device.unmap_memory(self.uniform_buf.memory);
+        }
+
+        let buf_p_info = vk::DescriptorBufferInfo { buffer: self.uniform_buf.buffer, offset: 0, range: 16 };
+        let buf_a_info = vk::DescriptorBufferInfo { buffer: buf_a, offset: 0, range: vk::WHOLE_SIZE };
+        let buf_b_info = vk::DescriptorBufferInfo { buffer: buf_b, offset: 0, range: vk::WHOLE_SIZE };
+        let buf_o_info = vk::DescriptorBufferInfo { buffer: buf_out, offset: 0, range: vk::WHOLE_SIZE };
+
+        let writes = [
+            vk::WriteDescriptorSet::default()
+                .dst_set(self.desc_set)
+                .dst_binding(0)
+                .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                .buffer_info(std::slice::from_ref(&buf_p_info)),
+            vk::WriteDescriptorSet::default()
+                .dst_set(self.desc_set)
+                .dst_binding(1)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(std::slice::from_ref(&buf_a_info)),
+            vk::WriteDescriptorSet::default()
+                .dst_set(self.desc_set)
+                .dst_binding(2)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(std::slice::from_ref(&buf_b_info)),
+            vk::WriteDescriptorSet::default()
+                .dst_set(self.desc_set)
+                .dst_binding(3)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(std::slice::from_ref(&buf_o_info)),
+        ];
+
+        unsafe {
+            node.device.update_descriptor_sets(&writes, &[]);
+        }
+
+        let wgs = count.div_ceil(WG_SIZE).clamp(1, 65_535);
+        one_shot_submit(node, |cb| unsafe {
+            let mem_barrier = vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE | vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE);
+            node.device.cmd_pipeline_barrier(
+                cb,
+                vk::PipelineStageFlags::TRANSFER | vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::DependencyFlags::empty(),
+                &[mem_barrier],
+                &[],
+                &[],
+            );
+
+            node.device.cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, self.pipeline);
+            node.device.cmd_bind_descriptor_sets(
+                cb,
+                vk::PipelineBindPoint::COMPUTE,
+                self.layout,
+                0,
+                &[self.desc_set],
+                &[],
+            );
+            node.device.cmd_dispatch(cb, wgs, 1, 1);
+
+            let mem_barrier_after = vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::TRANSFER_READ);
+            node.device.cmd_pipeline_barrier(
+                cb,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[mem_barrier_after],
+                &[],
+                &[],
+            );
+        })
+    }
+
+    pub fn destroy(&mut self, node: &GpuNode) {
+        destroy_buf(node, &self.uniform_buf);
+        unsafe {
+            node.device.destroy_descriptor_pool(self.desc_pool, None);
+            node.device.destroy_pipeline(self.pipeline, None);
+            node.device.destroy_pipeline_layout(self.layout, None);
+            node.device.destroy_descriptor_set_layout(self.desc_set_layout, None);
+            node.device.destroy_shader_module(self.shader_module, None);
+        }
+    }
+}
+
 pub(crate) struct RankComputePipelines {
     pub reduce: ReducePipeline,
     pub gemm: GemmPipeline,
     pub split_kv: SplitKvPipeline,
+    pub elem_mul: ElemMulPipeline,
 }
 
 impl RankComputePipelines {
@@ -852,10 +1095,12 @@ impl RankComputePipelines {
             reduce: ReducePipeline::new(node)?,
             gemm: GemmPipeline::new(node)?,
             split_kv: SplitKvPipeline::new(node)?,
+            elem_mul: ElemMulPipeline::new(node)?,
         })
     }
 
     pub fn destroy(&mut self, node: &GpuNode) {
+        self.elem_mul.destroy(node);
         self.split_kv.destroy(node);
         self.gemm.destroy(node);
         self.reduce.destroy(node);

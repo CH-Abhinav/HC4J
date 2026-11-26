@@ -28,6 +28,7 @@ import java.util.Objects;
  * @param deviceId the PCI device identifier
  * @param vramBytes the usable device-local video memory in bytes
  * @param computeGflops the measured sustained compute throughput in GFLOP/s
+ * @param vramBandwidthGbps the measured sustained VRAM copy bandwidth in GB/s ({@code 0.0} when unset)
  */
 public record DeviceProfile(
         int rank,
@@ -36,7 +37,30 @@ public record DeviceProfile(
         int vendorId,
         int deviceId,
         long vramBytes,
-        double computeGflops) {
+        double computeGflops,
+        double vramBandwidthGbps) {
+
+    /**
+     * Backwards-compatible constructor defaulting {@code vramBandwidthGbps} to {@code 0.0}.
+     *
+     * @param rank the rank index (non-negative)
+     * @param name adapter name (non-null)
+     * @param deviceType device category (non-null)
+     * @param vendorId vendor ID
+     * @param deviceId device ID
+     * @param vramBytes usable VRAM bytes (non-negative)
+     * @param computeGflops compute throughput in GFLOP/s (non-negative)
+     */
+    public DeviceProfile(
+            int rank,
+            String name,
+            String deviceType,
+            int vendorId,
+            int deviceId,
+            long vramBytes,
+            double computeGflops) {
+        this(rank, name, deviceType, vendorId, deviceId, vramBytes, computeGflops, 0.0);
+    }
 
     /**
      * Constructs and validates a {@link DeviceProfile}.
@@ -48,6 +72,7 @@ public record DeviceProfile(
      * @param deviceId device ID
      * @param vramBytes usable VRAM bytes (non-negative)
      * @param computeGflops compute throughput in GFLOP/s (non-negative)
+     * @param vramBandwidthGbps sustained VRAM bandwidth in GB/s (non-negative)
      */
     public DeviceProfile {
         if (rank < 0) {
@@ -60,6 +85,9 @@ public record DeviceProfile(
         }
         if (computeGflops < 0.0) {
             throw new IllegalArgumentException("computeGflops must be non-negative: " + computeGflops);
+        }
+        if (vramBandwidthGbps < 0.0 || Double.isNaN(vramBandwidthGbps)) {
+            throw new IllegalArgumentException("vramBandwidthGbps must be non-negative: " + vramBandwidthGbps);
         }
     }
 }

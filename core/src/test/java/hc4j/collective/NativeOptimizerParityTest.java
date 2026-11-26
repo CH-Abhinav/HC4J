@@ -223,8 +223,8 @@ class NativeOptimizerParityTest {
 
         // STRAGGLER_PRUNED via RolePlan short context vs SPLIT_KV_RECLAIMED via long context
         List<DeviceProfile> roleDevs = List.of(
-                gpu(0, "Primary-GPU", "Discrete", 24, 90_000.0),
-                gpu(1, "Straggler-GPU", "Integrated", 16, 400.0));
+                new DeviceProfile(0, "Primary-GPU", "Discrete", 0x10DE, 0x2684, 24L << 30, 90_000.0, 1000.0),
+                new DeviceProfile(1, "Straggler-GPU", "Integrated", 0x8086, 0x9A49, 16L << 30, 400.0, 40.0));
         List<Link> roleLinks = fullMesh(2, 2.0, 80.0, Transport.HOST_STAGED);
         WorkloadSpec tpSpec = WorkloadSpec.builder(4096, 2e9, 4096).syncBytes(64L << 20).build();
 
@@ -291,5 +291,68 @@ class NativeOptimizerParityTest {
                 () -> WorkloadPlanner.planNative(devs, List.of(), oomSpec));
         assertTrue(ex.getMessage().contains("["), "Expected diagnostic suffix from hc4j_last_error, got: " + ex.getMessage());
         assertFalse(ex.getMessage().contains("[]"), "Diagnostic suffix should contain descriptive Rust error message");
+    }
+
+    @Test
+    @DisplayName("Step 4E parity: GPU-only Host spill, 1-GPU+CPU syncMs, Hockney decode routing, 24-worker Split-KV")
+    void testStep4EParityCases() {
+        Assumptions.assumeTrue(NativeOptimizerBridge.isNativeAvailable(), "Native optimizer required");
+
+        // 1. GPU-only plan spills to Host RAM even with computeGflops=0
+        List<DeviceProfile> singleGpu = List.of(gpu(0, "Single-GPU", "Discrete", 1, 20_000.0));
+        WorkloadSpec hostSpillGpuOnly = WorkloadSpec.builder(1500, 5e8, 1L << 20)
+                .syncBytes(0L)
+                .hostCpu(new HostCpuProfile("RAM-Only", 8L << 30, 0.0, 60.0, 16.0))
+                .build();
+        WorkloadPlan spillJava = WorkloadPlanner.planJavaFallback(singleGpu, List.of(), hostSpillGpuOnly);
+        WorkloadPlan spillNative = WorkloadPlanner.planNative(singleGpu, List.of(), hostSpillGpuOnly);
+        assertPlansEqual("gpu-only-host-ram-spill", spillJava, spillNative);
+        assertTrue(spillNative.allocations().getFirst().hostStreamUnits() > 0);
+        assertEquals(1, spillNative.allocations().size());
+
+        // 2. 1-GPU + CPU hybrid plan has strictly positive syncMs when syncBytes > 0
+        WorkloadSpec hybrid1Gpu = WorkloadSpec.builder(2400, 5e8, 1L << 20)
+                .syncBytes(32L << 20)
+                .hostCpu(HostCpuProfile.of("Hybrid-CPU", 16L << 30, 500.0, 80.0, 16.0))
+                .build();
+        WorkloadPlan hydJava = WorkloadPlanner.planJavaFallback(singleGpu, List.of(), hybrid1Gpu);
+        WorkloadPlan hydNative = WorkloadPlanner.planNative(singleGpu, List.of(), hybrid1Gpu);
+        assertPlansEqual("1gpu-plus-cpu-sync", hydJava, hydNative);
+        assertTrue(hydNative.estimatedSyncMs() > 0.0);
+
+        // 3. Decode small payload vs large prefill payload ring selection parity
+        List<DeviceProfile> quad = new ArrayList<>();
+        for (int i = 0; i < 4; i++) {
+            quad.add(gpu(i, "G" + i, "Discrete", 16, 20_000.0));
+        }
+        List<Link> dualCycles = new ArrayList<>();
+        for (int u = 0; u < 4; u++) {
+            for (int v = 0; v < 4; v++) {
+                if (u == v) continue;
+                boolean lowLatCycle = (v == (u + 1) % 4);
+                boolean highBwCycle = (u == (v + 1) % 4);
+                double bw = lowLatCycle ? 4.0 : (highBwCycle ? 25.0 : 0.5);
+                double lat = lowLatCycle ? 2.0 : (highBwCycle ? 150.0 : 500.0);
+                dualCycles.add(new Link(u, v, bw, Transport.PEER_TO_PEER, false, lat));
+            }
+        }
+        WorkloadSpec smallDecode = WorkloadSpec.builder(1000, 1e8, 1024).syncBytes(4096).build();
+        assertPlansEqual("hockney-decode-small",
+                WorkloadPlanner.planJavaFallback(quad, dualCycles, smallDecode),
+                WorkloadPlanner.planNative(quad, dualCycles, smallDecode));
+
+        // 4. Scalable > 12 workers Split-KV parity (24 workers)
+        List<DeviceProfile> devs24 = new ArrayList<>(24);
+        for (int i = 0; i < 24; i++) {
+            devs24.add(new DeviceProfile(i, "W" + i, i < 16 ? "Discrete" : "Integrated",
+                    0x10DE, 0x2684, 16L << 30, i < 16 ? 30_000.0 : 800.0, i < 16 ? 900.0 : 40.0));
+        }
+        List<Link> mesh24 = fullMesh(24, 16.0, 10.0, Transport.HOST_STAGED);
+        WorkloadSpec tp24 = WorkloadSpec.builder(4096, 2e9, 4096).syncBytes(32L << 20).build();
+        SplitKvSpec kv24 = new SplitKvSpec(100_000, 512L << 10, 1e6, 64L << 10, 2L << 30, 0.85);
+        RolePlan r24Java = WorkloadPlanner.planRolesJavaFallback(devs24, mesh24, tp24, kv24);
+        RolePlan r24Native = WorkloadPlanner.planRolesNative(devs24, mesh24, tp24, kv24);
+        assertRolePlansEqual("24-worker-split-kv", r24Java, r24Native);
+        assertEquals(100_000L, r24Native.splitKvAssignments().stream().mapToLong(SplitKvAssignment::kvTokens).sum());
     }
 }

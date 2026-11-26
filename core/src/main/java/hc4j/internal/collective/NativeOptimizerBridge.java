@@ -52,14 +52,15 @@ import java.util.Objects;
  */
 public final class NativeOptimizerBridge {
 
-    /** C-ABI {@code DeviceProfileC} layout (32 bytes). */
+    /** C-ABI {@code DeviceProfileC} layout (40 bytes). */
     public static final StructLayout DEVICE_PROFILE_LAYOUT = MemoryLayout.structLayout(
             JAVA_INT.withName("rank"),
             JAVA_INT.withName("vendor_id"),
             JAVA_INT.withName("device_id"),
             JAVA_INT.withName("device_type"),
             JAVA_LONG.withName("vram_bytes"),
-            JAVA_DOUBLE.withName("compute_gflops"));
+            JAVA_DOUBLE.withName("compute_gflops"),
+            JAVA_DOUBLE.withName("vram_bandwidth_gbps"));
 
     /** C-ABI {@code LinkInfo} layout (32 bytes). */
     public static final StructLayout LINK_INFO_LAYOUT = MemoryLayout.structLayout(
@@ -150,6 +151,11 @@ public final class NativeOptimizerBridge {
     private static MethodHandle planWorkHandle;
     private static MethodHandle planRolesHandle;
     private static MethodHandle mergeSplitKvHandle;
+    private static MethodHandle cpuGemmF32Handle;
+    private static MethodHandle cpuGemmF32F16Handle;
+    private static MethodHandle cpuMlpSliceF32Handle;
+    private static MethodHandle cpuSplitKvAttnF32Handle;
+    private static volatile boolean cpuKernelsReady;
 
     private NativeOptimizerBridge() {
         throw new AssertionError("No instances of NativeOptimizerBridge");
@@ -217,11 +223,216 @@ public final class NativeOptimizerBridge {
                     JAVA_INT, JAVA_INT, JAVA_INT,
                     ADDRESS, ADDRESS, ADDRESS));
 
+            var cpuGemmSym = lookup.find("hc4j_cpu_gemm_f32");
+            var cpuGemmF16Sym = lookup.find("hc4j_cpu_gemm_f32_f16");
+            var cpuMlpSym = lookup.find("hc4j_cpu_mlp_slice_f32");
+            var cpuKvSym = lookup.find("hc4j_cpu_split_kv_attn_f32");
+            if (cpuGemmSym.isPresent() && cpuGemmF16Sym.isPresent()
+                    && cpuMlpSym.isPresent() && cpuKvSym.isPresent()) {
+                cpuGemmF32Handle = linker.downcallHandle(cpuGemmSym.get(), FunctionDescriptor.of(
+                        JAVA_INT,
+                        ADDRESS, ADDRESS, ADDRESS,
+                        JAVA_INT, JAVA_INT, JAVA_INT, JAVA_INT));
+                cpuGemmF32F16Handle = linker.downcallHandle(cpuGemmF16Sym.get(), FunctionDescriptor.of(
+                        JAVA_INT,
+                        ADDRESS, ADDRESS, ADDRESS,
+                        JAVA_INT, JAVA_INT, JAVA_INT, JAVA_INT));
+                cpuMlpSliceF32Handle = linker.downcallHandle(cpuMlpSym.get(), FunctionDescriptor.of(
+                        JAVA_INT,
+                        ADDRESS, ADDRESS, ADDRESS, ADDRESS, ADDRESS,
+                        JAVA_INT, JAVA_INT, JAVA_INT, JAVA_INT,
+                        JAVA_INT, JAVA_INT, JAVA_INT));
+                cpuSplitKvAttnF32Handle = linker.downcallHandle(cpuKvSym.get(), FunctionDescriptor.of(
+                        JAVA_INT,
+                        ADDRESS, ADDRESS, ADDRESS, ADDRESS, ADDRESS,
+                        JAVA_INT, JAVA_INT, JAVA_INT, JAVA_INT, JAVA_INT));
+                cpuKernelsReady = true;
+            }
+
             handlesReady = true;
             return true;
         } catch (Throwable ignored) {
             return false;
         }
+    }
+
+    /**
+     * Returns {@code true} when the native library exposes the multi-threaded SIMD CPU kernels.
+     *
+     * @return true if native CPU kernels are callable
+     */
+    public static boolean isCpuKernelsAvailable() {
+        return isNativeAvailable() && cpuKernelsReady;
+    }
+
+    /**
+     * Executes native multi-threaded SIMD {@code C = A * B} over float32 host segments.
+     *
+     * @param aSeg float32 matrix A {@code [m, k]}
+     * @param bSeg float32 matrix B {@code [k, n]} (or {@code [n, k]} with transB flag)
+     * @param outSeg output float32 matrix C {@code [m, n]}
+     * @param m rows of A and C
+     * @param n columns of C
+     * @param k inner dimension
+     * @param flags transpose flags ({@code 1 = TRANS_A, 2 = TRANS_B})
+     */
+    public static void cpuGemmF32(MemorySegment aSeg, MemorySegment bSeg, MemorySegment outSeg,
+                                  int m, int n, int k, int flags) {
+        if (!isCpuKernelsAvailable()) {
+            throw new IllegalStateException("Native CPU GEMM kernel is not available");
+        }
+        try (Arena arena = Arena.ofConfined()) {
+            long aBytes = (long) m * k * 4L;
+            long bBytes = (long) k * n * 4L;
+            long cBytes = (long) m * n * 4L;
+            MemorySegment nA = aSeg.isNative() ? aSeg : copyToNative(arena, aSeg, aBytes);
+            MemorySegment nB = bSeg.isNative() ? bSeg : copyToNative(arena, bSeg, bBytes);
+            MemorySegment nC = outSeg.isNative() ? outSeg : arena.allocate(cBytes, 16);
+            int status = (int) cpuGemmF32Handle.invokeExact(nA, nB, nC, m, n, k, flags);
+            NativeEngine.checkStatus(status, "hc4j_cpu_gemm_f32");
+            if (!outSeg.isNative()) {
+                MemorySegment.copy(nC, 0, outSeg, 0, cBytes);
+            }
+        } catch (RuntimeException | Error e) {
+            throw e;
+        } catch (Throwable t) {
+            throw new RuntimeException("HC4J native CPU GEMM failed", t);
+        }
+    }
+
+    /**
+     * Executes native multi-threaded SIMD {@code C = A_f32 * B_f16} over host segments.
+     *
+     * @param aSeg float32 matrix A {@code [m, k]}
+     * @param bF16Seg float16 matrix B {@code [k, n]} (or {@code [n, k]} with transB flag)
+     * @param outSeg output float32 matrix C {@code [m, n]}
+     * @param m rows of A and C
+     * @param n columns of C
+     * @param k inner dimension
+     * @param flags transpose flags ({@code 2 = TRANS_B})
+     */
+    public static void cpuGemmF32F16(MemorySegment aSeg, MemorySegment bF16Seg, MemorySegment outSeg,
+                                     int m, int n, int k, int flags) {
+        if (!isCpuKernelsAvailable()) {
+            throw new IllegalStateException("Native CPU F16 GEMM kernel is not available");
+        }
+        try (Arena arena = Arena.ofConfined()) {
+            long aBytes = (long) m * k * 4L;
+            long bBytes = (long) k * n * 2L;
+            long cBytes = (long) m * n * 4L;
+            MemorySegment nA = aSeg.isNative() ? aSeg : copyToNative(arena, aSeg, aBytes);
+            MemorySegment nB = bF16Seg.isNative() ? bF16Seg : copyToNative(arena, bF16Seg, bBytes);
+            MemorySegment nC = outSeg.isNative() ? outSeg : arena.allocate(cBytes, 16);
+            int status = (int) cpuGemmF32F16Handle.invokeExact(nA, nB, nC, m, n, k, flags);
+            NativeEngine.checkStatus(status, "hc4j_cpu_gemm_f32_f16");
+            if (!outSeg.isNative()) {
+                MemorySegment.copy(nC, 0, outSeg, 0, cBytes);
+            }
+        } catch (RuntimeException | Error e) {
+            throw e;
+        } catch (Throwable t) {
+            throw new RuntimeException("HC4J native CPU F16 GEMM failed", t);
+        }
+    }
+
+    /**
+     * Executes native multi-threaded SIMD CPU-in-Place MLP slice computation.
+     *
+     * @param xSeg input activations {@code [m, dIn]}
+     * @param w1Seg first projection weights {@code [dIn, h]}
+     * @param b1Seg optional bias {@code [h]} (may be {@code null})
+     * @param w2Seg second projection weights {@code [h, dOut]}
+     * @param outSeg output buffer {@code [m, dOut]}
+     * @param m batch / token count
+     * @param dIn input feature dimension
+     * @param h total hidden width
+     * @param dOut output feature dimension
+     * @param hStart starting hidden offset
+     * @param units hidden width assigned to CPU
+     * @param actCode activation code ({@code -1 = NONE, 0 = RELU, 3 = GELU, 4 = SILU})
+     */
+    public static void cpuMlpSliceF32(MemorySegment xSeg, MemorySegment w1Seg, MemorySegment b1Seg,
+                                      MemorySegment w2Seg, MemorySegment outSeg,
+                                      int m, int dIn, int h, int dOut, int hStart, int units, int actCode) {
+        if (!isCpuKernelsAvailable()) {
+            throw new IllegalStateException("Native CPU MLP kernel is not available");
+        }
+        try (Arena arena = Arena.ofConfined()) {
+            long xBytes = (long) m * dIn * 4L;
+            long w1Bytes = (long) dIn * h * 4L;
+            long b1Bytes = (long) h * 4L;
+            long w2Bytes = (long) h * dOut * 4L;
+            long outBytes = (long) m * dOut * 4L;
+            MemorySegment nX = xSeg.isNative() ? xSeg : copyToNative(arena, xSeg, xBytes);
+            MemorySegment nW1 = w1Seg.isNative() ? w1Seg : copyToNative(arena, w1Seg, w1Bytes);
+            MemorySegment nB1 = (b1Seg == null) ? MemorySegment.NULL
+                    : (b1Seg.isNative() ? b1Seg : copyToNative(arena, b1Seg, b1Bytes));
+            MemorySegment nW2 = w2Seg.isNative() ? w2Seg : copyToNative(arena, w2Seg, w2Bytes);
+            MemorySegment nOut = outSeg.isNative() ? outSeg : arena.allocate(outBytes, 16);
+            int status = (int) cpuMlpSliceF32Handle.invokeExact(
+                    nX, nW1, nB1, nW2, nOut, m, dIn, h, dOut, hStart, units, actCode);
+            NativeEngine.checkStatus(status, "hc4j_cpu_mlp_slice_f32");
+            if (!outSeg.isNative()) {
+                MemorySegment.copy(nOut, 0, outSeg, 0, outBytes);
+            }
+        } catch (RuntimeException | Error e) {
+            throw e;
+        } catch (Throwable t) {
+            throw new RuntimeException("HC4J native CPU MLP slice failed", t);
+        }
+    }
+
+    /**
+     * Executes native multi-threaded SIMD Split-KV CPU attention over host RAM KV shards.
+     *
+     * @param qSeg query tensor {@code [numHeads, headDim]}
+     * @param kSeg key shard {@code [numKvHeads, tokens, headDim]}
+     * @param vSeg value shard {@code [numKvHeads, tokens, headDim]}
+     * @param outO output partial {@code [numHeads * headDim]}
+     * @param outStats output {@code (m, l)} pairs {@code [numHeads * 2]}
+     * @param tokens local cached token count
+     * @param numHeads query head count
+     * @param numKvHeads KV head count
+     * @param headDim per-head dimension
+     * @param scale attention dot-product scale
+     */
+    public static void cpuSplitKvAttnF32(MemorySegment qSeg, MemorySegment kSeg, MemorySegment vSeg,
+                                         float[] outO, float[] outStats,
+                                         int tokens, int numHeads, int numKvHeads, int headDim, float scale) {
+        if (!isCpuKernelsAvailable()) {
+            throw new IllegalStateException("Native CPU Split-KV attention kernel is not available");
+        }
+        try (Arena arena = Arena.ofConfined()) {
+            long qBytes = (long) numHeads * headDim * 4L;
+            long kvBytes = (long) numKvHeads * tokens * headDim * 4L;
+            long oBytes = qBytes;
+            long sBytes = (long) numHeads * 2L * 4L;
+            MemorySegment nQ = qSeg.isNative() ? qSeg : copyToNative(arena, qSeg, qBytes);
+            MemorySegment nK = (kvBytes == 0) ? arena.allocate(4L, 4)
+                    : (kSeg.isNative() ? kSeg : copyToNative(arena, kSeg, kvBytes));
+            MemorySegment nV = (kvBytes == 0) ? arena.allocate(4L, 4)
+                    : (vSeg.isNative() ? vSeg : copyToNative(arena, vSeg, kvBytes));
+            MemorySegment nO = arena.allocate(oBytes, 16);
+            MemorySegment nS = arena.allocate(sBytes, 16);
+            int status = (int) cpuSplitKvAttnF32Handle.invokeExact(
+                    nQ, nK, nV, nO, nS, tokens, numHeads, numKvHeads, headDim, Float.floatToRawIntBits(scale));
+            NativeEngine.checkStatus(status, "hc4j_cpu_split_kv_attn_f32");
+            MemorySegment.copy(nO, JAVA_FLOAT, 0, outO, 0, numHeads * headDim);
+            MemorySegment.copy(nS, JAVA_FLOAT, 0, outStats, 0, numHeads * 2);
+        } catch (RuntimeException | Error e) {
+            throw e;
+        } catch (Throwable t) {
+            throw new RuntimeException("HC4J native CPU Split-KV attention failed", t);
+        }
+    }
+
+    private static MemorySegment copyToNative(Arena arena, MemorySegment src, long byteLength) {
+        if (byteLength <= 0) {
+            return arena.allocate(4L, 4);
+        }
+        MemorySegment dst = arena.allocate(byteLength, 16);
+        MemorySegment.copy(src, 0, dst, 0, byteLength);
+        return dst;
     }
 
     private static void requireNativeHandles() {
@@ -441,6 +652,7 @@ public final class NativeOptimizerBridge {
             seg.set(JAVA_INT, off + 12L, deviceTypeCode(d.deviceType()));
             seg.set(JAVA_LONG, off + 16L, d.vramBytes());
             seg.set(JAVA_DOUBLE, off + 24L, d.computeGflops());
+            seg.set(JAVA_DOUBLE, off + 32L, d.vramBandwidthGbps());
         }
         return seg;
     }
