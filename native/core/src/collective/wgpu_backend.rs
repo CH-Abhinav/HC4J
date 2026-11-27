@@ -64,6 +64,7 @@ fn main(
 
 impl Node {
     async fn open(adapter: &wgpu::Adapter, adapter_index: usize, rank: usize) -> Result<Self, String> {
+        let info = adapter.get_info();
         let limits = adapter.limits();
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
@@ -73,7 +74,12 @@ impl Node {
                 ..Default::default()
             })
             .await
-            .map_err(|e| format!("rank {rank}: failed to open a logical device: {e}"))?;
+            .map_err(|e| {
+                format!(
+                    "rank {rank}: failed to open a logical device ({}, {:?}, {:?}, driver={}): {e}",
+                    info.name, info.device_type, info.backend, info.driver
+                )
+            })?;
 
         // wgpu's default handler panics, which would cross the FFI boundary.
         device.on_uncaptured_error(std::sync::Arc::new(move |err: wgpu::Error| {
@@ -330,7 +336,10 @@ impl WgpuStagedBackend {
             backends,
             ..wgpu::InstanceDescriptor::new_without_display_handle()
         });
-        let all = instance.enumerate_adapters(backends).await;
+        let mut all = instance.enumerate_adapters(backends).await;
+        if !backends.contains(wgpu::Backends::GL) {
+            all.retain(|a| a.get_info().backend != wgpu::Backend::Gl);
+        }
         if all.is_empty() {
             return Err("no GPU adapter available for a collective".to_string());
         }
@@ -369,16 +378,76 @@ impl WgpuStagedBackend {
             std::cmp::Reverse((crate::engine::device_rank(info.device_type), crate::engine::backend_rank(info.backend)))
         });
 
+        // Open one node per working physical adapter first (up to `ranks`). If an adapter
+        // fails on the shared instance, retry once with a dedicated wgpu::Instance so
+        // driver-side instance sharing quirks on multi-GPU Linux do not fail the collective.
+        let mut working_adapters: Vec<(usize, wgpu::Adapter)> = Vec::new();
         let mut nodes = Vec::with_capacity(ranks);
-        for rank in 0..ranks {
-            let slot = rank % physical.len();
-            nodes.push(Node::open(&all[physical[slot]], slot, rank).await?);
+        let mut first_err: Option<String> = None;
+
+        for (slot, &phys_idx) in physical.iter().enumerate() {
+            if nodes.len() >= ranks {
+                break;
+            }
+            let rank = nodes.len();
+            let candidate = &all[phys_idx];
+            match Node::open(candidate, slot, rank).await {
+                Ok(node) => {
+                    working_adapters.push((slot, candidate.clone()));
+                    nodes.push(node);
+                }
+                Err(shared_err) => {
+                    eprintln!("[HC4J] collective warning: {shared_err}");
+                    let info = candidate.get_info();
+                    let isolated = wgpu::Instance::new(wgpu::InstanceDescriptor {
+                        backends,
+                        ..wgpu::InstanceDescriptor::new_without_display_handle()
+                    });
+                    let isolated_match = isolated
+                        .enumerate_adapters(backends)
+                        .await
+                        .into_iter()
+                        .find(|a| {
+                            let i = a.get_info();
+                            i.vendor == info.vendor
+                                && i.device == info.device
+                                && i.backend == info.backend
+                                && i.name == info.name
+                        });
+                    if let Some(iso_adapter) = isolated_match {
+                        match Node::open(&iso_adapter, slot, rank).await {
+                            Ok(node) => {
+                                working_adapters.push((slot, iso_adapter));
+                                nodes.push(node);
+                                continue;
+                            }
+                            Err(iso_err) => {
+                                eprintln!("[HC4J] collective warning (isolated instance): {iso_err}");
+                                if first_err.is_none() {
+                                    first_err = Some(iso_err);
+                                }
+                            }
+                        }
+                    } else if first_err.is_none() {
+                        first_err = Some(shared_err);
+                    }
+                }
+            }
         }
 
-        if physical.len() < ranks {
+        if working_adapters.is_empty() {
+            return Err(first_err.unwrap_or_else(|| "failed to open any collective adapter".to_string()));
+        }
+
+        for rank in nodes.len()..ranks {
+            let (fallback_slot, ref fallback_adapter) = working_adapters[rank % working_adapters.len()];
+            nodes.push(Node::open(fallback_adapter, fallback_slot, rank).await?);
+        }
+
+        if working_adapters.len() < ranks {
             eprintln!(
-                "[HC4J] collective: {} physical GPU(s) for {ranks} ranks -> loopback mode",
-                physical.len()
+                "[HC4J] collective: {} physical GPU(s) active for {ranks} ranks -> loopback mode",
+                working_adapters.len()
             );
         }
         let mut profiles = Vec::with_capacity(ranks);

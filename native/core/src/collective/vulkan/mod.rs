@@ -51,6 +51,20 @@ impl VulkanP2pBackend {
         let phds = enum_physical_devices(&instance)?;
         let num_physical = phds.len();
 
+        unsafe {
+            if let Ok(len) = instance.enumerate_physical_device_groups_len() {
+                let mut groups = vec![vk::PhysicalDeviceGroupProperties::default(); len];
+                if instance.enumerate_physical_device_groups(&mut groups).is_ok() {
+                    let sizes: Vec<u32> = groups.iter().map(|g| g.physical_device_count).collect();
+                    eprintln!(
+                        "[HC4J] collective device_groups: {} group(s) (sizes={:?})",
+                        groups.len(),
+                        sizes
+                    );
+                }
+            }
+        }
+
         let mut nodes = Vec::with_capacity(ranks as usize);
         for i in 0..ranks as usize {
             let phd = phds[i % num_physical];
@@ -733,19 +747,27 @@ mod tests {
 
     #[test]
     fn test_vulkan_p2p_forced_tiers() {
-        use crate::collective::backend::{
-            TRANSPORT_HOST_SHARED_DMA, TRANSPORT_HOST_STAGED, TRANSPORT_PEER_TO_PEER,
-        };
+        #[cfg(any(target_os = "windows", target_os = "linux"))]
+        use crate::collective::backend::TRANSPORT_HOST_SHARED_DMA;
+        use crate::collective::backend::{TRANSPORT_HOST_STAGED, TRANSPORT_PEER_TO_PEER};
+
+        struct ForceTierEnvGuard;
+        impl Drop for ForceTierEnvGuard {
+            fn drop(&mut self) {
+                unsafe { std::env::remove_var("HC4J_COLLECTIVE_FORCE_TIER") };
+            }
+        }
+        let _env_guard = ForceTierEnvGuard;
 
         let tiers = [
             ("staged", TRANSPORT_HOST_STAGED),
             ("p2p", TRANSPORT_PEER_TO_PEER),
-            #[cfg(target_os = "windows")]
+            #[cfg(any(target_os = "windows", target_os = "linux"))]
             ("host_dma", TRANSPORT_HOST_SHARED_DMA),
         ];
 
         for (tier_name, expected_code) in tiers {
-            // SAFETY: Tests are run sequentially within this test function
+            // SAFETY: Tests are run sequentially via --test-threads=1 or inside this sequential loop
             unsafe { std::env::set_var("HC4J_COLLECTIVE_FORCE_TIER", tier_name) };
 
             let backend = match VulkanP2pBackend::new(2) {

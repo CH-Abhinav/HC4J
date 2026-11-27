@@ -6,7 +6,7 @@
 use std::path::{Path, PathBuf};
 
 /// Versioned plain-text header.
-pub const CACHE_HEADER: &str = "HC4J_TOPO_V4";
+pub const CACHE_HEADER: &str = "HC4J_TOPO_V5";
 
 /// A cached device entry.
 #[derive(Debug, Clone, PartialEq)]
@@ -301,11 +301,13 @@ mod tests {
         assert_eq!(loaded.devices, devices);
         assert_eq!(loaded.edges, edges);
 
-        // Verify that old V1/V2 caches fail to load
+        // Verify that old V1/V2/V4 caches fail to load
         let v1_content = "HC4J_TOPO_V1\nDEV\t0\t8589934592\t1000.0000\nDEV\t1\t8589934592\t800.0000\nEDGE\t0\t1\t1\t25.0000\nEDGE\t1\t0\t1\t22.0000\n";
         assert!(parse_cache(v1_content, 2).is_none());
         let v2_content = "HC4J_TOPO_V2\nDEV\t0\t8589934592\t1000.0000\nDEV\t1\t8589934592\t800.0000\n";
         assert!(parse_cache(v2_content, 2).is_none());
+        let v4_content = "HC4J_TOPO_V4\nDEV\t0\t8589934592\t1000.0000\t200.0000\nDEV\t1\t8589934592\t800.0000\t200.0000\n";
+        assert!(parse_cache(v4_content, 2).is_none());
 
         // Cleanup
         let _ = std::fs::remove_file(&path);
@@ -322,11 +324,11 @@ mod tests {
         assert!(load_cache(&path, 1).is_none());
 
         // Malformed lines
-        let _ = write_cache_atomic(&path, "HC4J_TOPO_V4\nDEV\tinvalid\t100\t100\t50");
+        let _ = write_cache_atomic(&path, "HC4J_TOPO_V5\nDEV\tinvalid\t100\t100\t50");
         assert!(load_cache(&path, 1).is_none());
 
         // Incomplete device count
-        let _ = write_cache_atomic(&path, "HC4J_TOPO_V4\nDEV\t0\t100\t100\t50\n");
+        let _ = write_cache_atomic(&path, "HC4J_TOPO_V5\nDEV\t0\t100\t100\t50\n");
         assert!(load_cache(&path, 2).is_none());
 
         let _ = std::fs::remove_file(&path);

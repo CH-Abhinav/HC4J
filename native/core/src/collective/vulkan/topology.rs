@@ -103,6 +103,179 @@ impl TopoGraph {
     }
 }
 
+/// Number of leading and trailing `f32` elements verified by the link probe sentinel check.
+pub(crate) const SENTINEL_COUNT: usize = 64;
+const SENTINEL_BYTES: vk::DeviceSize = (SENTINEL_COUNT * std::mem::size_of::<f32>()) as vk::DeviceSize;
+const SENTINEL_CLEAR_F32: f32 = -1.0;
+
+#[inline]
+pub(crate) fn sentinel_expected(idx: usize) -> f32 {
+    (idx as f32) * 1.25 + 7.5
+}
+
+/// Validates leading and trailing sentinel slices read back from a destination probe buffer.
+/// Rejects silent-zero transfers, stale `-1.0` clears, partial copies, and NaNs.
+pub(crate) fn verify_sentinel_slices(head: &[f32], tail: &[f32]) -> Result<(), (usize, f32, f32)> {
+    if head.len() < SENTINEL_COUNT || tail.len() < SENTINEL_COUNT {
+        return Err((0, f32::NAN, sentinel_expected(0)));
+    }
+    for (k, &got) in head.iter().take(SENTINEL_COUNT).enumerate() {
+        let expected = sentinel_expected(k);
+        if !got.is_finite() || (got - expected).abs() >= 1e-5 {
+            return Err((k, got, expected));
+        }
+    }
+    for (k, &got) in tail.iter().take(SENTINEL_COUNT).enumerate() {
+        let idx = SENTINEL_COUNT + k;
+        let expected = sentinel_expected(idx);
+        if !got.is_finite() || (got - expected).abs() >= 1e-5 {
+            return Err((idx, got, expected));
+        }
+    }
+    Ok(())
+}
+
+/// Populates head & tail sentinel patterns into `src_buf` and pre-clears `dst_buf` to `-1.0`.
+fn prepare_probe_sentinels(
+    src: &GpuNode,
+    src_buf: vk::Buffer,
+    dst: &GpuNode,
+    dst_buf: vk::Buffer,
+    size: vk::DeviceSize,
+) -> Result<(), &'static str> {
+    if size < SENTINEL_BYTES * 2 {
+        return Err("sentinel-size-too-small");
+    }
+    let stg_bytes = SENTINEL_BYTES * 2;
+    let stg = alloc_staging(src, stg_bytes, vk::BufferUsageFlags::TRANSFER_SRC)
+        .map_err(|_| "sentinel-src-stage-alloc-failed")?;
+
+    let write_ok = (|| -> Option<()> {
+        let ptr = unsafe {
+            src.device
+                .map_memory(stg.memory, 0, stg_bytes, vk::MemoryMapFlags::empty())
+        }
+        .ok()?;
+        let floats = unsafe { std::slice::from_raw_parts_mut(ptr as *mut f32, SENTINEL_COUNT * 2) };
+        for (i, slot) in floats.iter_mut().enumerate() {
+            *slot = sentinel_expected(i);
+        }
+        unsafe { src.device.unmap_memory(stg.memory) };
+        Some(())
+    })()
+    .is_some();
+
+    if !write_ok {
+        destroy_buf(src, &stg);
+        return Err("sentinel-src-map-failed");
+    }
+
+    let regions = [
+        vk::BufferCopy {
+            src_offset: 0,
+            dst_offset: 0,
+            size: SENTINEL_BYTES,
+        },
+        vk::BufferCopy {
+            src_offset: SENTINEL_BYTES,
+            dst_offset: size - SENTINEL_BYTES,
+            size: SENTINEL_BYTES,
+        },
+    ];
+    let upload_ok = one_shot_submit(src, |cb| unsafe {
+        src.device.cmd_copy_buffer(cb, stg.buffer, src_buf, &regions);
+    })
+    .is_ok();
+    destroy_buf(src, &stg);
+    if !upload_ok {
+        return Err("sentinel-src-upload-failed");
+    }
+
+    one_shot_submit(dst, |cb| unsafe {
+        dst.device
+            .cmd_fill_buffer(cb, dst_buf, 0, vk::WHOLE_SIZE, SENTINEL_CLEAR_F32.to_bits());
+    })
+    .map_err(|_| "sentinel-dst-clear-failed")?;
+
+    Ok(())
+}
+
+/// Reads back head & tail floats from `dst_buf` and asserts exact match against sentinels.
+fn verify_probe_data_integrity(
+    src: &GpuNode,
+    dst: &GpuNode,
+    tier_label: &str,
+    dst_buf: vk::Buffer,
+    size: vk::DeviceSize,
+) -> Result<(), &'static str> {
+    let stg_bytes = SENTINEL_BYTES * 2;
+    let stg = alloc_staging(dst, stg_bytes, vk::BufferUsageFlags::TRANSFER_DST).map_err(|_| {
+        eprintln!(
+            "[HC4J] collective probe {}->{}: {} failed data-integrity check (staging alloc failed) -> rejecting tier",
+            src.idx, dst.idx, tier_label
+        );
+        "data-integrity-failed"
+    })?;
+
+    let regions = [
+        vk::BufferCopy {
+            src_offset: 0,
+            dst_offset: 0,
+            size: SENTINEL_BYTES,
+        },
+        vk::BufferCopy {
+            src_offset: size - SENTINEL_BYTES,
+            dst_offset: SENTINEL_BYTES,
+            size: SENTINEL_BYTES,
+        },
+    ];
+    if one_shot_submit(dst, |cb| unsafe {
+        dst.device.cmd_copy_buffer(cb, dst_buf, stg.buffer, &regions);
+    })
+    .is_err()
+    {
+        destroy_buf(dst, &stg);
+        eprintln!(
+            "[HC4J] collective probe {}->{}: {} failed data-integrity check (readback copy failed) -> rejecting tier",
+            src.idx, dst.idx, tier_label
+        );
+        return Err("data-integrity-failed");
+    }
+
+    let mut samples = [0.0f32; SENTINEL_COUNT * 2];
+    let read_ok = (|| -> Option<()> {
+        let ptr = unsafe {
+            dst.device
+                .map_memory(stg.memory, 0, stg_bytes, vk::MemoryMapFlags::empty())
+        }
+        .ok()?;
+        let floats = unsafe { std::slice::from_raw_parts(ptr as *const f32, SENTINEL_COUNT * 2) };
+        samples.copy_from_slice(floats);
+        unsafe { dst.device.unmap_memory(stg.memory) };
+        Some(())
+    })()
+    .is_some();
+    destroy_buf(dst, &stg);
+
+    if !read_ok {
+        eprintln!(
+            "[HC4J] collective probe {}->{}: {} failed data-integrity check (map failed) -> rejecting tier",
+            src.idx, dst.idx, tier_label
+        );
+        return Err("data-integrity-failed");
+    }
+
+    if let Err((idx, got, expected)) = verify_sentinel_slices(&samples[..SENTINEL_COUNT], &samples[SENTINEL_COUNT..]) {
+        eprintln!(
+            "[HC4J] collective probe {}->{}: {} failed data-integrity check (idx={}, got={}, expected={}) -> rejecting tier",
+            src.idx, dst.idx, tier_label, idx, got, expected
+        );
+        return Err("data-integrity-failed");
+    }
+
+    Ok(())
+}
+
 /// Probe Tier 1 end-to-end hop:
 /// src_data -> export_buf on src, then imported_buf -> dst_recv on dst.
 #[cfg(target_os = "windows")]
@@ -152,28 +325,56 @@ pub(crate) fn probe_tier1(src: &GpuNode, dst: &GpuNode) -> Result<(f64, P2pHandl
         }
     };
 
+    if let Err(reason) = prepare_probe_sentinels(src, src_data.buffer, dst, dst_recv.buffer, BENCHMARK_BUFFER_SIZE) {
+        destroy_buf(dst, &dst_recv);
+        destroy_buf(dst, &dst_buf);
+        destroy_buf(src, &export_buf);
+        destroy_buf(src, &src_data);
+        return Err(reason);
+    }
+
     let region = vk::BufferCopy {
         src_offset: 0,
         dst_offset: 0,
         size: BENCHMARK_BUFFER_SIZE,
     };
 
-    // Warm-up iteration
-    let _ = one_shot_submit(src, |cb| unsafe {
+    // Warm-up + sentinel verification hop
+    let hop_ok = one_shot_submit(src, |cb| unsafe {
         src.device.cmd_copy_buffer(cb, src_data.buffer, export_buf.buffer, &[region]);
-    });
-    let _ = one_shot_submit(dst, |cb| unsafe {
+    }).is_ok() && one_shot_submit(dst, |cb| unsafe {
         dst.device.cmd_copy_buffer(cb, dst_buf.buffer, dst_recv.buffer, &[region]);
-    });
+    }).is_ok();
+
+    if !hop_ok {
+        destroy_buf(dst, &dst_recv);
+        destroy_buf(dst, &dst_buf);
+        destroy_buf(src, &export_buf);
+        destroy_buf(src, &src_data);
+        return Err("transfer-failed");
+    }
+
+    if let Err(reason) = verify_probe_data_integrity(src, dst, "T1(OPAQUE_WIN32)", dst_recv.buffer, BENCHMARK_BUFFER_SIZE) {
+        destroy_buf(dst, &dst_recv);
+        destroy_buf(dst, &dst_buf);
+        destroy_buf(src, &export_buf);
+        destroy_buf(src, &src_data);
+        return Err(reason);
+    }
 
     let t0 = Instant::now();
     for _ in 0..BENCHMARK_ITERATIONS {
-        let _ = one_shot_submit(src, |cb| unsafe {
+        if one_shot_submit(src, |cb| unsafe {
             src.device.cmd_copy_buffer(cb, src_data.buffer, export_buf.buffer, &[region]);
-        });
-        let _ = one_shot_submit(dst, |cb| unsafe {
+        }).is_err() || one_shot_submit(dst, |cb| unsafe {
             dst.device.cmd_copy_buffer(cb, dst_buf.buffer, dst_recv.buffer, &[region]);
-        });
+        }).is_err() {
+            destroy_buf(dst, &dst_recv);
+            destroy_buf(dst, &dst_buf);
+            destroy_buf(src, &export_buf);
+            destroy_buf(src, &src_data);
+            return Err("transfer-failed");
+        }
     }
     let elapsed = t0.elapsed().as_secs_f64();
     let total_bytes = BENCHMARK_BUFFER_SIZE as f64 * BENCHMARK_ITERATIONS as f64;
@@ -192,6 +393,7 @@ fn probe_tier1_linux_fd(
     src: &GpuNode,
     dst: &GpuNode,
     handle_type: vk::ExternalMemoryHandleTypeFlags,
+    tier_label: &str,
 ) -> Result<f64, &'static str> {
     let usage = vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST;
 
@@ -234,28 +436,56 @@ fn probe_tier1_linux_fd(
         }
     };
 
+    if let Err(reason) = prepare_probe_sentinels(src, src_data.buffer, dst, dst_recv.buffer, BENCHMARK_BUFFER_SIZE) {
+        destroy_buf(dst, &dst_recv);
+        destroy_buf(dst, &dst_buf);
+        destroy_buf(src, &export_buf);
+        destroy_buf(src, &src_data);
+        return Err(reason);
+    }
+
     let region = vk::BufferCopy {
         src_offset: 0,
         dst_offset: 0,
         size: BENCHMARK_BUFFER_SIZE,
     };
 
-    // Warm-up iteration
-    let _ = one_shot_submit(src, |cb| unsafe {
+    // Warm-up + sentinel verification hop
+    let hop_ok = one_shot_submit(src, |cb| unsafe {
         src.device.cmd_copy_buffer(cb, src_data.buffer, export_buf.buffer, &[region]);
-    });
-    let _ = one_shot_submit(dst, |cb| unsafe {
+    }).is_ok() && one_shot_submit(dst, |cb| unsafe {
         dst.device.cmd_copy_buffer(cb, dst_buf.buffer, dst_recv.buffer, &[region]);
-    });
+    }).is_ok();
+
+    if !hop_ok {
+        destroy_buf(dst, &dst_recv);
+        destroy_buf(dst, &dst_buf);
+        destroy_buf(src, &export_buf);
+        destroy_buf(src, &src_data);
+        return Err("transfer-failed");
+    }
+
+    if let Err(reason) = verify_probe_data_integrity(src, dst, tier_label, dst_recv.buffer, BENCHMARK_BUFFER_SIZE) {
+        destroy_buf(dst, &dst_recv);
+        destroy_buf(dst, &dst_buf);
+        destroy_buf(src, &export_buf);
+        destroy_buf(src, &src_data);
+        return Err(reason);
+    }
 
     let t0 = Instant::now();
     for _ in 0..BENCHMARK_ITERATIONS {
-        let _ = one_shot_submit(src, |cb| unsafe {
+        if one_shot_submit(src, |cb| unsafe {
             src.device.cmd_copy_buffer(cb, src_data.buffer, export_buf.buffer, &[region]);
-        });
-        let _ = one_shot_submit(dst, |cb| unsafe {
+        }).is_err() || one_shot_submit(dst, |cb| unsafe {
             dst.device.cmd_copy_buffer(cb, dst_buf.buffer, dst_recv.buffer, &[region]);
-        });
+        }).is_err() {
+            destroy_buf(dst, &dst_recv);
+            destroy_buf(dst, &dst_buf);
+            destroy_buf(src, &export_buf);
+            destroy_buf(src, &src_data);
+            return Err("transfer-failed");
+        }
     }
     let elapsed = t0.elapsed().as_secs_f64();
     let total_bytes = BENCHMARK_BUFFER_SIZE as f64 * BENCHMARK_ITERATIONS as f64;
@@ -270,7 +500,8 @@ fn probe_tier1_linux_fd(
 }
 
 /// Probe Tier 1 on Linux:
-/// 1. Prefer `OPAQUE_FD_BIT` when both GPUs share the same vendor/driver UUID and support `VK_KHR_external_memory_fd`.
+/// 1. Try `OPAQUE_FD_BIT` when both GPUs share the same vendor/driver UUID and support `VK_KHR_external_memory_fd`,
+///    requiring passing sentinel verification (distinct physical GPUs without kernel P2P can otherwise zero-fill imports).
 /// 2. Fall back to `DMA_BUF_BIT_EXT` when `VK_EXT_external_memory_dma_buf` is available.
 #[cfg(target_os = "linux")]
 pub(crate) fn probe_tier1(src: &GpuNode, dst: &GpuNode) -> Result<(f64, P2pHandleKind), &'static str> {
@@ -280,14 +511,19 @@ pub(crate) fn probe_tier1(src: &GpuNode, dst: &GpuNode) -> Result<(f64, P2pHandl
 
     let mut last_err = "ext-missing";
     if same_driver_identity(src, dst) {
-        match probe_tier1_linux_fd(src, dst, vk::ExternalMemoryHandleTypeFlags::OPAQUE_FD) {
+        let label = if src.device_uuid == dst.device_uuid {
+            "T1(OPAQUE_FD,same-gpu)"
+        } else {
+            "T1(OPAQUE_FD)"
+        };
+        match probe_tier1_linux_fd(src, dst, vk::ExternalMemoryHandleTypeFlags::OPAQUE_FD, label) {
             Ok(bw) => return Ok((bw, P2pHandleKind::OpaqueFd)),
             Err(reason) => last_err = reason,
         }
     }
 
     if src.ext.external_memory_dma_buf && dst.ext.external_memory_dma_buf {
-        match probe_tier1_linux_fd(src, dst, vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT) {
+        match probe_tier1_linux_fd(src, dst, vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT, "T1(DMA_BUF)") {
             Ok(bw) => return Ok((bw, P2pHandleKind::DmaBuf)),
             Err(reason) => last_err = reason,
         }
@@ -374,22 +610,50 @@ pub(crate) fn probe_tier1_5(src: &GpuNode, dst: &GpuNode) -> Result<f64, &'stati
         size: BENCHMARK_BUFFER_SIZE,
     };
 
-    // Warm-up full hop
-    let _ = one_shot_submit(src, |cb| unsafe {
+    if let Err(reason) = prepare_probe_sentinels(src, src_data.buffer, dst, dst_recv.buffer, BENCHMARK_BUFFER_SIZE) {
+        destroy_buf(dst, &dst_recv);
+        destroy_buf(src, &src_data);
+        destroy_buf(dst, &host_buf_dst);
+        destroy_buf(src, &host_buf_src);
+        return Err(reason);
+    }
+
+    // Warm-up + sentinel verification full hop
+    let hop_ok = one_shot_submit(src, |cb| unsafe {
         src.device.cmd_copy_buffer(cb, src_data.buffer, host_buf_src.buffer, &[region]);
-    });
-    let _ = one_shot_submit(dst, |cb| unsafe {
+    }).is_ok() && one_shot_submit(dst, |cb| unsafe {
         dst.device.cmd_copy_buffer(cb, host_buf_dst.buffer, dst_recv.buffer, &[region]);
-    });
+    }).is_ok();
+
+    if !hop_ok {
+        destroy_buf(dst, &dst_recv);
+        destroy_buf(src, &src_data);
+        destroy_buf(dst, &host_buf_dst);
+        destroy_buf(src, &host_buf_src);
+        return Err("transfer-failed");
+    }
+
+    if let Err(reason) = verify_probe_data_integrity(src, dst, "T1.5(HOST_SHARED_DMA)", dst_recv.buffer, BENCHMARK_BUFFER_SIZE) {
+        destroy_buf(dst, &dst_recv);
+        destroy_buf(src, &src_data);
+        destroy_buf(dst, &host_buf_dst);
+        destroy_buf(src, &host_buf_src);
+        return Err(reason);
+    }
 
     let t0 = Instant::now();
     for _ in 0..BENCHMARK_ITERATIONS {
-        let _ = one_shot_submit(src, |cb| unsafe {
+        if one_shot_submit(src, |cb| unsafe {
             src.device.cmd_copy_buffer(cb, src_data.buffer, host_buf_src.buffer, &[region]);
-        });
-        let _ = one_shot_submit(dst, |cb| unsafe {
+        }).is_err() || one_shot_submit(dst, |cb| unsafe {
             dst.device.cmd_copy_buffer(cb, host_buf_dst.buffer, dst_recv.buffer, &[region]);
-        });
+        }).is_err() {
+            destroy_buf(dst, &dst_recv);
+            destroy_buf(src, &src_data);
+            destroy_buf(dst, &host_buf_dst);
+            destroy_buf(src, &host_buf_src);
+            return Err("transfer-failed");
+        }
     }
     let elapsed = t0.elapsed().as_secs_f64();
     let total_bytes = BENCHMARK_BUFFER_SIZE as f64 * BENCHMARK_ITERATIONS as f64;
@@ -410,18 +674,16 @@ pub(crate) fn probe_tier1_5(_src: &GpuNode, _dst: &GpuNode) -> Result<f64, &'sta
 
 /// Probe Tier 2 (HOST_STAGED) complete end-to-end hop:
 /// src_data -> staging_src -> host memcpy -> staging_dst -> dst_recv.
-pub(crate) fn probe_tier2(src: &GpuNode, dst: &GpuNode) -> f64 {
+pub(crate) fn probe_tier2(src: &GpuNode, dst: &GpuNode) -> Result<f64, &'static str> {
     let usage = vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST;
 
-    let src_data = match alloc_device_local(src, BENCHMARK_BUFFER_SIZE, usage) {
-        Ok(b) => b,
-        Err(_) => return TIER2_DEFAULT_BW_GBPS,
-    };
+    let src_data = alloc_device_local(src, BENCHMARK_BUFFER_SIZE, usage)
+        .map_err(|_| "src-alloc-failed")?;
     let dst_recv = match alloc_device_local(dst, BENCHMARK_BUFFER_SIZE, usage) {
         Ok(b) => b,
         Err(_) => {
             destroy_buf(src, &src_data);
-            return TIER2_DEFAULT_BW_GBPS;
+            return Err("dst-alloc-failed");
         }
     };
     let staging_src = match alloc_staging(src, BENCHMARK_BUFFER_SIZE, usage) {
@@ -429,7 +691,7 @@ pub(crate) fn probe_tier2(src: &GpuNode, dst: &GpuNode) -> f64 {
         Err(_) => {
             destroy_buf(dst, &dst_recv);
             destroy_buf(src, &src_data);
-            return TIER2_DEFAULT_BW_GBPS;
+            return Err("src-stage-alloc-failed");
         }
     };
     let staging_dst = match alloc_staging(dst, BENCHMARK_BUFFER_SIZE, usage) {
@@ -438,9 +700,17 @@ pub(crate) fn probe_tier2(src: &GpuNode, dst: &GpuNode) -> f64 {
             destroy_buf(src, &staging_src);
             destroy_buf(dst, &dst_recv);
             destroy_buf(src, &src_data);
-            return TIER2_DEFAULT_BW_GBPS;
+            return Err("dst-stage-alloc-failed");
         }
     };
+
+    if let Err(reason) = prepare_probe_sentinels(src, src_data.buffer, dst, dst_recv.buffer, BENCHMARK_BUFFER_SIZE) {
+        destroy_buf(dst, &staging_dst);
+        destroy_buf(src, &staging_src);
+        destroy_buf(dst, &dst_recv);
+        destroy_buf(src, &src_data);
+        return Err(reason);
+    }
 
     let region = vk::BufferCopy {
         src_offset: 0,
@@ -476,13 +746,21 @@ pub(crate) fn probe_tier2(src: &GpuNode, dst: &GpuNode) -> f64 {
         }).is_ok()
     };
 
-    // Warm-up iteration
+    // Warm-up + sentinel verification iteration
     if !execute_staged_hop() {
         destroy_buf(dst, &staging_dst);
         destroy_buf(src, &staging_src);
         destroy_buf(dst, &dst_recv);
         destroy_buf(src, &src_data);
-        return TIER2_DEFAULT_BW_GBPS;
+        return Err("transfer-failed");
+    }
+
+    if let Err(reason) = verify_probe_data_integrity(src, dst, "T2(HOST_STAGED)", dst_recv.buffer, BENCHMARK_BUFFER_SIZE) {
+        destroy_buf(dst, &staging_dst);
+        destroy_buf(src, &staging_src);
+        destroy_buf(dst, &dst_recv);
+        destroy_buf(src, &src_data);
+        return Err(reason);
     }
 
     let t0 = Instant::now();
@@ -492,7 +770,7 @@ pub(crate) fn probe_tier2(src: &GpuNode, dst: &GpuNode) -> f64 {
             destroy_buf(src, &staging_src);
             destroy_buf(dst, &dst_recv);
             destroy_buf(src, &src_data);
-            return TIER2_DEFAULT_BW_GBPS;
+            return Err("transfer-failed");
         }
     }
     let elapsed = t0.elapsed().as_secs_f64();
@@ -504,7 +782,7 @@ pub(crate) fn probe_tier2(src: &GpuNode, dst: &GpuNode) -> f64 {
     destroy_buf(dst, &dst_recv);
     destroy_buf(src, &src_data);
 
-    gbps
+    Ok(gbps)
 }
 
 /// Pure decision function: selects the optimal transport tier comparing direct tiers
@@ -807,7 +1085,7 @@ pub(crate) fn build_topology_and_profiles(
                 } else {
                     let (selected_tier, bw) = match force_tier {
                         ForceTier::Auto => {
-                            let t2_gbps = probe_tier2(&nodes[i], &nodes[j]);
+                            let t2_gbps = probe_tier2(&nodes[i], &nodes[j]).unwrap_or(TIER2_DEFAULT_BW_GBPS);
                             let t1_res = probe_tier1(&nodes[i], &nodes[j]);
                             let t1_5_res = probe_tier1_5(&nodes[i], &nodes[j]);
 
@@ -891,7 +1169,13 @@ pub(crate) fn build_topology_and_profiles(
                             }
                         }
                         ForceTier::Staged => {
-                            let t2_gbps = probe_tier2(&nodes[i], &nodes[j]);
+                            let t2_gbps = probe_tier2(&nodes[i], &nodes[j]).map_err(|reason| {
+                                eprintln!(
+                                    "[HC4J] Forced Tier 2 HOST_STAGED unavailable for probe {}->{}: {reason}",
+                                    i, j
+                                );
+                                Hc4jError::Unsupported("Forced Tier 2 HOST_STAGED unavailable")
+                            })?;
                             let t = TransportTier::Tier2Staging { bandwidth_gbps: t2_gbps };
                             eprintln!(
                                 "[HC4J] collective probe {}->{}: T2(staged)={:.1} GB/s -> HOST_STAGED [FORCED] (loopback={})",
@@ -1040,5 +1324,43 @@ mod tests {
         assert_eq!(parse_force_tier(Some("staged")).unwrap(), ForceTier::Staged);
         assert_eq!(parse_force_tier(Some("STAGED")).unwrap(), ForceTier::Staged);
         assert!(parse_force_tier(Some("invalid")).is_err());
+    }
+
+    #[test]
+    fn test_sentinel_verification_rejects_silent_zeros_and_accepts_valid() {
+        let valid_head: Vec<f32> = (0..SENTINEL_COUNT).map(sentinel_expected).collect();
+        let valid_tail: Vec<f32> = (SENTINEL_COUNT..SENTINEL_COUNT * 2).map(sentinel_expected).collect();
+        assert_eq!(verify_sentinel_slices(&valid_head, &valid_tail), Ok(()));
+
+        // Simulate broken cross-GPU OPAQUE_FD transfer returning silent zeros -> must reject
+        let zero_head = vec![0.0f32; SENTINEL_COUNT];
+        let zero_tail = vec![0.0f32; SENTINEL_COUNT];
+        let err = verify_sentinel_slices(&zero_head, &zero_tail).unwrap_err();
+        assert_eq!(err, (0, 0.0, sentinel_expected(0)));
+
+        // Simulate pre-cleared dst (-1.0) untouched -> must reject and trigger fallback in select_best_tier
+        let untouched_head = vec![SENTINEL_CLEAR_F32; SENTINEL_COUNT];
+        assert!(verify_sentinel_slices(&untouched_head, &valid_tail).is_err());
+        let (tier, bw) = select_best_tier(Err("data-integrity-failed"), Ok(4.6), 2.1);
+        #[cfg(any(target_os = "windows", target_os = "linux"))]
+        {
+            assert_eq!(tier.name(), "HOST_SHARED_DMA");
+            assert_eq!(bw, 4.6);
+        }
+        #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+        {
+            assert_eq!(tier.name(), "HOST_STAGED");
+            assert_eq!(bw, 2.1);
+        }
+
+        // Simulate tail corruption or NaN -> must reject
+        let mut corrupt_tail = valid_tail.clone();
+        corrupt_tail[SENTINEL_COUNT - 1] = 0.0;
+        let tail_err = verify_sentinel_slices(&valid_head, &corrupt_tail).unwrap_err();
+        assert_eq!(tail_err.0, SENTINEL_COUNT * 2 - 1);
+
+        let mut nan_head = valid_head;
+        nan_head[3] = f32::NAN;
+        assert_eq!(verify_sentinel_slices(&nan_head, &valid_tail).unwrap_err().0, 3);
     }
 }

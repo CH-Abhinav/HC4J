@@ -11,8 +11,9 @@ pub(crate) fn requested_backends() -> wgpu::Backends {
         Ok("dx12") => wgpu::Backends::DX12,
         Ok("vulkan") => wgpu::Backends::VULKAN,
         Ok("metal") => wgpu::Backends::METAL,
-        _ if cfg!(windows) => wgpu::Backends::DX12 | wgpu::Backends::VULKAN,
-        _ => wgpu::Backends::all(),
+        Ok("gl") => wgpu::Backends::GL,
+        _ => wgpu::Backends::from_env()
+            .unwrap_or(wgpu::Backends::VULKAN | wgpu::Backends::DX12 | wgpu::Backends::METAL),
     }
 }
 
@@ -51,6 +52,9 @@ pub fn pick_adapter(candidates: &[(wgpu::DeviceType, wgpu::Backend)], discrete_o
 
 pub(crate) async fn select_adapter(instance: &wgpu::Instance, backends: wgpu::Backends) -> Result<(wgpu::Adapter, &'static str), String> {
     let mut adapters = instance.enumerate_adapters(backends).await;
+    if !backends.contains(wgpu::Backends::GL) {
+        adapters.retain(|a| a.get_info().backend != wgpu::Backend::Gl);
+    }
     for adapter in &adapters {
         let info = adapter.get_info();
         crate::hc4j_trace!("adapter candidate: {} ({:?}, {:?})", info.name, info.device_type, info.backend);
@@ -230,5 +234,15 @@ mod tests {
     fn ties_keep_enumeration_order() {
         let adapters = [(DeviceType::DiscreteGpu, Backend::Dx12), (DeviceType::DiscreteGpu, Backend::Dx12)];
         assert_eq!(pick_adapter(&adapters, true), Some(0));
+    }
+
+    #[test]
+    fn requested_backends_excludes_gl_by_default() {
+        // Without HC4J_BACKEND or WGPU_BACKEND overrides, headless OpenGL/EGL must stay excluded.
+        if std::env::var_os("HC4J_BACKEND").is_none() && std::env::var_os("WGPU_BACKEND").is_none() {
+            let backends = super::requested_backends();
+            assert!(!backends.contains(wgpu::Backends::GL));
+            assert!(backends.contains(wgpu::Backends::VULKAN));
+        }
     }
 }
