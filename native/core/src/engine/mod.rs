@@ -242,6 +242,24 @@ pub fn init() -> Hc4jResult<()> {
 }
 
 static WARMUP_STARTED: AtomicBool = AtomicBool::new(false);
+static WARMUP_STOP: AtomicBool = AtomicBool::new(false);
+static WARMUP_HANDLE: Mutex<Option<std::thread::JoinHandle<()>>> = Mutex::new(None);
+
+#[cfg(target_os = "linux")]
+extern "C" fn on_process_exit() {
+    wait_warmup();
+}
+
+/// Signals any running background shader warm-up thread to stop before the next
+/// kernel and joins it so driver static teardown never races with shader compilation.
+pub fn wait_warmup() {
+    WARMUP_STOP.store(true, Ordering::Release);
+    if let Some(handle) = lock_or_recover(&WARMUP_HANDLE).take()
+        && handle.thread().id() != std::thread::current().id()
+    {
+        let _ = handle.join();
+    }
+}
 
 /// Compiles the expensive matmul kernels on a background thread, so the first
 /// matmul does not pay for shader compilation (0.5-5 s under D3D12's FXC).
@@ -255,9 +273,15 @@ fn spawn_warmup() {
         return;
     }
     let spawned = std::thread::Builder::new().name("hc4j-warmup".to_string()).spawn(|| {
+        if WARMUP_STOP.load(Ordering::Acquire) {
+            return;
+        }
         let Ok(engine) = get_engine() else { return };
         let started = std::time::Instant::now();
         for (name, source) in crate::kernels::linalg::matmul::warmup_kernels(engine) {
+            if WARMUP_STOP.load(Ordering::Acquire) {
+                return;
+            }
             if let Err(err) = engine.get_or_compile(&name, "main", &source) {
                 eprintln!("[HC4J] warm-up of {name} failed: {err}");
                 return;
@@ -265,8 +289,17 @@ fn spawn_warmup() {
         }
         crate::hc4j_trace!("warm-up compiled matmul kernels in {:?}", started.elapsed());
     });
-    if let Err(err) = spawned {
-        crate::hc4j_trace!("warm-up thread could not start: {err}");
+    match spawned {
+        Ok(handle) => {
+            *lock_or_recover(&WARMUP_HANDLE) = Some(handle);
+            #[cfg(target_os = "linux")]
+            unsafe {
+                libc::atexit(on_process_exit);
+            }
+        }
+        Err(err) => {
+            crate::hc4j_trace!("warm-up thread could not start: {err}");
+        }
     }
 }
 

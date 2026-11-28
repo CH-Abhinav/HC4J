@@ -18,7 +18,7 @@ use ash::vk;
 
 use crate::collective::backend::{CollectiveBackend, DeviceProfileC, LinkInfo};
 use crate::collective::planner::{detect_islands, solve_optimal_ring, IslandInfo};
-use crate::collective::vulkan::device::{BufMem, GpuNode, alloc_device_local, alloc_staging, build_node, create_instance, destroy_buf, device_name, device_type_str, enum_physical_devices, one_shot_submit};
+use crate::collective::vulkan::device::{BufMem, GpuNode, alloc_device_local_concurrent, alloc_staging, build_node, create_instance, destroy_buf, device_name, device_type_str, enum_physical_devices, one_shot_submit};
 use crate::collective::vulkan::pipeline::{RankComputePipelines, ReducePipeline};
 use crate::collective::vulkan::ring::execute_allreduce;
 use crate::collective::vulkan::topology::{TopoGraph, build_topology_and_profiles};
@@ -119,6 +119,10 @@ impl VulkanP2pBackend {
                 vram_str,
                 p.compute_gflops,
                 p.vram_bandwidth_gbps
+            );
+            eprintln!(
+                "[HC4J] collective rank {} queues: compute_qf={}, send_qf={} ({})",
+                i, node.queue_family, node.send_queue_family, node.send_queue_mode
             );
         }
         for link in &graph.links {
@@ -227,7 +231,7 @@ impl CollectiveBackend for VulkanP2pBackend {
             | vk::BufferUsageFlags::TRANSFER_SRC
             | vk::BufferUsageFlags::TRANSFER_DST;
 
-        let buf = alloc_device_local(node, size, usage)?;
+        let buf = alloc_device_local_concurrent(node, size, usage)?;
         let id = self.next_buffer_id.fetch_add(1, Ordering::Relaxed);
 
         let mut map = self.buffers.lock().unwrap();
@@ -243,6 +247,9 @@ impl CollectiveBackend for VulkanP2pBackend {
         };
 
         if let Some((rank, buf, _)) = entry {
+            if let Ok(mut pipes) = self.rank_pipelines[rank].lock() {
+                pipes.reduce.invalidate_desc_cache();
+            }
             destroy_buf(&self.nodes[rank], &buf);
             Ok(())
         } else {
@@ -771,6 +778,58 @@ mod tests {
 
             backend.free(b0).expect("free b0");
             backend.free(b1).expect("free b1");
+        }
+    }
+
+    #[test]
+    fn test_vulkan_p2p_direct_vs_copy_reduce_equivalence() {
+        struct DirectReduceEnvGuard;
+        impl Drop for DirectReduceEnvGuard {
+            fn drop(&mut self) {
+                unsafe { std::env::remove_var("HC4J_COLLECTIVE_DIRECT_REDUCE") };
+            }
+        }
+        let _guard = DirectReduceEnvGuard;
+
+        let backend = match VulkanP2pBackend::new(2) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("Skipping Vulkan test (ICD unavailable): {e}");
+                return;
+            }
+        };
+
+        for &len in &[1usize, 3, 7, 1003, 262_144] {
+            let d0: Vec<f32> = (0..len).map(|i| ((i % 73) as f32) * 0.25 + 0.5).collect();
+            let d1: Vec<f32> = (0..len).map(|i| ((i % 41) as f32) * 0.5 - 1.25).collect();
+
+            let mut results = Vec::with_capacity(2);
+            for mode in ["1", "0"] {
+                unsafe { std::env::set_var("HC4J_COLLECTIVE_DIRECT_REDUCE", mode) };
+                let b0 = backend.alloc(0, len as u64).expect("alloc b0");
+                let b1 = backend.alloc(1, len as u64).expect("alloc b1");
+                backend.write(b0, &d0).expect("write b0");
+                backend.write(b1, &d1).expect("write b1");
+                backend.allreduce_sum(&[b0, b1]).expect("allreduce_sum");
+                let mut out0 = vec![0.0f32; len];
+                let mut out1 = vec![0.0f32; len];
+                backend.read(b0, &mut out0).expect("read b0");
+                backend.read(b1, &mut out1).expect("read b1");
+                assert_eq!(out0, out1, "rank outputs diverged for len={len}, mode={mode}");
+                backend.free(b0).expect("free b0");
+                backend.free(b1).expect("free b1");
+                results.push(out0);
+            }
+
+            for i in 0..len {
+                let expected = d0[i] + d1[i];
+                assert!(
+                    (results[0][i] - expected).abs() < 1e-4 && (results[1][i] - expected).abs() < 1e-4,
+                    "len={len} mismatch at {i}: direct={}, copy={}, expected={expected}",
+                    results[0][i],
+                    results[1][i]
+                );
+            }
         }
     }
 

@@ -25,6 +25,7 @@ pub(crate) struct RankSlotSync {
 
 pub(crate) fn submit_cb_with_fence(
     node: &GpuNode,
+    queue: vk::Queue,
     cb: vk::CommandBuffer,
     fence: vk::Fence,
     record_fn: impl FnOnce(vk::CommandBuffer),
@@ -45,7 +46,7 @@ pub(crate) fn submit_cb_with_fence(
 
         let submit = vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&cb));
         node.device
-            .queue_submit(node.queue, &[submit], fence)
+            .queue_submit(queue, &[submit], fence)
             .map_err(|e| Hc4jError::Device(format!("queue_submit failed: {e}")))?;
     }
     Ok(())
@@ -63,6 +64,7 @@ pub(crate) struct ReducePipeline {
     pub recv_chunk_bufs: [Option<BufMem>; EDGE_PIPELINE_SLOTS],
     pub recv_capacities: [vk::DeviceSize; EDGE_PIPELINE_SLOTS],
     pub sync: [RankSlotSync; EDGE_PIPELINE_SLOTS],
+    bound_descs: [Option<(vk::Buffer, vk::Buffer, vk::DeviceSize)>; EDGE_PIPELINE_SLOTS],
 }
 
 impl ReducePipeline {
@@ -216,12 +218,12 @@ impl ReducePipeline {
             }
         };
 
-        let cb_count = (EDGE_PIPELINE_SLOTS * 2) as u32;
-        let cb_ai = vk::CommandBufferAllocateInfo::default()
-            .command_pool(node.cmd_pool)
+        let slot_cb_count = EDGE_PIPELINE_SLOTS as u32;
+        let send_cb_ai = vk::CommandBufferAllocateInfo::default()
+            .command_pool(node.send_cmd_pool)
             .level(vk::CommandBufferLevel::PRIMARY)
-            .command_buffer_count(cb_count);
-        let cbs = match unsafe { node.device.allocate_command_buffers(&cb_ai) } {
+            .command_buffer_count(slot_cb_count);
+        let send_cbs = match unsafe { node.device.allocate_command_buffers(&send_cb_ai) } {
             Ok(v) => v,
             Err(e) => {
                 unsafe {
@@ -231,7 +233,26 @@ impl ReducePipeline {
                 destroy_buf(node, &u1);
                 destroy_buf(node, &u0);
                 cleanup_pipe_base();
-                return Err(Hc4jError::Device(format!("allocate ring command buffers failed: {e}")));
+                return Err(Hc4jError::Device(format!("allocate ring send command buffers failed: {e}")));
+            }
+        };
+
+        let recv_cb_ai = vk::CommandBufferAllocateInfo::default()
+            .command_pool(node.cmd_pool)
+            .level(vk::CommandBufferLevel::PRIMARY)
+            .command_buffer_count(slot_cb_count);
+        let recv_cbs = match unsafe { node.device.allocate_command_buffers(&recv_cb_ai) } {
+            Ok(v) => v,
+            Err(e) => {
+                unsafe {
+                    node.device.free_command_buffers(node.send_cmd_pool, &send_cbs);
+                    node.device.unmap_memory(u0.memory);
+                    node.device.unmap_memory(u1.memory);
+                }
+                destroy_buf(node, &u1);
+                destroy_buf(node, &u0);
+                cleanup_pipe_base();
+                return Err(Hc4jError::Device(format!("allocate ring recv command buffers failed: {e}")));
             }
         };
 
@@ -245,7 +266,8 @@ impl ReducePipeline {
                         unsafe { node.device.destroy_fence(f, None) };
                     }
                     unsafe {
-                        node.device.free_command_buffers(node.cmd_pool, &cbs);
+                        node.device.free_command_buffers(node.send_cmd_pool, &send_cbs);
+                        node.device.free_command_buffers(node.cmd_pool, &recv_cbs);
                         node.device.unmap_memory(u0.memory);
                         node.device.unmap_memory(u1.memory);
                     }
@@ -259,15 +281,15 @@ impl ReducePipeline {
 
         let sync = [
             RankSlotSync {
-                send_cb: cbs[0],
+                send_cb: send_cbs[0],
                 send_fence: fences[0],
-                recv_cb: cbs[1],
+                recv_cb: recv_cbs[0],
                 recv_fence: fences[1],
             },
             RankSlotSync {
-                send_cb: cbs[2],
+                send_cb: send_cbs[1],
                 send_fence: fences[2],
-                recv_cb: cbs[3],
+                recv_cb: recv_cbs[1],
                 recv_fence: fences[3],
             },
         ];
@@ -284,7 +306,13 @@ impl ReducePipeline {
             recv_chunk_bufs: [None, None],
             recv_capacities: [0; EDGE_PIPELINE_SLOTS],
             sync,
+            bound_descs: [None; EDGE_PIPELINE_SLOTS],
         })
+    }
+
+    #[inline]
+    pub fn invalidate_desc_cache(&mut self) {
+        self.bound_descs = [None; EDGE_PIPELINE_SLOTS];
     }
 
     /// Ensures persistent double-buffered receive scratch buffers are allocated and at least `needed_bytes`.
@@ -306,6 +334,7 @@ impl ReducePipeline {
         unsafe {
             node.device.device_wait_idle().ok();
         }
+        self.invalidate_desc_cache();
         for (i, opt) in self.recv_chunk_bufs.iter_mut().enumerate() {
             if opt.is_none() || self.recv_capacities[i] < req {
                 if let Some(old) = opt.take() {
@@ -335,7 +364,7 @@ impl ReducePipeline {
     }
 
     fn update_reduce_bindings(
-        &self,
+        &mut self,
         node: &GpuNode,
         slot: usize,
         accum: vk::Buffer,
@@ -352,6 +381,11 @@ impl ReducePipeline {
         }
 
         let byte_range = count as vk::DeviceSize * 4;
+        let key = (accum, incoming, byte_range);
+        if self.bound_descs[s] == Some(key) {
+            return;
+        }
+
         let buf_info_a = vk::DescriptorBufferInfo {
             buffer: accum,
             offset: 0,
@@ -389,54 +423,28 @@ impl ReducePipeline {
         unsafe {
             node.device.update_descriptor_sets(&writes, &[]);
         }
+        self.bound_descs[s] = Some(key);
     }
 
-    /// Prepares descriptors/uniform and records a single fused receive+reduce submission:
-    /// `cmd_copy_buffer(edge_dst_buf -> recv_slot) + barrier + dispatch(reduce) + post-barrier`.
     #[allow(clippy::too_many_arguments)]
-    pub fn record_copy_and_reduce(
-        &self,
+    fn record_reduce_dispatch(
+        &mut self,
         node: &GpuNode,
         cb: vk::CommandBuffer,
-        slot: usize,
+        s: usize,
         accum: vk::Buffer,
         accum_offset: vk::DeviceSize,
-        edge_dst_buf: vk::Buffer,
+        rhs_buf: vk::Buffer,
         count: u32,
     ) {
-        if count == 0 {
-            return;
-        }
-        let s = slot % EDGE_PIPELINE_SLOTS;
-        let recv_buf = self.recv_buf(s);
-        self.update_reduce_bindings(node, s, accum, accum_offset, recv_buf, count);
+        self.update_reduce_bindings(node, s, accum, accum_offset, rhs_buf, count);
 
-        let byte_range = count as vk::DeviceSize * 4;
-        let region = vk::BufferCopy {
-            src_offset: 0,
-            dst_offset: 0,
-            size: byte_range,
-        };
-        let groups = count.div_ceil(WG_SIZE);
+        // Each workgroup has 256 threads and each invocation reduces 4 floats (1024 floats/wg).
+        let groups = count.div_ceil(WG_SIZE * 4);
         let max_x = node.props.limits.max_compute_work_group_count[0];
         let (gx, gy) = crate::kernels::elementwise::grid_2d(groups, max_x);
 
         unsafe {
-            node.device.cmd_copy_buffer(cb, edge_dst_buf, recv_buf, &[region]);
-
-            let xfer_to_compute = vk::MemoryBarrier::default()
-                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE);
-            node.device.cmd_pipeline_barrier(
-                cb,
-                vk::PipelineStageFlags::TRANSFER,
-                vk::PipelineStageFlags::COMPUTE_SHADER,
-                vk::DependencyFlags::empty(),
-                &[xfer_to_compute],
-                &[],
-                &[],
-            );
-
             node.device.cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, self.pipeline);
             node.device.cmd_bind_descriptor_sets(
                 cb,
@@ -463,18 +471,85 @@ impl ReducePipeline {
         }
     }
 
+    /// Prepares descriptors/uniform and records a single fused receive+reduce submission:
+    /// `cmd_copy_buffer(edge_dst_buf -> recv_slot) + barrier + dispatch(reduce) + post-barrier`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_copy_and_reduce(
+        &mut self,
+        node: &GpuNode,
+        cb: vk::CommandBuffer,
+        slot: usize,
+        accum: vk::Buffer,
+        accum_offset: vk::DeviceSize,
+        edge_dst_buf: vk::Buffer,
+        count: u32,
+    ) {
+        if count == 0 {
+            return;
+        }
+        let s = slot % EDGE_PIPELINE_SLOTS;
+        let recv_buf = self.recv_buf(s);
+        let byte_range = count as vk::DeviceSize * 4;
+        let region = vk::BufferCopy {
+            src_offset: 0,
+            dst_offset: 0,
+            size: byte_range,
+        };
+
+        unsafe {
+            node.device.cmd_copy_buffer(cb, edge_dst_buf, recv_buf, &[region]);
+
+            let xfer_to_compute = vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE);
+            node.device.cmd_pipeline_barrier(
+                cb,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::DependencyFlags::empty(),
+                &[xfer_to_compute],
+                &[],
+                &[],
+            );
+        }
+
+        self.record_reduce_dispatch(node, cb, s, accum, accum_offset, recv_buf, count);
+    }
+
+    /// Prepares descriptors/uniform and records a zero-bounce direct-read reduce submission:
+    /// skips the VRAM copy and pre-compute barrier by binding `edge_dst_buf` directly.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_direct_reduce(
+        &mut self,
+        node: &GpuNode,
+        cb: vk::CommandBuffer,
+        slot: usize,
+        accum: vk::Buffer,
+        accum_offset: vk::DeviceSize,
+        edge_dst_buf: vk::Buffer,
+        count: u32,
+    ) {
+        if count == 0 {
+            return;
+        }
+        let s = slot % EDGE_PIPELINE_SLOTS;
+        self.record_reduce_dispatch(node, cb, s, accum, accum_offset, edge_dst_buf, count);
+    }
+
     pub fn destroy(&mut self, node: &GpuNode) {
-        let mut cbs = Vec::with_capacity(EDGE_PIPELINE_SLOTS * 2);
+        let mut send_cbs = Vec::with_capacity(EDGE_PIPELINE_SLOTS);
+        let mut recv_cbs = Vec::with_capacity(EDGE_PIPELINE_SLOTS);
         for sync in &self.sync {
-            cbs.push(sync.send_cb);
-            cbs.push(sync.recv_cb);
+            send_cbs.push(sync.send_cb);
+            recv_cbs.push(sync.recv_cb);
             unsafe {
                 node.device.destroy_fence(sync.send_fence, None);
                 node.device.destroy_fence(sync.recv_fence, None);
             }
         }
         unsafe {
-            node.device.free_command_buffers(node.cmd_pool, &cbs);
+            node.device.free_command_buffers(node.send_cmd_pool, &send_cbs);
+            node.device.free_command_buffers(node.cmd_pool, &recv_cbs);
         }
 
         for opt in &mut self.recv_chunk_bufs {

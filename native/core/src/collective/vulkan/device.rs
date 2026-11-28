@@ -67,9 +67,12 @@ pub(crate) struct GpuNode {
     pub physical_device: vk::PhysicalDevice,
     pub device: ash::Device,
     pub queue: vk::Queue,
-    #[allow(dead_code)]
     pub queue_family: u32,
     pub cmd_pool: vk::CommandPool,
+    pub send_queue: vk::Queue,
+    pub send_queue_family: u32,
+    pub send_cmd_pool: vk::CommandPool,
+    pub send_queue_mode: &'static str,
     pub props: vk::PhysicalDeviceProperties,
     pub mem_props: vk::PhysicalDeviceMemoryProperties,
     #[allow(dead_code)]
@@ -117,9 +120,17 @@ pub(crate) fn same_driver_identity(a: &GpuNode, b: &GpuNode) -> bool {
 }
 
 impl GpuNode {
+    #[inline]
+    pub fn has_dual_queue(&self) -> bool {
+        self.send_queue != self.queue
+    }
+
     pub fn destroy(&self) {
         unsafe {
             self.device.device_wait_idle().ok();
+            if self.send_cmd_pool != self.cmd_pool {
+                self.device.destroy_command_pool(self.send_cmd_pool, None);
+            }
             self.device.destroy_command_pool(self.cmd_pool, None);
             self.device.destroy_device(None);
         }
@@ -144,10 +155,23 @@ pub(crate) fn find_mem_type(
 pub(crate) fn find_queue_family(instance: &ash::Instance, phd: vk::PhysicalDevice) -> Option<u32> {
     let families = unsafe { instance.get_physical_device_queue_family_properties(phd) };
     families.iter().enumerate().find_map(|(i, f)| {
-        let dominated = f
-            .queue_flags
-            .contains(vk::QueueFlags::COMPUTE | vk::QueueFlags::TRANSFER);
+        let dominated = f.queue_count > 0
+            && f.queue_flags
+                .contains(vk::QueueFlags::COMPUTE | vk::QueueFlags::TRANSFER);
         dominated.then_some(i as u32)
+    })
+}
+
+pub(crate) fn find_transfer_only_queue_family(
+    instance: &ash::Instance,
+    phd: vk::PhysicalDevice,
+) -> Option<u32> {
+    let families = unsafe { instance.get_physical_device_queue_family_properties(phd) };
+    families.iter().enumerate().find_map(|(i, f)| {
+        let transfer_only = f.queue_count > 0
+            && f.queue_flags.contains(vk::QueueFlags::TRANSFER)
+            && !f.queue_flags.intersects(vk::QueueFlags::GRAPHICS | vk::QueueFlags::COMPUTE);
+        transfer_only.then_some(i as u32)
     })
 }
 
@@ -195,18 +219,56 @@ pub(crate) fn create_instance(entry: &ash::Entry) -> Hc4jResult<ash::Instance> {
         .map_err(|e| Hc4jError::Device(format!("failed to create Vulkan 1.2 instance: {e}")))
 }
 
+pub(crate) struct CreatedDevice {
+    pub device: ash::Device,
+    pub queue: vk::Queue,
+    pub queue_family: u32,
+    pub send_queue: vk::Queue,
+    pub send_queue_family: u32,
+    pub send_queue_mode: &'static str,
+}
+
 pub(crate) fn create_device(
     instance: &ash::Instance,
     phd: vk::PhysicalDevice,
     ext: &ExtSupport,
-) -> Hc4jResult<(ash::Device, vk::Queue, u32)> {
+) -> Hc4jResult<CreatedDevice> {
     let qf = find_queue_family(instance, phd)
         .ok_or_else(|| Hc4jError::Device("no queue family with COMPUTE + TRANSFER".to_string()))?;
+    let families = unsafe { instance.get_physical_device_queue_family_properties(phd) };
+    let compute_q_count = families[qf as usize].queue_count;
+    let transfer_qf = find_transfer_only_queue_family(instance, phd);
 
-    let priorities = [1.0f32];
-    let queue_ci = vk::DeviceQueueCreateInfo::default()
-        .queue_family_index(qf)
-        .queue_priorities(&priorities);
+    let priorities_one = [1.0f32];
+    let priorities_two = [1.0f32, 1.0f32];
+    let mut queue_cis = Vec::with_capacity(2);
+    let (send_qf, send_queue_mode) = if let Some(tqf) = transfer_qf {
+        queue_cis.push(
+            vk::DeviceQueueCreateInfo::default()
+                .queue_family_index(qf)
+                .queue_priorities(&priorities_one),
+        );
+        queue_cis.push(
+            vk::DeviceQueueCreateInfo::default()
+                .queue_family_index(tqf)
+                .queue_priorities(&priorities_one),
+        );
+        (tqf, "dedicated-dma")
+    } else if compute_q_count >= 2 {
+        queue_cis.push(
+            vk::DeviceQueueCreateInfo::default()
+                .queue_family_index(qf)
+                .queue_priorities(&priorities_two),
+        );
+        (qf, "dual-queue")
+    } else {
+        queue_cis.push(
+            vk::DeviceQueueCreateInfo::default()
+                .queue_family_index(qf)
+                .queue_priorities(&priorities_one),
+        );
+        (qf, "shared-queue")
+    };
 
     let mut ext_names: Vec<*const i8> = Vec::new();
     #[cfg(target_os = "linux")]
@@ -238,7 +300,7 @@ pub(crate) fn create_device(
         .timeline_semaphore(ext.timeline_semaphore);
 
     let device_ci = vk::DeviceCreateInfo::default()
-        .queue_create_infos(std::slice::from_ref(&queue_ci))
+        .queue_create_infos(&queue_cis)
         .enabled_extension_names(&ext_names)
         .push_next(&mut features12);
 
@@ -246,8 +308,20 @@ pub(crate) fn create_device(
         .map_err(|e| Hc4jError::Device(format!("failed to create Vulkan logical device: {e}")))?;
 
     let queue = unsafe { device.get_device_queue(qf, 0) };
+    let send_queue = match send_queue_mode {
+        "dedicated-dma" => unsafe { device.get_device_queue(send_qf, 0) },
+        "dual-queue" => unsafe { device.get_device_queue(qf, 1) },
+        _ => queue,
+    };
 
-    Ok((device, queue, qf))
+    Ok(CreatedDevice {
+        device,
+        queue,
+        queue_family: qf,
+        send_queue,
+        send_queue_family: send_qf,
+        send_queue_mode,
+    })
 }
 
 pub(crate) fn build_node(
@@ -256,7 +330,13 @@ pub(crate) fn build_node(
     idx: usize,
 ) -> Hc4jResult<GpuNode> {
     let ext = probe_extensions(instance, phd);
-    let (device, queue, qf) = create_device(instance, phd, &ext)?;
+    let created = create_device(instance, phd, &ext)?;
+    let device = created.device;
+    let queue = created.queue;
+    let qf = created.queue_family;
+    let send_queue = created.send_queue;
+    let send_qf = created.send_queue_family;
+    let send_queue_mode = created.send_queue_mode;
 
     let props = unsafe { instance.get_physical_device_properties(phd) };
     let mem_props = unsafe { instance.get_physical_device_memory_properties(phd) };
@@ -269,8 +349,31 @@ pub(crate) fn build_node(
     let pool_ci = vk::CommandPoolCreateInfo::default()
         .queue_family_index(qf)
         .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
-    let cmd_pool = unsafe { device.create_command_pool(&pool_ci, None) }
-        .map_err(|e| Hc4jError::Device(format!("failed to create command pool: {e}")))?;
+    let cmd_pool = match unsafe { device.create_command_pool(&pool_ci, None) } {
+        Ok(p) => p,
+        Err(e) => {
+            unsafe { device.destroy_device(None) };
+            return Err(Hc4jError::Device(format!("failed to create command pool: {e}")));
+        }
+    };
+
+    let send_cmd_pool = if send_queue != queue {
+        let send_pool_ci = vk::CommandPoolCreateInfo::default()
+            .queue_family_index(send_qf)
+            .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
+        match unsafe { device.create_command_pool(&send_pool_ci, None) } {
+            Ok(p) => p,
+            Err(e) => {
+                unsafe {
+                    device.destroy_command_pool(cmd_pool, None);
+                    device.destroy_device(None);
+                }
+                return Err(Hc4jError::Device(format!("failed to create send command pool: {e}")));
+            }
+        }
+    } else {
+        cmd_pool
+    };
 
     #[cfg(target_os = "linux")]
     let fd_fn = ext
@@ -304,6 +407,10 @@ pub(crate) fn build_node(
         queue,
         queue_family: qf,
         cmd_pool,
+        send_queue,
+        send_queue_family: send_qf,
+        send_cmd_pool,
+        send_queue_mode,
         props,
         mem_props,
         driver_uuid,
@@ -377,15 +484,20 @@ pub(crate) fn enum_physical_devices(instance: &ash::Instance) -> Hc4jResult<Vec<
     Ok(filtered)
 }
 
-pub(crate) fn alloc_device_local(
+fn alloc_device_local_with_sharing(
     node: &GpuNode,
     size: vk::DeviceSize,
     usage: vk::BufferUsageFlags,
+    sharing_mode: vk::SharingMode,
+    queue_family_indices: &[u32],
 ) -> Hc4jResult<BufMem> {
-    let buf_ci = vk::BufferCreateInfo::default()
+    let mut buf_ci = vk::BufferCreateInfo::default()
         .size(size)
         .usage(usage)
-        .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        .sharing_mode(sharing_mode);
+    if sharing_mode == vk::SharingMode::CONCURRENT && !queue_family_indices.is_empty() {
+        buf_ci = buf_ci.queue_family_indices(queue_family_indices);
+    }
 
     let buffer = unsafe { node.device.create_buffer(&buf_ci, None) }
         .map_err(|e| Hc4jError::Device(format!("create_buffer failed: {e}")))?;
@@ -414,6 +526,27 @@ pub(crate) fn alloc_device_local(
     }
 
     Ok(BufMem { buffer, memory, size: req.size })
+}
+
+pub(crate) fn alloc_device_local(
+    node: &GpuNode,
+    size: vk::DeviceSize,
+    usage: vk::BufferUsageFlags,
+) -> Hc4jResult<BufMem> {
+    alloc_device_local_with_sharing(node, size, usage, vk::SharingMode::EXCLUSIVE, &[])
+}
+
+pub(crate) fn alloc_device_local_concurrent(
+    node: &GpuNode,
+    size: vk::DeviceSize,
+    usage: vk::BufferUsageFlags,
+) -> Hc4jResult<BufMem> {
+    if node.send_queue_family != node.queue_family {
+        let qfs = [node.queue_family, node.send_queue_family];
+        alloc_device_local_with_sharing(node, size, usage, vk::SharingMode::CONCURRENT, &qfs)
+    } else {
+        alloc_device_local_with_sharing(node, size, usage, vk::SharingMode::EXCLUSIVE, &[])
+    }
 }
 
 pub(crate) fn alloc_staging(

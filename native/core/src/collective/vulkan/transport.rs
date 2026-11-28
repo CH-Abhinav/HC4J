@@ -296,6 +296,8 @@ impl Drop for FdGuard {
 #[cfg(target_os = "linux")]
 pub(crate) struct LinuxHostAllocGuard {
     pub ptr: *mut std::ffi::c_void,
+    pub size: usize,
+    pub locked: bool,
 }
 
 #[cfg(target_os = "linux")]
@@ -308,9 +310,14 @@ impl Drop for LinuxHostAllocGuard {
     fn drop(&mut self) {
         if !self.ptr.is_null() {
             unsafe {
+                if self.locked {
+                    libc::munlock(self.ptr, self.size);
+                }
                 libc::free(self.ptr);
             }
             self.ptr = std::ptr::null_mut();
+            self.size = 0;
+            self.locked = false;
         }
     }
 }
@@ -320,14 +327,40 @@ pub(crate) fn alloc_aligned_host(
     size: usize,
     align: usize,
 ) -> Option<(*mut std::ffi::c_void, LinuxHostAllocGuard)> {
+    const TWO_MIB: usize = 2 * 1024 * 1024;
+    let alloc_size = size.max(1);
+    let base_align = align.max(std::mem::size_of::<*mut std::ffi::c_void>());
     let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
-    let aligned = align.max(std::mem::size_of::<*mut std::ffi::c_void>());
-    let rc = unsafe { libc::posix_memalign(&mut ptr, aligned, size.max(1)) };
+
+    let mut rc = if alloc_size >= TWO_MIB {
+        let huge_align = base_align.max(TWO_MIB);
+        unsafe { libc::posix_memalign(&mut ptr, huge_align, alloc_size) }
+    } else {
+        -1
+    };
+    if rc != 0 || ptr.is_null() {
+        ptr = std::ptr::null_mut();
+        rc = unsafe { libc::posix_memalign(&mut ptr, base_align, alloc_size) };
+    }
     if rc != 0 || ptr.is_null() {
         return None;
     }
-    unsafe { std::ptr::write_bytes(ptr, 0, size.max(1)) };
-    Some((ptr, LinuxHostAllocGuard { ptr }))
+
+    unsafe {
+        if alloc_size >= TWO_MIB {
+            let _ = libc::madvise(ptr, alloc_size, libc::MADV_HUGEPAGE);
+        }
+        std::ptr::write_bytes(ptr, 0, alloc_size);
+    }
+    let locked = unsafe { libc::mlock(ptr, alloc_size) == 0 };
+    Some((
+        ptr,
+        LinuxHostAllocGuard {
+            ptr,
+            size: alloc_size,
+            locked,
+        },
+    ))
 }
 
 // ── Linux External Memory FD Transport (OPAQUE_FD & dma_buf) ────────────────
@@ -984,6 +1017,7 @@ pub(crate) enum EdgeSlotBacking {
     Tier1_5Host {
         host_buf_src: BufMem,
         host_buf_dst: BufMem,
+        dst_supports_storage: bool,
         #[cfg(target_os = "windows")]
         _host_guard: VirtualAllocGuard,
         #[cfg(target_os = "linux")]
@@ -1093,16 +1127,20 @@ impl EdgeSlotBacking {
                 let host_buf_src = alloc_host_imported(src, host_ptr, aligned_size, xfer_usage)
                     .ok_or_else(|| Hc4jError::Device("Persistent Tier 1.5 import on src failed".to_string()))?;
                 let dst_usage_storage = xfer_usage | vk::BufferUsageFlags::STORAGE_BUFFER;
-                let host_buf_dst = alloc_host_imported(dst, host_ptr, aligned_size, dst_usage_storage)
-                    .or_else(|| alloc_host_imported(dst, host_ptr, aligned_size, xfer_usage))
-                    .ok_or_else(|| {
+                let (host_buf_dst, dst_supports_storage) =
+                    if let Some(buf) = alloc_host_imported(dst, host_ptr, aligned_size, dst_usage_storage) {
+                        (buf, true)
+                    } else if let Some(buf) = alloc_host_imported(dst, host_ptr, aligned_size, xfer_usage) {
+                        (buf, false)
+                    } else {
                         destroy_buf(src, &host_buf_src);
-                        Hc4jError::Device("Persistent Tier 1.5 import on dst failed".to_string())
-                    })?;
+                        return Err(Hc4jError::Device("Persistent Tier 1.5 import on dst failed".to_string()));
+                    };
 
                 Ok(EdgeSlotBacking::Tier1_5Host {
                     host_buf_src,
                     host_buf_dst,
+                    dst_supports_storage,
                     _host_guard: host_guard,
                 })
             }
@@ -1166,6 +1204,15 @@ impl EdgeSlotBacking {
     }
 
     #[inline]
+    fn dst_supports_storage(&self) -> bool {
+        match self {
+            #[cfg(any(target_os = "windows", target_os = "linux"))]
+            EdgeSlotBacking::Tier1_5Host { dst_supports_storage, .. } => *dst_supports_storage,
+            _ => false,
+        }
+    }
+
+    #[inline]
     fn copy_host_if_staged(&self, bytes: vk::DeviceSize) {
         if bytes == 0 {
             return;
@@ -1184,7 +1231,7 @@ impl EdgeSlotBacking {
                 destroy_buf(src, &export_buf);
             }
             #[cfg(any(target_os = "windows", target_os = "linux"))]
-            EdgeSlotBacking::Tier1_5Host { host_buf_src, host_buf_dst, _host_guard } => {
+            EdgeSlotBacking::Tier1_5Host { host_buf_src, host_buf_dst, _host_guard, .. } => {
                 destroy_buf(dst, &host_buf_dst);
                 destroy_buf(src, &host_buf_src);
                 drop(_host_guard);
@@ -1221,6 +1268,11 @@ impl EdgeSlot {
 
     pub fn dst_buffer(&self) -> vk::Buffer {
         self.backing.as_ref().expect("EdgeSlot destroyed").dst_buffer()
+    }
+
+    #[inline]
+    pub fn dst_supports_storage(&self) -> bool {
+        self.backing.as_ref().is_some_and(|b| b.dst_supports_storage())
     }
 
     #[inline]
@@ -1271,11 +1323,11 @@ impl EdgeChannel {
         src: &GpuNode,
         dst: &GpuNode,
         needed_bytes: vk::DeviceSize,
-    ) -> Hc4jResult<()> {
+    ) -> Hc4jResult<bool> {
         let req = needed_bytes.max(4);
         let needs_grow = self.slots.iter().any(|s| s.capacity < req);
         if !needs_grow {
-            return Ok(());
+            return Ok(false);
         }
         unsafe {
             src.device.device_wait_idle().ok();
@@ -1287,7 +1339,7 @@ impl EdgeChannel {
                 *slot = EdgeSlot::new(src, dst, self.tier, req)?;
             }
         }
-        Ok(())
+        Ok(true)
     }
 
     #[inline]
@@ -1324,12 +1376,11 @@ impl EdgeChannelCache {
         dst_idx: usize,
         tier: TransportTier,
         slot_bytes: vk::DeviceSize,
-    ) -> Hc4jResult<&EdgeChannel> {
+    ) -> Hc4jResult<bool> {
         let key = (src_idx, dst_idx);
         if let Some(existing) = self.edges.get_mut(&key) {
             if existing.tier.transport_code() == tier.transport_code() {
-                existing.ensure_capacity(src, dst, slot_bytes)?;
-                return Ok(self.edges.get(&key).unwrap());
+                return existing.ensure_capacity(src, dst, slot_bytes);
             }
             unsafe {
                 src.device.device_wait_idle().ok();
@@ -1340,7 +1391,8 @@ impl EdgeChannelCache {
             }
         }
         let ch = EdgeChannel::create(src, dst, tier, slot_bytes)?;
-        Ok(self.edges.entry(key).or_insert(ch))
+        self.edges.insert(key, ch);
+        Ok(true)
     }
 
     #[inline]
