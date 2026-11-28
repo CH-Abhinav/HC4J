@@ -1,3 +1,9 @@
+abstract class GpuTestLockService implements org.gradle.api.services.BuildService<org.gradle.api.services.BuildServiceParameters.None> {}
+
+def gpuTestLock = gradle.sharedServices.registerIfAbsent('gpuTestLock', GpuTestLockService) {
+    maxParallelUsages.set(1)
+}
+
 subprojects {
     apply plugin: 'java'
 
@@ -22,5 +28,9 @@ subprojects {
     tasks.withType(Javadoc).configureEach {
         options.encoding = 'UTF-8'
         options.addStringOption('Xdoclint:all,-missing', '-quiet')
+    }
+
+    tasks.withType(Test).configureEach {
+        usesService(gpuTestLock)
     }
 }

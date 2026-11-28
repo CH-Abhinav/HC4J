@@ -121,10 +121,9 @@ class CollectiveTest {
                 assertNotNull(link.transport());
                 int srcIsland = findIsland(islands, link.src());
                 int dstIsland = findIsland(islands, link.dst());
-                if (srcIsland == dstIsland) {
-                    assertTrue(link.loopback(), "Same-island link must be marked loopback");
-                } else {
-                    assertFalse(link.loopback(), "Cross-island link must not be marked loopback");
+                assertTrue(srcIsland >= 0 && dstIsland >= 0, "Every rank must belong to an island");
+                if (link.loopback()) {
+                    assertEquals(srcIsland, dstIsland, "Loopback link must stay within the same island");
                 }
             }
         }

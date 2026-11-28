@@ -12,7 +12,7 @@ pub(crate) mod topology;
 pub(crate) mod transport;
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::sync::atomic::{AtomicU64, Ordering};
 use ash::vk;
 
@@ -22,13 +22,29 @@ use crate::collective::vulkan::device::{BufMem, GpuNode, alloc_device_local, all
 use crate::collective::vulkan::pipeline::{RankComputePipelines, ReducePipeline};
 use crate::collective::vulkan::ring::execute_allreduce;
 use crate::collective::vulkan::topology::{TopoGraph, build_topology_and_profiles};
+use crate::collective::vulkan::transport::EdgeChannelCache;
 use crate::engine::error::{Hc4jError, Hc4jResult};
 
+/// Process-wide loaded Vulkan entry point. Kept resident for process lifetime so
+/// dropping a `VulkanP2pBackend` never `dlclose`s `libvulkan.so.1` while `wgpu`'s
+/// static GPU engine still holds active Vulkan objects on Linux.
+static VULKAN_ENTRY: OnceLock<Result<ash::Entry, String>> = OnceLock::new();
+
+fn get_vulkan_entry() -> Hc4jResult<&'static ash::Entry> {
+    VULKAN_ENTRY
+        .get_or_init(|| {
+            unsafe { ash::Entry::load() }
+                .map_err(|e| format!("failed to load Vulkan entry point: {e}"))
+        })
+        .as_ref()
+        .map_err(|msg| Hc4jError::Device(msg.clone()))
+}
+
 pub struct VulkanP2pBackend {
-    _entry: ash::Entry,
     instance: ash::Instance,
     nodes: Vec<GpuNode>,
     rank_pipelines: Vec<Mutex<RankComputePipelines>>,
+    edge_channels: Mutex<EdgeChannelCache>,
     graph: TopoGraph,
     profiles: Vec<DeviceProfileC>,
     ring_order: Vec<u32>,
@@ -43,10 +59,9 @@ impl VulkanP2pBackend {
             return Err(Hc4jError::InvalidParam("collective needs at least 1 rank"));
         }
 
-        let entry = unsafe { ash::Entry::load() }
-            .map_err(|e| Hc4jError::Device(format!("failed to load Vulkan entry point: {e}")))?;
+        let entry = get_vulkan_entry()?;
 
-        let instance = create_instance(&entry)?;
+        let instance = create_instance(entry)?;
 
         let phds = enum_physical_devices(&instance)?;
         let num_physical = phds.len();
@@ -164,10 +179,10 @@ impl VulkanP2pBackend {
         );
 
         Ok(Self {
-            _entry: entry,
             instance,
             nodes,
             rank_pipelines,
+            edge_channels: Mutex::new(EdgeChannelCache::new()),
             graph,
             profiles,
             ring_order,
@@ -402,9 +417,11 @@ impl CollectiveBackend for VulkanP2pBackend {
             raw_buffers[r] = b;
         }
 
+        let mut channels = self.edge_channels.lock().unwrap();
         execute_allreduce(
             &self.nodes,
             &mut pipes,
+            &mut channels,
             &self.graph,
             &raw_buffers,
             elements,
@@ -576,24 +593,29 @@ impl Drop for VulkanP2pBackend {
             }
         }
 
-        // 2. Free all user allocated buffers
+        // 2. Destroy cached persistent edge channels before devices are destroyed
+        if let Ok(mut channels) = self.edge_channels.lock() {
+            channels.destroy_all(&self.nodes);
+        }
+
+        // 3. Free all user allocated buffers
         let mut user_bufs = self.buffers.lock().unwrap();
         for (_, (rank, buf, _)) in user_bufs.drain() {
             destroy_buf(&self.nodes[rank], &buf);
         }
 
-        // 3. Destroy all pipelines, scratch buffers, and descriptor pools
+        // 4. Destroy all pipelines, scratch buffers, fences, CBs, and descriptor pools
         for (i, mutex) in self.rank_pipelines.iter().enumerate() {
             let mut pipes = mutex.lock().unwrap();
             pipes.destroy(&self.nodes[i]);
         }
 
-        // 4. Destroy all GpuNodes (command pools & logical devices)
+        // 5. Destroy all GpuNodes (command pools & logical devices)
         for node in &self.nodes {
             node.destroy();
         }
 
-        // 5. Destroy Vulkan instance
+        // 6. Destroy Vulkan instance
         unsafe {
             self.instance.destroy_instance(None);
         }
@@ -707,6 +729,52 @@ mod tests {
     }
 
     #[test]
+    fn test_vulkan_p2p_large_pipelined_and_prime_allreduce() {
+        let backend = match VulkanP2pBackend::new(2) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("Skipping Vulkan test (ICD unavailable): {e}");
+                return;
+            }
+        };
+
+        // Cover uneven prime lengths (1, 7, 1003) and large >= 2 MiB chunk sizes
+        // that exercise double-buffered sub-chunk pipelining (4 MiB = S=4, 16 MiB = S=8).
+        for &len in &[1usize, 7, 1003, 1_048_576, 4_194_304] {
+            let b0 = backend.alloc(0, len as u64).expect("alloc b0");
+            let b1 = backend.alloc(1, len as u64).expect("alloc b1");
+
+            let d0: Vec<f32> = (0..len).map(|i| ((i % 97) as f32) * 0.25 + 1.5).collect();
+            let d1: Vec<f32> = (0..len).map(|i| ((i % 53) as f32) * 0.5 - 3.25).collect();
+
+            backend.write(b0, &d0).expect("write b0");
+            backend.write(b1, &d1).expect("write b1");
+
+            // Run twice so pass 2 exercises 100% persistent EdgeChannel reuse without reallocation
+            backend.allreduce_sum(&[b0, b1]).expect("allreduce_sum pass 1");
+            backend.allreduce_sum(&[b0, b1]).expect("allreduce_sum pass 2");
+
+            let mut out0 = vec![0.0f32; len];
+            let mut out1 = vec![0.0f32; len];
+            backend.read(b0, &mut out0).expect("read b0");
+            backend.read(b1, &mut out1).expect("read b1");
+
+            for i in 0..len {
+                let expected = 2.0 * (d0[i] + d1[i]);
+                assert!(
+                    (out0[i] - expected).abs() < 1e-4 && (out1[i] - expected).abs() < 1e-4,
+                    "len={len} mismatch at {i}: got ({}, {}), expected {expected}",
+                    out0[i],
+                    out1[i]
+                );
+            }
+
+            backend.free(b0).expect("free b0");
+            backend.free(b1).expect("free b1");
+        }
+    }
+
+    #[test]
     fn test_vulkan_p2p_25_iterations_stress() {
         let backend = match VulkanP2pBackend::new(2) {
             Ok(b) => b,
@@ -805,6 +873,31 @@ mod tests {
 
             backend.free(b0).expect("free b0");
             backend.free(b1).expect("free b1");
+
+            // Also verify persistent channel growth + >= 2 MiB sub-chunk pipelining on every tier
+            let big_len = 1_048_576usize;
+            let big0 = backend.alloc(0, big_len as u64).expect("alloc big0");
+            let big1 = backend.alloc(1, big_len as u64).expect("alloc big1");
+            let d0: Vec<f32> = (0..big_len).map(|i| ((i % 31) as f32) * 0.25 + 1.0).collect();
+            let d1: Vec<f32> = (0..big_len).map(|i| ((i % 19) as f32) * 0.5 - 2.0).collect();
+            backend.write(big0, &d0).expect("write big0");
+            backend.write(big1, &d1).expect("write big1");
+            backend.allreduce_sum(&[big0, big1]).expect("allreduce_sum pipelined");
+            let mut r0 = vec![0.0f32; big_len];
+            let mut r1 = vec![0.0f32; big_len];
+            backend.read(big0, &mut r0).expect("read big0");
+            backend.read(big1, &mut r1).expect("read big1");
+            for i in (0..big_len).step_by(997) {
+                let exp = d0[i] + d1[i];
+                assert!(
+                    (r0[i] - exp).abs() < 1e-4 && (r1[i] - exp).abs() < 1e-4,
+                    "tier={tier_name} pipelined mismatch at {i}: got ({}, {}), expected {exp}",
+                    r0[i],
+                    r1[i]
+                );
+            }
+            backend.free(big0).expect("free big0");
+            backend.free(big1).expect("free big1");
         }
 
         unsafe { std::env::remove_var("HC4J_COLLECTIVE_FORCE_TIER") };

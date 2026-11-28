@@ -1,6 +1,7 @@
 //! Memory transport engine: Tier 1 (Linux OPAQUE_FD / dma_buf, Windows OPAQUE_WIN32),
 //! Tier 1.5 (VK_EXT_external_memory_host), and Tier 2 (staged + Timeline Semaphores).
 
+use std::collections::HashMap;
 use ash::vk;
 
 use crate::collective::backend::{
@@ -8,6 +9,16 @@ use crate::collective::backend::{
 };
 use crate::collective::vulkan::device::{BufMem, GpuNode, alloc_staging, destroy_buf, find_mem_type, one_shot_submit};
 use crate::engine::error::{Hc4jError, Hc4jResult};
+
+/// Number of double-buffered transport slots per directed GPU->GPU edge.
+pub(crate) const EDGE_PIPELINE_SLOTS: usize = 2;
+
+/// Wrapper allowing raw mapped host/device pointers stored under synchronization
+/// mutexes to satisfy `Send + Sync` cleanly across the Vulkan backend.
+#[derive(Clone, Copy)]
+pub(crate) struct SendMutPtr<T>(pub *mut T);
+unsafe impl<T> Send for SendMutPtr<T> {}
+unsafe impl<T> Sync for SendMutPtr<T> {}
 
 /// Native external memory handle mechanism backing a directed link.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -240,6 +251,11 @@ pub(crate) struct VirtualAllocGuard {
 }
 
 #[cfg(target_os = "windows")]
+unsafe impl Send for VirtualAllocGuard {}
+#[cfg(target_os = "windows")]
+unsafe impl Sync for VirtualAllocGuard {}
+
+#[cfg(target_os = "windows")]
 impl Drop for VirtualAllocGuard {
     fn drop(&mut self) {
         if !self.ptr.is_null() {
@@ -281,6 +297,11 @@ impl Drop for FdGuard {
 pub(crate) struct LinuxHostAllocGuard {
     pub ptr: *mut std::ffi::c_void,
 }
+
+#[cfg(target_os = "linux")]
+unsafe impl Send for LinuxHostAllocGuard {}
+#[cfg(target_os = "linux")]
+unsafe impl Sync for LinuxHostAllocGuard {}
 
 #[cfg(target_os = "linux")]
 impl Drop for LinuxHostAllocGuard {
@@ -946,6 +967,392 @@ pub(crate) fn transfer_route(
         }
         TransportTier::Tier2Staging { .. } => {
             transfer_tier2(src, dst, src_buf, src_offset, dst_recv, dst_offset, size)
+        }
+    }
+}
+
+// ── Persistent Per-Edge Double-Buffered Channels (Fix 1) ────────────────────
+
+pub(crate) enum EdgeSlotBacking {
+    Tier1 {
+        export_buf: BufMem,
+        imported_buf: BufMem,
+        #[cfg(target_os = "windows")]
+        _win32_guard: Win32HandleGuard,
+    },
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
+    Tier1_5Host {
+        host_buf_src: BufMem,
+        host_buf_dst: BufMem,
+        #[cfg(target_os = "windows")]
+        _host_guard: VirtualAllocGuard,
+        #[cfg(target_os = "linux")]
+        _host_guard: LinuxHostAllocGuard,
+    },
+    Tier2Staged {
+        staging_src: BufMem,
+        staging_dst: BufMem,
+        src_ptr: SendMutPtr<u8>,
+        dst_ptr: SendMutPtr<u8>,
+    },
+}
+
+impl EdgeSlotBacking {
+    fn allocate(
+        src: &GpuNode,
+        dst: &GpuNode,
+        tier: TransportTier,
+        slot_bytes: vk::DeviceSize,
+    ) -> Hc4jResult<Self> {
+        let size = slot_bytes.max(4);
+        let xfer_usage = vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST;
+        match tier {
+            TransportTier::Tier1P2P { handle_kind, .. } => {
+                #[cfg(target_os = "linux")]
+                {
+                    let vk_handle_ty = handle_kind.to_vk_fd_handle_type();
+                    let export_buf = alloc_exportable_fd(src, size, xfer_usage, vk_handle_ty)
+                        .ok_or_else(|| Hc4jError::Device("Persistent Tier 1 FD export alloc failed".to_string()))?;
+                    let fd = match export_memory_fd(src, export_buf.memory, vk_handle_ty) {
+                        Some(fd) => fd,
+                        None => {
+                            destroy_buf(src, &export_buf);
+                            return Err(Hc4jError::Device("Persistent Tier 1 FD export failed".to_string()));
+                        }
+                    };
+                    let imported_buf = match import_memory_fd(dst, size, fd, xfer_usage, vk_handle_ty) {
+                        Some(b) => b,
+                        None => {
+                            destroy_buf(src, &export_buf);
+                            return Err(Hc4jError::Device("Persistent Tier 1 FD import failed".to_string()));
+                        }
+                    };
+                    Ok(EdgeSlotBacking::Tier1 { export_buf, imported_buf })
+                }
+                #[cfg(target_os = "windows")]
+                {
+                    let _ = handle_kind;
+                    let export_buf = alloc_exportable_win32(src, size, xfer_usage)
+                        .ok_or_else(|| Hc4jError::Device("Persistent Tier 1 Win32 export alloc failed".to_string()))?;
+                    let handle = match export_win32_handle(src, export_buf.memory) {
+                        Some(h) => h,
+                        None => {
+                            destroy_buf(src, &export_buf);
+                            return Err(Hc4jError::Device("Persistent Tier 1 Win32 handle export failed".to_string()));
+                        }
+                    };
+                    let guard = Win32HandleGuard(handle);
+                    let imported_buf = match import_win32_handle(dst, size, handle, xfer_usage) {
+                        Some(b) => b,
+                        None => {
+                            drop(guard);
+                            destroy_buf(src, &export_buf);
+                            return Err(Hc4jError::Device("Persistent Tier 1 Win32 handle import failed".to_string()));
+                        }
+                    };
+                    Ok(EdgeSlotBacking::Tier1 {
+                        export_buf,
+                        imported_buf,
+                        _win32_guard: guard,
+                    })
+                }
+                #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+                {
+                    let _ = (src, dst, handle_kind, size, xfer_usage);
+                    Err(Hc4jError::Unsupported("Tier 1 P2P not supported on this OS"))
+                }
+            }
+            #[cfg(any(target_os = "windows", target_os = "linux"))]
+            TransportTier::Tier1_5HostMem { .. } => {
+                let align = src.min_host_ptr_align.max(dst.min_host_ptr_align).max(4096);
+                let aligned_size = (size + align - 1) & !(align - 1);
+
+                #[cfg(target_os = "windows")]
+                let (host_ptr, host_guard) = {
+                    use windows_sys::Win32::System::Memory::{
+                        VirtualAlloc, MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE,
+                    };
+                    let ptr = unsafe {
+                        VirtualAlloc(
+                            std::ptr::null(),
+                            aligned_size as usize,
+                            MEM_COMMIT | MEM_RESERVE,
+                            PAGE_READWRITE,
+                        )
+                    };
+                    if ptr.is_null() {
+                        return Err(Hc4jError::OutOfMemory);
+                    }
+                    (ptr, VirtualAllocGuard { ptr })
+                };
+
+                #[cfg(target_os = "linux")]
+                let (host_ptr, host_guard) = alloc_aligned_host(aligned_size as usize, align as usize)
+                    .ok_or(Hc4jError::OutOfMemory)?;
+
+                let host_buf_src = alloc_host_imported(src, host_ptr, aligned_size, xfer_usage)
+                    .ok_or_else(|| Hc4jError::Device("Persistent Tier 1.5 import on src failed".to_string()))?;
+                let dst_usage_storage = xfer_usage | vk::BufferUsageFlags::STORAGE_BUFFER;
+                let host_buf_dst = alloc_host_imported(dst, host_ptr, aligned_size, dst_usage_storage)
+                    .or_else(|| alloc_host_imported(dst, host_ptr, aligned_size, xfer_usage))
+                    .ok_or_else(|| {
+                        destroy_buf(src, &host_buf_src);
+                        Hc4jError::Device("Persistent Tier 1.5 import on dst failed".to_string())
+                    })?;
+
+                Ok(EdgeSlotBacking::Tier1_5Host {
+                    host_buf_src,
+                    host_buf_dst,
+                    _host_guard: host_guard,
+                })
+            }
+            TransportTier::Tier2Staging { .. } => {
+                let staging_src = alloc_staging(src, size, xfer_usage)?;
+                let staging_dst = match alloc_staging(dst, size, xfer_usage) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        destroy_buf(src, &staging_src);
+                        return Err(e);
+                    }
+                };
+                let src_ptr = match unsafe {
+                    src.device.map_memory(staging_src.memory, 0, staging_src.size, vk::MemoryMapFlags::empty())
+                } {
+                    Ok(p) => SendMutPtr(p as *mut u8),
+                    Err(e) => {
+                        destroy_buf(dst, &staging_dst);
+                        destroy_buf(src, &staging_src);
+                        return Err(Hc4jError::Device(format!("persistent map_memory src failed: {e}")));
+                    }
+                };
+                let dst_ptr = match unsafe {
+                    dst.device.map_memory(staging_dst.memory, 0, staging_dst.size, vk::MemoryMapFlags::empty())
+                } {
+                    Ok(p) => SendMutPtr(p as *mut u8),
+                    Err(e) => {
+                        unsafe { src.device.unmap_memory(staging_src.memory) };
+                        destroy_buf(dst, &staging_dst);
+                        destroy_buf(src, &staging_src);
+                        return Err(Hc4jError::Device(format!("persistent map_memory dst failed: {e}")));
+                    }
+                };
+
+                Ok(EdgeSlotBacking::Tier2Staged {
+                    staging_src,
+                    staging_dst,
+                    src_ptr,
+                    dst_ptr,
+                })
+            }
+        }
+    }
+
+    fn src_buffer(&self) -> vk::Buffer {
+        match self {
+            EdgeSlotBacking::Tier1 { export_buf, .. } => export_buf.buffer,
+            #[cfg(any(target_os = "windows", target_os = "linux"))]
+            EdgeSlotBacking::Tier1_5Host { host_buf_src, .. } => host_buf_src.buffer,
+            EdgeSlotBacking::Tier2Staged { staging_src, .. } => staging_src.buffer,
+        }
+    }
+
+    fn dst_buffer(&self) -> vk::Buffer {
+        match self {
+            EdgeSlotBacking::Tier1 { imported_buf, .. } => imported_buf.buffer,
+            #[cfg(any(target_os = "windows", target_os = "linux"))]
+            EdgeSlotBacking::Tier1_5Host { host_buf_dst, .. } => host_buf_dst.buffer,
+            EdgeSlotBacking::Tier2Staged { staging_dst, .. } => staging_dst.buffer,
+        }
+    }
+
+    #[inline]
+    fn copy_host_if_staged(&self, bytes: vk::DeviceSize) {
+        if bytes == 0 {
+            return;
+        }
+        if let EdgeSlotBacking::Tier2Staged { src_ptr, dst_ptr, .. } = self {
+            unsafe {
+                std::ptr::copy_nonoverlapping(src_ptr.0, dst_ptr.0, bytes as usize);
+            }
+        }
+    }
+
+    fn destroy(self, src: &GpuNode, dst: &GpuNode) {
+        match self {
+            EdgeSlotBacking::Tier1 { export_buf, imported_buf, .. } => {
+                destroy_buf(dst, &imported_buf);
+                destroy_buf(src, &export_buf);
+            }
+            #[cfg(any(target_os = "windows", target_os = "linux"))]
+            EdgeSlotBacking::Tier1_5Host { host_buf_src, host_buf_dst, _host_guard } => {
+                destroy_buf(dst, &host_buf_dst);
+                destroy_buf(src, &host_buf_src);
+                drop(_host_guard);
+            }
+            EdgeSlotBacking::Tier2Staged { staging_src, staging_dst, .. } => {
+                unsafe {
+                    src.device.unmap_memory(staging_src.memory);
+                    dst.device.unmap_memory(staging_dst.memory);
+                }
+                destroy_buf(dst, &staging_dst);
+                destroy_buf(src, &staging_src);
+            }
+        }
+    }
+}
+
+pub(crate) struct EdgeSlot {
+    pub capacity: vk::DeviceSize,
+    backing: Option<EdgeSlotBacking>,
+}
+
+impl EdgeSlot {
+    fn new(src: &GpuNode, dst: &GpuNode, tier: TransportTier, capacity: vk::DeviceSize) -> Hc4jResult<Self> {
+        let backing = EdgeSlotBacking::allocate(src, dst, tier, capacity)?;
+        Ok(Self {
+            capacity,
+            backing: Some(backing),
+        })
+    }
+
+    pub fn src_buffer(&self) -> vk::Buffer {
+        self.backing.as_ref().expect("EdgeSlot destroyed").src_buffer()
+    }
+
+    pub fn dst_buffer(&self) -> vk::Buffer {
+        self.backing.as_ref().expect("EdgeSlot destroyed").dst_buffer()
+    }
+
+    #[inline]
+    pub fn copy_host_if_staged(&self, bytes: vk::DeviceSize) {
+        if let Some(b) = &self.backing {
+            b.copy_host_if_staged(bytes);
+        }
+    }
+
+    fn destroy(&mut self, src: &GpuNode, dst: &GpuNode) {
+        self.capacity = 0;
+        if let Some(b) = self.backing.take() {
+            b.destroy(src, dst);
+        }
+    }
+}
+
+pub(crate) struct EdgeChannel {
+    pub tier: TransportTier,
+    slots: Vec<EdgeSlot>,
+}
+
+impl EdgeChannel {
+    fn create(
+        src: &GpuNode,
+        dst: &GpuNode,
+        tier: TransportTier,
+        slot_bytes: vk::DeviceSize,
+    ) -> Hc4jResult<Self> {
+        let cap = slot_bytes.max(4);
+        let mut slots = Vec::with_capacity(EDGE_PIPELINE_SLOTS);
+        for _ in 0..EDGE_PIPELINE_SLOTS {
+            match EdgeSlot::new(src, dst, tier, cap) {
+                Ok(slot) => slots.push(slot),
+                Err(e) => {
+                    for s in &mut slots {
+                        s.destroy(src, dst);
+                    }
+                    return Err(e);
+                }
+            }
+        }
+        Ok(Self { tier, slots })
+    }
+
+    fn ensure_capacity(
+        &mut self,
+        src: &GpuNode,
+        dst: &GpuNode,
+        needed_bytes: vk::DeviceSize,
+    ) -> Hc4jResult<()> {
+        let req = needed_bytes.max(4);
+        let needs_grow = self.slots.iter().any(|s| s.capacity < req);
+        if !needs_grow {
+            return Ok(());
+        }
+        unsafe {
+            src.device.device_wait_idle().ok();
+            dst.device.device_wait_idle().ok();
+        }
+        for slot in &mut self.slots {
+            if slot.capacity < req {
+                slot.destroy(src, dst);
+                *slot = EdgeSlot::new(src, dst, self.tier, req)?;
+            }
+        }
+        Ok(())
+    }
+
+    #[inline]
+    pub fn slot(&self, idx: usize) -> &EdgeSlot {
+        &self.slots[idx % EDGE_PIPELINE_SLOTS]
+    }
+
+    fn destroy(&mut self, src: &GpuNode, dst: &GpuNode) {
+        for slot in &mut self.slots {
+            slot.destroy(src, dst);
+        }
+        self.slots.clear();
+    }
+}
+
+/// Cache of persistent double-buffered directed edge channels `(src_rank, dst_rank)`.
+#[derive(Default)]
+pub(crate) struct EdgeChannelCache {
+    edges: HashMap<(usize, usize), EdgeChannel>,
+}
+
+impl EdgeChannelCache {
+    pub fn new() -> Self {
+        Self {
+            edges: HashMap::new(),
+        }
+    }
+
+    pub fn ensure_edge(
+        &mut self,
+        src: &GpuNode,
+        dst: &GpuNode,
+        src_idx: usize,
+        dst_idx: usize,
+        tier: TransportTier,
+        slot_bytes: vk::DeviceSize,
+    ) -> Hc4jResult<&EdgeChannel> {
+        let key = (src_idx, dst_idx);
+        if let Some(existing) = self.edges.get_mut(&key) {
+            if existing.tier.transport_code() == tier.transport_code() {
+                existing.ensure_capacity(src, dst, slot_bytes)?;
+                return Ok(self.edges.get(&key).unwrap());
+            }
+            unsafe {
+                src.device.device_wait_idle().ok();
+                dst.device.device_wait_idle().ok();
+            }
+            if let Some(mut old) = self.edges.remove(&key) {
+                old.destroy(src, dst);
+            }
+        }
+        let ch = EdgeChannel::create(src, dst, tier, slot_bytes)?;
+        Ok(self.edges.entry(key).or_insert(ch))
+    }
+
+    #[inline]
+    pub fn edge(&self, src_idx: usize, dst_idx: usize) -> &EdgeChannel {
+        self.edges
+            .get(&(src_idx, dst_idx))
+            .expect("BUG: EdgeChannel not ensured before use")
+    }
+
+    pub fn destroy_all(&mut self, nodes: &[GpuNode]) {
+        for ((src_idx, dst_idx), mut channel) in self.edges.drain() {
+            channel.destroy(&nodes[src_idx], &nodes[dst_idx]);
         }
     }
 }

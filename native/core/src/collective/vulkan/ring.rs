@@ -1,21 +1,290 @@
-//! Balanced uneven chunk partitioning and N-rank Ring / Hierarchical AllReduce execution.
+//! Balanced uneven chunk partitioning and zero-copy bidirectional pipelined Ring / Hierarchical AllReduce.
 
 use ash::vk;
 
 use crate::collective::backend::LinkInfo;
-use crate::collective::planner::{solve_optimal_ring, IslandInfo};
-use crate::collective::vulkan::device::{GpuNode, one_shot_submit};
-use crate::collective::vulkan::pipeline::ReducePipeline;
+use crate::collective::planner::{IslandInfo, solve_optimal_ring};
+use crate::collective::vulkan::device::GpuNode;
+use crate::collective::vulkan::pipeline::{ReducePipeline, submit_cb_with_fence};
 use crate::collective::vulkan::topology::TopoGraph;
-use crate::collective::vulkan::transport::transfer_route;
+use crate::collective::vulkan::transport::{EDGE_PIPELINE_SLOTS, EdgeChannelCache};
 use crate::engine::error::{Hc4jError, Hc4jResult};
 
 pub(crate) use crate::collective::planner::chunk_range;
 
-/// Executes an ordered Ring AllReduce (sum) across participating ranks in `order`.
+/// Chunks >= 2 MiB are split across 4..8 double-buffered sub-slices to overlap
+/// source-GPU writes with destination-GPU reads/reductions.
+const SUBCHUNK_PIPELINE_THRESHOLD_BYTES: vk::DeviceSize = 2 * 1024 * 1024;
+
+#[inline]
+fn sub_slice_count(max_chunk_bytes: vk::DeviceSize) -> usize {
+    if max_chunk_bytes < SUBCHUNK_PIPELINE_THRESHOLD_BYTES {
+        1
+    } else {
+        ((max_chunk_bytes / (1024 * 1024)) as usize).clamp(4, 8)
+    }
+}
+
+fn drain_ranks_idle(nodes: &[GpuNode], order: &[usize]) {
+    for &rank in order {
+        unsafe {
+            nodes[rank].device.device_wait_idle().ok();
+        }
+    }
+}
+
+fn wait_slot_fences(
+    nodes: &[GpuNode],
+    order: &[usize],
+    pipelines: &[Option<&mut ReducePipeline>],
+    slot: usize,
+    is_recv: bool,
+    active: &mut [[bool; EDGE_PIPELINE_SLOTS]],
+) -> Hc4jResult<()> {
+    for (pos, flags) in active.iter_mut().enumerate() {
+        if flags[slot] {
+            let rank = order[pos];
+            let sync = pipelines[rank].as_deref().unwrap().sync(slot);
+            let fence = if is_recv { sync.recv_fence } else { sync.send_fence };
+            unsafe {
+                nodes[rank]
+                    .device
+                    .wait_for_fences(std::slice::from_ref(&fence), true, u64::MAX)
+                    .map_err(|e| Hc4jError::Device(format!("wait_for_fences failed: {e}")))?;
+            }
+            flags[slot] = false;
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn submit_step_a_send_slice(
+    nodes: &[GpuNode],
+    pipelines: &[Option<&mut ReducePipeline>],
+    channels: &EdgeChannelCache,
+    order: &[usize],
+    user_buffers: &[vk::Buffer],
+    chunk_ranges: &[(usize, usize)],
+    num_slices: usize,
+    slice_idx: usize,
+    slot: usize,
+    send_active: &mut [[bool; EDGE_PIPELINE_SLOTS]],
+) -> Hc4jResult<()> {
+    let k_len = order.len();
+    for (pos, &(chunk_start, chunk_len)) in chunk_ranges.iter().enumerate() {
+        let (rel_start, slice_len) = chunk_range(chunk_len, num_slices, slice_idx);
+        if slice_len == 0 {
+            continue;
+        }
+        let i = order[pos];
+        let next = order[(pos + 1) % k_len];
+        let src_offset_bytes = ((chunk_start + rel_start) * 4) as vk::DeviceSize;
+        let slice_bytes = (slice_len * 4) as vk::DeviceSize;
+        let edge_src_buf = channels.edge(i, next).slot(slot).src_buffer();
+        let sync = pipelines[i].as_deref().unwrap().sync(slot);
+
+        submit_cb_with_fence(&nodes[i], sync.send_cb, sync.send_fence, |cb| unsafe {
+            let region = vk::BufferCopy {
+                src_offset: src_offset_bytes,
+                dst_offset: 0,
+                size: slice_bytes,
+            };
+            nodes[i].device.cmd_copy_buffer(cb, user_buffers[i], edge_src_buf, &[region]);
+        })?;
+        send_active[pos][slot] = true;
+    }
+    Ok(())
+}
+
+#[inline]
+fn copy_staged_slice_hosts(
+    channels: &EdgeChannelCache,
+    order: &[usize],
+    chunk_ranges: &[(usize, usize)],
+    num_slices: usize,
+    slice_idx: usize,
+    slot: usize,
+) {
+    let k_len = order.len();
+    for (pos, &(_, chunk_len)) in chunk_ranges.iter().enumerate() {
+        let (_, slice_len) = chunk_range(chunk_len, num_slices, slice_idx);
+        if slice_len == 0 {
+            continue;
+        }
+        let i = order[pos];
+        let next = order[(pos + 1) % k_len];
+        channels
+            .edge(i, next)
+            .slot(slot)
+            .copy_host_if_staged((slice_len * 4) as vk::DeviceSize);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn submit_step_b_recv_slice(
+    nodes: &[GpuNode],
+    pipelines: &[Option<&mut ReducePipeline>],
+    channels: &EdgeChannelCache,
+    order: &[usize],
+    user_buffers: &[vk::Buffer],
+    chunk_ranges: &[(usize, usize)],
+    num_slices: usize,
+    slice_idx: usize,
+    slot: usize,
+    reduce: bool,
+    recv_active: &mut [[bool; EDGE_PIPELINE_SLOTS]],
+) -> Hc4jResult<()> {
+    let k_len = order.len();
+    for (pos, &(chunk_start, chunk_len)) in chunk_ranges.iter().enumerate() {
+        let (rel_start, slice_len) = chunk_range(chunk_len, num_slices, slice_idx);
+        if slice_len == 0 {
+            continue;
+        }
+        let i = order[pos];
+        let next_pos = (pos + 1) % k_len;
+        let next = order[next_pos];
+        let dst_offset_bytes = ((chunk_start + rel_start) * 4) as vk::DeviceSize;
+        let slice_bytes = (slice_len * 4) as vk::DeviceSize;
+        let edge_dst_buf = channels.edge(i, next).slot(slot).dst_buffer();
+        let recv_pipe = pipelines[next].as_deref().unwrap();
+        let sync = recv_pipe.sync(slot);
+
+        submit_cb_with_fence(&nodes[next], sync.recv_cb, sync.recv_fence, |cb| {
+            if reduce {
+                recv_pipe.record_copy_and_reduce(
+                    &nodes[next],
+                    cb,
+                    slot,
+                    user_buffers[next],
+                    dst_offset_bytes,
+                    edge_dst_buf,
+                    slice_len as u32,
+                );
+            } else {
+                unsafe {
+                    let region = vk::BufferCopy {
+                        src_offset: 0,
+                        dst_offset: dst_offset_bytes,
+                        size: slice_bytes,
+                    };
+                    nodes[next]
+                        .device
+                        .cmd_copy_buffer(cb, edge_dst_buf, user_buffers[next], &[region]);
+
+                    let barrier = vk::MemoryBarrier::default()
+                        .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                        .dst_access_mask(vk::AccessFlags::TRANSFER_READ | vk::AccessFlags::SHADER_READ);
+                    nodes[next].device.cmd_pipeline_barrier(
+                        cb,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::PipelineStageFlags::TRANSFER | vk::PipelineStageFlags::COMPUTE_SHADER,
+                        vk::DependencyFlags::empty(),
+                        &[barrier],
+                        &[],
+                        &[],
+                    );
+                }
+            }
+        })?;
+        recv_active[next_pos][slot] = true;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_ring_phase(
+    nodes: &[GpuNode],
+    pipelines: &[Option<&mut ReducePipeline>],
+    channels: &EdgeChannelCache,
+    order: &[usize],
+    user_buffers: &[vk::Buffer],
+    total_elements: usize,
+    num_slices: usize,
+    reduce: bool,
+) -> Hc4jResult<()> {
+    let k_len = order.len();
+    let mut chunk_ranges = Vec::with_capacity(k_len);
+    let mut send_active = vec![[false; EDGE_PIPELINE_SLOTS]; k_len];
+    let mut recv_active = vec![[false; EDGE_PIPELINE_SLOTS]; k_len];
+
+    for round in 0..(k_len - 1) {
+        chunk_ranges.clear();
+        for pos in 0..k_len {
+            let chunk_idx = if reduce {
+                (pos + k_len - round) % k_len
+            } else {
+                (pos + 1 + k_len - round) % k_len
+            };
+            chunk_ranges.push(chunk_range(total_elements, k_len, chunk_idx));
+        }
+
+        // Kick off slice 0 Step A on slot 0 and wait before first Step B read.
+        submit_step_a_send_slice(
+            nodes,
+            pipelines,
+            channels,
+            order,
+            user_buffers,
+            &chunk_ranges,
+            num_slices,
+            0,
+            0,
+            &mut send_active,
+        )?;
+        wait_slot_fences(nodes, order, pipelines, 0, false, &mut send_active)?;
+        copy_staged_slice_hosts(channels, order, &chunk_ranges, num_slices, 0, 0);
+
+        for s in 0..num_slices {
+            let curr_slot = s % EDGE_PIPELINE_SLOTS;
+            submit_step_b_recv_slice(
+                nodes,
+                pipelines,
+                channels,
+                order,
+                user_buffers,
+                &chunk_ranges,
+                num_slices,
+                s,
+                curr_slot,
+                reduce,
+                &mut recv_active,
+            )?;
+
+            if s + 1 < num_slices {
+                let next_slot = (s + 1) % EDGE_PIPELINE_SLOTS;
+                // Ensure `next_slot` finished any prior Step B before reusing its buffers.
+                wait_slot_fences(nodes, order, pipelines, next_slot, true, &mut recv_active)?;
+                submit_step_a_send_slice(
+                    nodes,
+                    pipelines,
+                    channels,
+                    order,
+                    user_buffers,
+                    &chunk_ranges,
+                    num_slices,
+                    s + 1,
+                    next_slot,
+                    &mut send_active,
+                )?;
+                wait_slot_fences(nodes, order, pipelines, next_slot, false, &mut send_active)?;
+                copy_staged_slice_hosts(channels, order, &chunk_ranges, num_slices, s + 1, next_slot);
+            }
+        }
+
+        // Wait for all remaining Step B work before next round reads updated user buffers.
+        wait_slot_fences(nodes, order, pipelines, 0, true, &mut recv_active)?;
+        wait_slot_fences(nodes, order, pipelines, 1, true, &mut recv_active)?;
+    }
+
+    Ok(())
+}
+
+/// Executes a bidirectional, double-buffered ordered Ring AllReduce (sum) across `order`.
 pub(crate) fn ring_allreduce_ordered(
     nodes: &[GpuNode],
     pipelines: &mut [Option<&mut ReducePipeline>],
+    channels: &mut EdgeChannelCache,
     graph: &TopoGraph,
     user_buffers: &[vk::Buffer],
     total_elements: usize,
@@ -28,113 +297,150 @@ pub(crate) fn ring_allreduce_ordered(
 
     let max_chunk_len = (total_elements / k_len) + usize::from(!total_elements.is_multiple_of(k_len));
     let max_chunk_bytes = (max_chunk_len * 4) as vk::DeviceSize;
+    let num_slices = sub_slice_count(max_chunk_bytes);
+    let max_slice_len = (max_chunk_len / num_slices) + usize::from(!max_chunk_len.is_multiple_of(num_slices));
+    let max_slice_bytes = (max_slice_len * 4) as vk::DeviceSize;
 
     for &rank in order {
-        pipelines[rank].as_deref_mut().unwrap().ensure_scratch(&nodes[rank], max_chunk_bytes)?;
+        pipelines[rank]
+            .as_deref_mut()
+            .unwrap()
+            .ensure_recv_slots(&nodes[rank], max_slice_bytes)?;
+    }
+    for pos in 0..k_len {
+        let i = order[pos];
+        let next = order[(pos + 1) % k_len];
+        let tier = *graph.tier(i, next);
+        channels.ensure_edge(&nodes[i], &nodes[next], i, next, tier, max_slice_bytes)?;
     }
 
-    // ═══ Phase 1: Scatter-Reduce (k_len − 1 rounds) ══════════════════════════
-    for round in 0..(k_len - 1) {
-        for idx in 0..k_len {
-            let i = order[idx];
-            let next = order[(idx + 1) % k_len];
-            let send_chunk_idx = ((idx + k_len) - round) % k_len;
-            let (chunk_start, chunk_len) = chunk_range(total_elements, k_len, send_chunk_idx);
+    let res = (|| -> Hc4jResult<()> {
+        // Phase 1: Scatter-Reduce (k_len - 1 rounds)
+        run_ring_phase(
+            nodes,
+            pipelines,
+            channels,
+            order,
+            user_buffers,
+            total_elements,
+            num_slices,
+            true,
+        )?;
+        // Phase 2: Allgather (k_len - 1 rounds)
+        run_ring_phase(
+            nodes,
+            pipelines,
+            channels,
+            order,
+            user_buffers,
+            total_elements,
+            num_slices,
+            false,
+        )
+    })();
 
-            if chunk_len == 0 {
-                continue;
-            }
+    if res.is_err() {
+        drain_ranks_idle(nodes, order);
+    }
+    res
+}
 
-            let chunk_bytes = (chunk_len * 4) as vk::DeviceSize;
-            let chunk_offset_bytes = (chunk_start * 4) as vk::DeviceSize;
+/// Transfers `total_elements` from `src_rank` -> `dst_rank` across a persistent edge channel.
+/// When `reduce_into_dst` is true, accumulates into `dst_buf` via fused copy+reduce CB;
+/// otherwise copies directly into `dst_buf`.
+#[allow(clippy::too_many_arguments)]
+fn transfer_edge_persistent(
+    nodes: &[GpuNode],
+    pipelines: &mut [Option<&mut ReducePipeline>],
+    channels: &mut EdgeChannelCache,
+    graph: &TopoGraph,
+    src_rank: usize,
+    dst_rank: usize,
+    src_buf: vk::Buffer,
+    dst_buf: vk::Buffer,
+    total_elements: usize,
+    reduce_into_dst: bool,
+) -> Hc4jResult<()> {
+    if total_elements == 0 {
+        return Ok(());
+    }
+    let total_bytes = (total_elements * 4) as vk::DeviceSize;
+    let num_slices = sub_slice_count(total_bytes);
+    let max_slice_len = (total_elements / num_slices) + usize::from(!total_elements.is_multiple_of(num_slices));
+    let max_slice_bytes = (max_slice_len * 4) as vk::DeviceSize;
 
-            let send_buf = pipelines[i].as_deref().unwrap().send_chunk_buf.as_ref().unwrap().buffer;
-            let recv_buf = pipelines[next].as_deref().unwrap().recv_chunk_buf.as_ref().unwrap().buffer;
+    if reduce_into_dst {
+        pipelines[dst_rank]
+            .as_deref_mut()
+            .unwrap()
+            .ensure_recv_slots(&nodes[dst_rank], max_slice_bytes)?;
+    }
+    let tier = *graph.tier(src_rank, dst_rank);
+    channels.ensure_edge(&nodes[src_rank], &nodes[dst_rank], src_rank, dst_rank, tier, max_slice_bytes)?;
 
-            // GPU i: copy slice from user buffer -> send_chunk_buf
-            one_shot_submit(&nodes[i], |cb| unsafe {
-                let region = vk::BufferCopy {
-                    src_offset: chunk_offset_bytes,
-                    dst_offset: 0,
-                    size: chunk_bytes,
-                };
-                nodes[i].device.cmd_copy_buffer(cb, user_buffers[i], send_buf, &[region]);
-            })?;
+    let edge = channels.edge(src_rank, dst_rank);
+    let src_pipe = pipelines[src_rank].as_deref().unwrap();
+    let dst_pipe = pipelines[dst_rank].as_deref().unwrap();
 
-            // Transfer from GPU i (send_chunk_buf) -> GPU next (recv_chunk_buf)
-            let tier = graph.tier(i, next);
-            transfer_route(
-                &nodes[i],
-                &nodes[next],
-                tier,
-                send_buf,
-                0,
-                recv_buf,
-                0,
-                chunk_bytes,
-            )?;
-
-            // GPU next: accumulate recv_chunk_buf into user_buffers[next] at chunk_offset_bytes
-            pipelines[next].as_deref().unwrap().dispatch_reduce(
-                &nodes[next],
-                user_buffers[next],
-                chunk_offset_bytes,
-                recv_buf,
-                chunk_len as u32,
-            )?;
+    for s in 0..num_slices {
+        let (elem_start, slice_len) = chunk_range(total_elements, num_slices, s);
+        if slice_len == 0 {
+            continue;
         }
-    }
+        let slot = s % EDGE_PIPELINE_SLOTS;
+        let offset_bytes = (elem_start * 4) as vk::DeviceSize;
+        let slice_bytes = (slice_len * 4) as vk::DeviceSize;
+        let slot_ref = edge.slot(slot);
+        let src_sync = src_pipe.sync(slot);
+        let dst_sync = dst_pipe.sync(slot);
 
-    // ═══ Phase 2: Allgather (k_len − 1 rounds) ═══════════════════════════════
-    for round in 0..(k_len - 1) {
-        for idx in 0..k_len {
-            let i = order[idx];
-            let next = order[(idx + 1) % k_len];
-            let send_chunk_idx = ((idx + 1 + k_len) - round) % k_len;
-            let (chunk_start, chunk_len) = chunk_range(total_elements, k_len, send_chunk_idx);
+        submit_cb_with_fence(&nodes[src_rank], src_sync.send_cb, src_sync.send_fence, |cb| unsafe {
+            let region = vk::BufferCopy {
+                src_offset: offset_bytes,
+                dst_offset: 0,
+                size: slice_bytes,
+            };
+            nodes[src_rank]
+                .device
+                .cmd_copy_buffer(cb, src_buf, slot_ref.src_buffer(), &[region]);
+        })?;
+        unsafe {
+            nodes[src_rank]
+                .device
+                .wait_for_fences(std::slice::from_ref(&src_sync.send_fence), true, u64::MAX)
+                .map_err(|e| Hc4jError::Device(format!("wait_for_fences failed: {e}")))?;
+        }
+        slot_ref.copy_host_if_staged(slice_bytes);
 
-            if chunk_len == 0 {
-                continue;
+        submit_cb_with_fence(&nodes[dst_rank], dst_sync.recv_cb, dst_sync.recv_fence, |cb| {
+            if reduce_into_dst {
+                dst_pipe.record_copy_and_reduce(
+                    &nodes[dst_rank],
+                    cb,
+                    slot,
+                    dst_buf,
+                    offset_bytes,
+                    slot_ref.dst_buffer(),
+                    slice_len as u32,
+                );
+            } else {
+                unsafe {
+                    let region = vk::BufferCopy {
+                        src_offset: 0,
+                        dst_offset: offset_bytes,
+                        size: slice_bytes,
+                    };
+                    nodes[dst_rank]
+                        .device
+                        .cmd_copy_buffer(cb, slot_ref.dst_buffer(), dst_buf, &[region]);
+                }
             }
-
-            let chunk_bytes = (chunk_len * 4) as vk::DeviceSize;
-            let chunk_offset_bytes = (chunk_start * 4) as vk::DeviceSize;
-
-            let send_buf = pipelines[i].as_deref().unwrap().send_chunk_buf.as_ref().unwrap().buffer;
-            let recv_buf = pipelines[next].as_deref().unwrap().recv_chunk_buf.as_ref().unwrap().buffer;
-
-            // GPU i: copy fully reduced slice from user buffer -> send_chunk_buf
-            one_shot_submit(&nodes[i], |cb| unsafe {
-                let region = vk::BufferCopy {
-                    src_offset: chunk_offset_bytes,
-                    dst_offset: 0,
-                    size: chunk_bytes,
-                };
-                nodes[i].device.cmd_copy_buffer(cb, user_buffers[i], send_buf, &[region]);
-            })?;
-
-            // Transfer from GPU i -> GPU next
-            let tier = graph.tier(i, next);
-            transfer_route(
-                &nodes[i],
-                &nodes[next],
-                tier,
-                send_buf,
-                0,
-                recv_buf,
-                0,
-                chunk_bytes,
-            )?;
-
-            // GPU next: copy recv_chunk_buf into user_buffers[next] at chunk_offset_bytes
-            one_shot_submit(&nodes[next], |cb| unsafe {
-                let region = vk::BufferCopy {
-                    src_offset: 0,
-                    dst_offset: chunk_offset_bytes,
-                    size: chunk_bytes,
-                };
-                nodes[next].device.cmd_copy_buffer(cb, recv_buf, user_buffers[next], &[region]);
-            })?;
+        })?;
+        unsafe {
+            nodes[dst_rank]
+                .device
+                .wait_for_fences(std::slice::from_ref(&dst_sync.recv_fence), true, u64::MAX)
+                .map_err(|e| Hc4jError::Device(format!("wait_for_fences failed: {e}")))?;
         }
     }
 
@@ -148,6 +454,7 @@ pub(crate) fn ring_allreduce_ordered(
 pub(crate) fn hierarchical_allreduce(
     nodes: &[GpuNode],
     pipelines: &mut [Option<&mut ReducePipeline>],
+    channels: &mut EdgeChannelCache,
     graph: &TopoGraph,
     user_buffers: &[vk::Buffer],
     total_elements: usize,
@@ -157,37 +464,26 @@ pub(crate) fn hierarchical_allreduce(
         return Ok(());
     }
 
-    let total_bytes = (total_elements * 4) as vk::DeviceSize;
-
     // Phase 1: Intra-Island Reduce to Leader
     for isl in islands {
         if isl.members.len() > 1 {
             let leader = isl.leader_rank as usize;
-            pipelines[leader].as_deref_mut().unwrap().ensure_scratch(&nodes[leader], total_bytes)?;
-            let leader_recv_buf = pipelines[leader].as_deref().unwrap().recv_chunk_buf.as_ref().unwrap().buffer;
-
             for &m in &isl.members {
                 let member = m as usize;
                 if member == leader {
                     continue;
                 }
-                let tier = graph.tier(member, leader);
-                transfer_route(
-                    &nodes[member],
-                    &nodes[leader],
-                    tier,
+                transfer_edge_persistent(
+                    nodes,
+                    pipelines,
+                    channels,
+                    graph,
+                    member,
+                    leader,
                     user_buffers[member],
-                    0,
-                    leader_recv_buf,
-                    0,
-                    total_bytes,
-                )?;
-                pipelines[leader].as_deref().unwrap().dispatch_reduce(
-                    &nodes[leader],
                     user_buffers[leader],
-                    0,
-                    leader_recv_buf,
-                    total_elements as u32,
+                    total_elements,
+                    true,
                 )?;
             }
         }
@@ -227,6 +523,7 @@ pub(crate) fn hierarchical_allreduce(
         ring_allreduce_ordered(
             nodes,
             pipelines,
+            channels,
             graph,
             user_buffers,
             total_elements,
@@ -243,16 +540,17 @@ pub(crate) fn hierarchical_allreduce(
                 if member == leader {
                     continue;
                 }
-                let tier = graph.tier(leader, member);
-                transfer_route(
-                    &nodes[leader],
-                    &nodes[member],
-                    tier,
+                transfer_edge_persistent(
+                    nodes,
+                    pipelines,
+                    channels,
+                    graph,
+                    leader,
+                    member,
                     user_buffers[leader],
-                    0,
                     user_buffers[member],
-                    0,
-                    total_bytes,
+                    total_elements,
+                    false,
                 )?;
             }
         }
@@ -263,9 +561,11 @@ pub(crate) fn hierarchical_allreduce(
 
 /// Executes AllReduce across the collective using the selected algorithm
 /// (auto, ring, or hierarchical) based on `HC4J_COLLECTIVE_ALGO`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn execute_allreduce(
     nodes: &[GpuNode],
     pipelines: &mut [Option<&mut ReducePipeline>],
+    channels: &mut EdgeChannelCache,
     graph: &TopoGraph,
     user_buffers: &[vk::Buffer],
     total_elements: usize,
@@ -285,11 +585,12 @@ pub(crate) fn execute_allreduce(
     match algo_var.as_str() {
         "auto" | "" => {
             if islands.len() > 1 && islands.iter().any(|isl| isl.members.len() > 1) {
-                hierarchical_allreduce(nodes, pipelines, graph, user_buffers, total_elements, islands)
+                hierarchical_allreduce(nodes, pipelines, channels, graph, user_buffers, total_elements, islands)
             } else {
                 ring_allreduce_ordered(
                     nodes,
                     pipelines,
+                    channels,
                     graph,
                     user_buffers,
                     total_elements,
@@ -300,6 +601,7 @@ pub(crate) fn execute_allreduce(
         "ring" => ring_allreduce_ordered(
             nodes,
             pipelines,
+            channels,
             graph,
             user_buffers,
             total_elements,
@@ -310,13 +612,14 @@ pub(crate) fn execute_allreduce(
                 ring_allreduce_ordered(
                     nodes,
                     pipelines,
+                    channels,
                     graph,
                     user_buffers,
                     total_elements,
                     &ring_order_usize,
                 )
             } else {
-                hierarchical_allreduce(nodes, pipelines, graph, user_buffers, total_elements, islands)
+                hierarchical_allreduce(nodes, pipelines, channels, graph, user_buffers, total_elements, islands)
             }
         }
         _ => Err(Hc4jError::InvalidParam(
